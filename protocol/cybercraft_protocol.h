@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 1;
+	inline constexpr std::uint32_t kVersion = 2;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -24,7 +24,8 @@ namespace cybercraft::proto
 	// ---- region offsets ---------------------------------------------------------------------
 	inline constexpr std::uint64_t kOffHeader = 0x0;
 	inline constexpr std::uint64_t kOffGameState = 0x100;  // Cyberpunk -> Minecraft
-	inline constexpr std::uint64_t kOffMcState = 0x200;    // Minecraft -> Cyberpunk (reserved for phase 1b)
+	inline constexpr std::uint64_t kOffMcState = 0x200;    // Minecraft -> Cyberpunk: player state (reserved for phase 1b-ii)
+	inline constexpr std::uint64_t kOffMcCommand = 0x300;  // Minecraft -> Cyberpunk: one-off commands
 	inline constexpr std::uint64_t kMappingBytes = 0x1000;
 
 	// ---- header @0x0 ------------------------------------------------------------------------
@@ -51,6 +52,32 @@ namespace cybercraft::proto
 		std::uint32_t flags;  // GameFlags
 		double        posX, posY, posZ;  // V's feet, Minecraft coordinates
 		std::uint64_t frameCounter;
+		std::uint32_t cmdAck;     // seq of the last McCommand Cyberpunk has dealt with
+		std::uint32_t cmdResult;  // CommandResult for that command
 	};
-	static_assert(sizeof(GameState) == 0x28);
+	static_assert(sizeof(GameState) == 0x30);
+
+	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock: seq is odd while being written) -----
+	// A latest-value slot. Minecraft writes the fields and bumps seq by 2 (even); Cyberpunk acts on a
+	// command whenever it sees a new even, non-zero seq, then copies seq into GameState::cmdAck.
+	enum McCommandKind : std::uint32_t
+	{
+		kCmdNone = 0,
+		kCmdTeleport = 1,  // move V to (x, y, z), Minecraft coordinates
+	};
+
+	enum CommandResult : std::uint32_t
+	{
+		kResultNone = 0,
+		kResultOk = 1,
+		kResultFailed = 2,
+	};
+
+	struct McCommand
+	{
+		std::uint32_t seq;
+		std::uint32_t kind;  // McCommandKind
+		double        x, y, z;
+	};
+	static_assert(sizeof(McCommand) == 0x20);
 }

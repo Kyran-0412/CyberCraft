@@ -61,6 +61,8 @@ public final class CyberLink {
 		public int flags;
 		public double x, y, z; // Minecraft coordinates
 		public long frame;
+		public int cmdAck; // seq of the last command Cyberpunk dealt with
+		public int cmdResult; // Proto.RESULT_*
 
 		public boolean inGame() {
 			return (this.flags & GAME_IN_GAME) != 0;
@@ -147,6 +149,27 @@ public final class CyberLink {
 		}
 	}
 
+	/**
+	 * Asks Cyberpunk to teleport V to a position (Minecraft coordinates). Returns the command's sequence
+	 * number (watch for it in GameState.cmdAck), or 0 if the link is down.
+	 */
+	public static int sendTeleport(double x, double y, double z) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return 0;
+		}
+		int base = s.get(JAVA_INT, OFF_MC_COMMAND + C_SEQ) & ~1; // the last finished value (even)
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 1); // odd: write in progress
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_KIND, CMD_TELEPORT);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_X, x);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Y, y);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Z, z);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 2); // even: done
+		return base + 2;
+	}
+
 	/** Seqlock read of the game state into {@code out}. Returns false if the link is down or the writer was mid-update every try. */
 	public static boolean readGameState(GameState out) {
 		MemorySegment s = shm;
@@ -164,6 +187,8 @@ public final class CyberLink {
 			out.y = s.get(JAVA_DOUBLE, OFF_GAME_STATE + G_Y);
 			out.z = s.get(JAVA_DOUBLE, OFF_GAME_STATE + G_Z);
 			out.frame = s.get(JAVA_LONG, OFF_GAME_STATE + G_FRAME);
+			out.cmdAck = s.get(JAVA_INT, OFF_GAME_STATE + G_CMD_ACK);
+			out.cmdResult = s.get(JAVA_INT, OFF_GAME_STATE + G_CMD_RESULT);
 			VarHandle.acquireFence();
 			int seq2 = s.get(JAVA_INT, OFF_GAME_STATE + G_SEQ);
 			if (seq1 == seq2) {

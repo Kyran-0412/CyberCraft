@@ -1,12 +1,16 @@
-// CyberCraft - Phase 1a: the Cyberpunk end of the link.
+// CyberCraft - Phase 1b-i: the Cyberpunk end of the link.
 //
 // Every frame, while a game is running, it finds V (the player) and publishes V's position to shared
-// memory (see protocol/cybercraft_protocol.h) for the Minecraft mod to read. Once a second it also writes
-// a line to the RED4ext log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
+// memory (see protocol/cybercraft_protocol.h) for the Minecraft mod to read. It also listens for one-off
+// commands from Minecraft; so far just "teleport V here". Once a second it writes a line to the RED4ext
+// log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
 #include "Link.hpp"
 
+#include <cybercraft_protocol.h>
+
 #include <RED4ext/RED4ext.hpp>
+#include <RED4ext/Scripting/Natives/Generated/EulerAngles.hpp>
 #include <RED4ext/Scripting/Natives/ScriptGameInstance.hpp>
 #include <RED4ext/Scripting/Natives/Vector4.hpp>
 
@@ -20,10 +24,129 @@ RED4ext::v1::PluginHandle g_handle = nullptr;
 const RED4ext::v1::Sdk* g_sdk = nullptr;
 
 RED4ext::CClassFunction* g_getWorldPosition = nullptr;
+RED4ext::CClassFunction* g_getWorldYaw = nullptr;
 bool g_lookedUpFunction = false;
 bool g_hadPlayer = false;
 bool g_mcWasLinked = false;
 std::chrono::steady_clock::time_point g_lastLog{};
+
+// Finds the game's teleportation facility (the object whose Teleport function moves things around).
+// Two routes are tried, because we can't tell from here which one this game version supports:
+//   1. as a game system, looked up by its class name;
+//   2. through the script function ScriptGameInstance.GetTeleportationFacility, like redscript mods do.
+RED4ext::Handle<RED4ext::IScriptable> FindTeleportFacility()
+{
+    static bool loggedRoute = false;
+    auto rtti = RED4ext::CRTTISystem::Get();
+
+    if (auto cls = rtti->GetClass("gameTeleportationFacility"))
+    {
+        auto engine = RED4ext::CGameEngine::Get();
+        if (engine && engine->framework && engine->framework->gameInstance)
+        {
+            if (auto system = engine->framework->gameInstance->GetSystem(cls))
+            {
+                if (!loggedRoute)
+                {
+                    loggedRoute = true;
+                    g_sdk->logger->Info(g_handle, "teleport: found the teleportation facility as a game system");
+                }
+                return RED4ext::Handle<RED4ext::IScriptable>(system);
+            }
+        }
+    }
+
+    if (auto cls = rtti->GetClass("ScriptGameInstance"))
+    {
+        if (auto func = cls->GetFunction("GetTeleportationFacility"))
+        {
+            RED4ext::ScriptGameInstance game;
+            RED4ext::Handle<RED4ext::IScriptable> facility;
+            RED4ext::StackArgs_t args;
+            args.emplace_back(nullptr, &game);
+            RED4ext::ExecuteFunction(static_cast<void*>(nullptr), func, &facility, args);
+            if (facility)
+            {
+                if (!loggedRoute)
+                {
+                    loggedRoute = true;
+                    g_sdk->logger->Info(g_handle, "teleport: found the teleportation facility through ScriptGameInstance");
+                }
+                return facility;
+            }
+        }
+    }
+
+    return {};
+}
+
+// Moves V to a position in Cyberpunk coordinates (X east, Y north, Z up, metres). Returns false on any failure.
+bool TeleportPlayer(RED4ext::Handle<RED4ext::IScriptable>& aPlayer, double aX, double aY, double aZ)
+{
+    auto facility = FindTeleportFacility();
+    if (!facility)
+    {
+        g_sdk->logger->Error(g_handle, "teleport: could not find the teleportation facility");
+        return false;
+    }
+
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto facilityCls = rtti->GetClass("gameTeleportationFacility");
+    auto teleport = facilityCls ? facilityCls->GetFunction("Teleport") : nullptr;
+    if (!teleport)
+    {
+        g_sdk->logger->Error(g_handle, "teleport: could not find gameTeleportationFacility::Teleport");
+        return false;
+    }
+
+    // Keep V facing the way V already faces.
+    float yaw = 0.0f;
+    if (g_getWorldYaw)
+    {
+        RED4ext::ExecuteFunction(aPlayer.instance, g_getWorldYaw, &yaw);
+    }
+
+    RED4ext::Vector4 position(static_cast<float>(aX), static_cast<float>(aY), static_cast<float>(aZ), 1.0f);
+    RED4ext::EulerAngles rotation{0.0f, 0.0f, yaw};
+
+    RED4ext::StackArgs_t args;
+    args.emplace_back(nullptr, &aPlayer);
+    args.emplace_back(nullptr, &position);
+    args.emplace_back(nullptr, &rotation);
+
+    bool result = false; // some versions return a bool, some return nothing
+    const bool executed = RED4ext::ExecuteFunction(facility.instance, teleport, &result, args);
+    g_sdk->logger->InfoF(g_handle, "teleport: Teleport executed=%d returned=%d", executed ? 1 : 0, result ? 1 : 0);
+    return executed;
+}
+
+// Acts on a command from Minecraft. The player may be null (main menu, loading screen).
+void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RED4ext::IScriptable>& aPlayer)
+{
+    auto& link = cybercraft::Link::Get();
+
+    if (aCommand.kind != cybercraft::proto::kCmdTeleport)
+    {
+        g_sdk->logger->WarnF(g_handle, "command #%u: unknown kind %u", aCommand.seq, aCommand.kind);
+        link.AckCommand(aCommand.seq, false);
+        return;
+    }
+
+    if (!aPlayer)
+    {
+        g_sdk->logger->WarnF(g_handle, "command #%u: teleport ignored, there is no player right now", aCommand.seq);
+        link.AckCommand(aCommand.seq, false);
+        return;
+    }
+
+    // Minecraft (X east, Y up, -Z north) -> Cyberpunk (X east, Y north, Z up).
+    const double cx = aCommand.x;
+    const double cy = -aCommand.z;
+    const double cz = aCommand.y;
+    g_sdk->logger->InfoF(g_handle, "command #%u: teleport V to x=%.2f y=%.2f z=%.2f", aCommand.seq, cx, cy, cz);
+
+    link.AckCommand(aCommand.seq, TeleportPlayer(aPlayer, cx, cy, cz));
+}
 
 // Called every frame while the game is in its "Running" state (on the game's main thread).
 bool OnRunningUpdate(RED4ext::CGameApplication*)
@@ -60,9 +183,16 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     RED4ext::Handle<RED4ext::IScriptable> player;
     RED4ext::ExecuteGlobalFunction("GetPlayer;GameInstance", &player, gameInstance);
 
+    cybercraft::Link::Command command{};
+    const bool haveCommand = link.PollCommand(command);
+
     if (!player)
     {
         // Main menu, loading screen, etc.
+        if (haveCommand)
+        {
+            HandleCommand(command, player);
+        }
         link.PublishPlayer(false, 0.0, 0.0, 0.0);
         if (g_hadPlayer)
         {
@@ -87,6 +217,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
         if (playerPuppet)
         {
             g_getWorldPosition = playerPuppet->GetFunction("GetWorldPosition");
+            g_getWorldYaw = playerPuppet->GetFunction("GetWorldYaw");
         }
 
         if (!g_getWorldPosition)
@@ -102,6 +233,11 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
 
     RED4ext::Vector4 position;
     RED4ext::ExecuteFunction(player.instance, g_getWorldPosition, &position);
+
+    if (haveCommand)
+    {
+        HandleCommand(command, player);
+    }
 
     // Cyberpunk is Z-up (X east, Y north) in metres; Minecraft is Y-up (X east, -Z north) in blocks.
     link.PublishPlayer(true, position.X, position.Z, -position.Y);
@@ -158,7 +294,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 2, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

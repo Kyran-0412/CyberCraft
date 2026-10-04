@@ -94,8 +94,43 @@ namespace cybercraft
 		state->posY = a_y;
 		state->posZ = a_z;
 		state->frameCounter = ++frame_;
+		state->cmdAck = cmdAck_;
+		state->cmdResult = cmdResult_;
 
 		seq.store(start + 2, std::memory_order_release);  // even: done
+	}
+
+	bool Link::PollCommand(Command& a_out)
+	{
+		if (!base_) {
+			return false;
+		}
+		auto* cmd = reinterpret_cast<proto::McCommand*>(base_ + proto::kOffMcCommand);
+
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			const auto seq1 = Atomic(cmd->seq).load(std::memory_order_acquire);
+			if ((seq1 & 1) != 0) {
+				continue;  // Minecraft is writing it right now
+			}
+			if (seq1 == 0 || seq1 == lastSeenCmdSeq_) {
+				return false;  // nothing new
+			}
+
+			const Command copy{ seq1, cmd->kind, cmd->x, cmd->y, cmd->z };
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (Atomic(cmd->seq).load(std::memory_order_relaxed) == seq1) {
+				a_out = copy;
+				lastSeenCmdSeq_ = seq1;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Link::AckCommand(std::uint32_t a_seq, bool a_ok)
+	{
+		cmdAck_ = a_seq;
+		cmdResult_ = a_ok ? proto::kResultOk : proto::kResultFailed;
 	}
 
 	std::uint32_t Link::McPid() const
