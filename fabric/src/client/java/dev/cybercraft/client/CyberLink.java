@@ -49,6 +49,8 @@ public final class CyberLink {
 		GET_CURRENT_PROCESS_ID = linker.downcallHandle(k32.find("GetCurrentProcessId").orElseThrow(), FunctionDescriptor.of(JAVA_INT));
 	}
 
+	private static long mcFrame;
+
 	private static volatile MemorySegment shm;
 	private static long lastOpenAttempt;
 	private static int gamePid;
@@ -147,6 +149,29 @@ public final class CyberLink {
 		} catch (Throwable t) {
 			CyberCraft.LOG.error("CyberCraft: failed to open shared memory", t);
 		}
+	}
+
+	/**
+	 * Tells Cyberpunk what Minecraft wants. With {@code follow} set, Cyberpunk keeps moving V to (x, y, z)
+	 * (the same coordinate space as the game state position) and turns V to face {@code yaw}.
+	 */
+	public static void publishMcState(boolean inWorld, boolean follow, double x, double y, double z, float yaw, float pitch) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return;
+		}
+		int base = s.get(JAVA_INT, OFF_MC_STATE + M_SEQ) & ~1;
+		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 1); // odd: write in progress
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0));
+		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_X, x);
+		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Y, y);
+		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Z, z);
+		s.set(JAVA_FLOAT, OFF_MC_STATE + M_YAW, yaw);
+		s.set(JAVA_FLOAT, OFF_MC_STATE + M_PITCH, pitch);
+		s.set(JAVA_LONG, OFF_MC_STATE + M_FRAME, ++mcFrame);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 2); // even: done
 	}
 
 	/**

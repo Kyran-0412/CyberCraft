@@ -20,6 +20,18 @@ namespace cybercraft
 		// Publish V's position (Minecraft coordinates) with a seqlock so Minecraft never reads a torn value.
 		void PublishPlayer(bool inGame, double mcX, double mcY, double mcZ);
 
+		// What Minecraft currently wants (see McState in the protocol).
+		struct McSnapshot
+		{
+			std::uint32_t flags;
+			double        x, y, z;  // where V should be, protocol coordinates (Minecraft axes)
+			float         yaw, pitch;  // Minecraft degrees
+			std::uint64_t frame;
+		};
+
+		// True when a consistent copy was read.
+		bool ReadMcState(McSnapshot& a_out) const;
+
 		// A one-off command from Minecraft (see McCommand in the protocol).
 		struct Command
 		{

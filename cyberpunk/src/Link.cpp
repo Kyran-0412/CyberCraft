@@ -100,6 +100,30 @@ namespace cybercraft
 		seq.store(start + 2, std::memory_order_release);  // even: done
 	}
 
+	bool Link::ReadMcState(McSnapshot& a_out) const
+	{
+		if (!base_) {
+			return false;
+		}
+		auto* state = reinterpret_cast<proto::McState*>(base_ + proto::kOffMcState);
+
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			const auto seq1 = Atomic(state->seq).load(std::memory_order_acquire);
+			if ((seq1 & 1) != 0) {
+				continue;  // Minecraft is writing it right now
+			}
+
+			const McSnapshot copy{ state->flags, state->targetX, state->targetY, state->targetZ, state->yaw, state->pitch,
+				state->frameCounter };
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (Atomic(state->seq).load(std::memory_order_relaxed) == seq1) {
+				a_out = copy;
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool Link::PollCommand(Command& a_out)
 	{
 		if (!base_) {

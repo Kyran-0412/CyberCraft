@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 2;
+	public static final int VERSION = 3;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 	public static final long MAPPING_BYTES = 0x1000;
 
@@ -31,6 +31,20 @@ public final class Proto {
 	public static final long G_CMD_RESULT = 44; // u32, RESULT_*
 
 	public static final int GAME_IN_GAME = 1;
+
+	// ---- Minecraft -> Cyberpunk state @0x200 (seqlock): where Minecraft wants V ----
+	public static final long OFF_MC_STATE = 0x200;
+	public static final long M_SEQ = 0; // u32, odd while being written
+	public static final long M_FLAGS = 4; // u32
+	public static final long M_X = 8; // double, target for V's feet (same space as the game state position)
+	public static final long M_Y = 16;
+	public static final long M_Z = 24;
+	public static final long M_YAW = 32; // float, Minecraft degrees
+	public static final long M_PITCH = 36; // float
+	public static final long M_FRAME = 40; // u64
+
+	public static final int MC_IN_WORLD = 1;
+	public static final int MC_FOLLOW = 2;
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock) ----
 	public static final long OFF_MC_COMMAND = 0x300;

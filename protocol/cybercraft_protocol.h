@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 2;
+	inline constexpr std::uint32_t kVersion = 3;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -24,7 +24,7 @@ namespace cybercraft::proto
 	// ---- region offsets ---------------------------------------------------------------------
 	inline constexpr std::uint64_t kOffHeader = 0x0;
 	inline constexpr std::uint64_t kOffGameState = 0x100;  // Cyberpunk -> Minecraft
-	inline constexpr std::uint64_t kOffMcState = 0x200;    // Minecraft -> Cyberpunk: player state (reserved for phase 1b-ii)
+	inline constexpr std::uint64_t kOffMcState = 0x200;    // Minecraft -> Cyberpunk: where Minecraft wants V
 	inline constexpr std::uint64_t kOffMcCommand = 0x300;  // Minecraft -> Cyberpunk: one-off commands
 	inline constexpr std::uint64_t kMappingBytes = 0x1000;
 
@@ -56,6 +56,23 @@ namespace cybercraft::proto
 		std::uint32_t cmdResult;  // CommandResult for that command
 	};
 	static_assert(sizeof(GameState) == 0x30);
+
+	// ---- Minecraft -> Cyberpunk state @0x200 (seqlock: seq is odd while being written) ------
+	enum McFlags : std::uint32_t
+	{
+		kMcInWorld = 1u << 0,  // Minecraft has a world open and a player in it
+		kMcFollow = 1u << 1,   // Cyberpunk should keep moving V to (targetX, targetY, targetZ)
+	};
+
+	struct McState
+	{
+		std::uint32_t seq;
+		std::uint32_t flags;  // McFlags
+		double        targetX, targetY, targetZ;  // where Minecraft wants V's feet (same space as GameState::pos)
+		float         yaw, pitch;                 // Minecraft's look direction, Minecraft degrees
+		std::uint64_t frameCounter;
+	};
+	static_assert(sizeof(McState) == 0x30);
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock: seq is odd while being written) -----
 	// A latest-value slot. Minecraft writes the fields and bumps seq by 2 (even); Cyberpunk acts on a

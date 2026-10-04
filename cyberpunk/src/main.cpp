@@ -1,8 +1,9 @@
-// CyberCraft - Phase 1b-i: the Cyberpunk end of the link.
+// CyberCraft - Phase 1b-ii: the Cyberpunk end of the link.
 //
 // Every frame, while a game is running, it finds V (the player) and publishes V's position to shared
 // memory (see protocol/cybercraft_protocol.h) for the Minecraft mod to read. It also listens for one-off
-// commands from Minecraft; so far just "teleport V here". Once a second it writes a line to the RED4ext
+// commands from Minecraft ("teleport V here"), and while Minecraft says "follow" it keeps moving V to the
+// position Minecraft's player has. Once a second it writes a line to the RED4ext
 // log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
 #include "Link.hpp"
@@ -17,6 +18,7 @@
 #include <Windows.h>
 
 #include <chrono>
+#include <cmath>
 
 namespace
 {
@@ -29,6 +31,24 @@ bool g_lookedUpFunction = false;
 bool g_hadPlayer = false;
 bool g_mcWasLinked = false;
 std::chrono::steady_clock::time_point g_lastLog{};
+
+// "Follow" mode: V is moved to wherever Minecraft's player is, every frame.
+struct FollowState
+{
+    bool active = false;
+    bool gaveUp = false; // too many failures; stays off until Minecraft stops asking and asks again
+    double x = 0.0, y = 0.0, z = 0.0; // smoothed target, protocol (Minecraft-axes) coordinates
+    float yaw = 0.0f;                  // smoothed, Cyberpunk degrees
+    double lastSentX = 0.0, lastSentY = 0.0, lastSentZ = 0.0;
+    float lastSentYaw = 0.0f;
+    bool haveSent = false;
+    int failures = 0;
+    std::chrono::steady_clock::time_point last{};
+} g_follow;
+
+// Cached after the first successful teleport (class and function pointers don't change while the game runs).
+RED4ext::CClass* g_facilityCls = nullptr;
+RED4ext::CClassFunction* g_teleportFunc = nullptr;
 
 // Finds the game's teleportation facility (the object whose Teleport function moves things around).
 // Two routes are tried, because we can't tell from here which one this game version supports:
@@ -81,7 +101,9 @@ RED4ext::Handle<RED4ext::IScriptable> FindTeleportFacility()
 }
 
 // Moves V to a position in Cyberpunk coordinates (X east, Y north, Z up, metres). Returns false on any failure.
-bool TeleportPlayer(RED4ext::Handle<RED4ext::IScriptable>& aPlayer, double aX, double aY, double aZ)
+// If aYawOverride is a number, V is turned to face that way (degrees); otherwise V keeps facing the same way.
+bool TeleportPlayer(RED4ext::Handle<RED4ext::IScriptable>& aPlayer, double aX, double aY, double aZ,
+                    float aYawOverride = std::nanf(""), bool aQuiet = false)
 {
     auto facility = FindTeleportFacility();
     if (!facility)
@@ -90,18 +112,26 @@ bool TeleportPlayer(RED4ext::Handle<RED4ext::IScriptable>& aPlayer, double aX, d
         return false;
     }
 
-    auto rtti = RED4ext::CRTTISystem::Get();
-    auto facilityCls = rtti->GetClass("gameTeleportationFacility");
-    auto teleport = facilityCls ? facilityCls->GetFunction("Teleport") : nullptr;
-    if (!teleport)
+    if (!g_teleportFunc)
     {
-        g_sdk->logger->Error(g_handle, "teleport: could not find gameTeleportationFacility::Teleport");
-        return false;
+        auto rtti = RED4ext::CRTTISystem::Get();
+        g_facilityCls = rtti->GetClass("gameTeleportationFacility");
+        g_teleportFunc = g_facilityCls ? g_facilityCls->GetFunction("Teleport") : nullptr;
+        if (!g_teleportFunc)
+        {
+            g_sdk->logger->Error(g_handle, "teleport: could not find gameTeleportationFacility::Teleport");
+            return false;
+        }
     }
+    auto teleport = g_teleportFunc;
 
-    // Keep V facing the way V already faces.
+    // Keep V facing the way V already faces, unless a direction was given.
     float yaw = 0.0f;
-    if (g_getWorldYaw)
+    if (!std::isnan(aYawOverride))
+    {
+        yaw = aYawOverride;
+    }
+    else if (g_getWorldYaw)
     {
         RED4ext::ExecuteFunction(aPlayer.instance, g_getWorldYaw, &yaw);
     }
@@ -116,7 +146,10 @@ bool TeleportPlayer(RED4ext::Handle<RED4ext::IScriptable>& aPlayer, double aX, d
 
     bool result = false; // some versions return a bool, some return nothing
     const bool executed = RED4ext::ExecuteFunction(facility.instance, teleport, &result, args);
-    g_sdk->logger->InfoF(g_handle, "teleport: Teleport executed=%d returned=%d", executed ? 1 : 0, result ? 1 : 0);
+    if (!aQuiet)
+    {
+        g_sdk->logger->InfoF(g_handle, "teleport: Teleport executed=%d returned=%d", executed ? 1 : 0, result ? 1 : 0);
+    }
     return executed;
 }
 
@@ -146,6 +179,113 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
     g_sdk->logger->InfoF(g_handle, "command #%u: teleport V to x=%.2f y=%.2f z=%.2f", aCommand.seq, cx, cy, cz);
 
     link.AckCommand(aCommand.seq, TeleportPlayer(aPlayer, cx, cy, cz));
+}
+
+// Wraps an angle difference into -180..180.
+float WrapDegrees(float aDegrees)
+{
+    while (aDegrees > 180.0f)
+    {
+        aDegrees -= 360.0f;
+    }
+    while (aDegrees < -180.0f)
+    {
+        aDegrees += 360.0f;
+    }
+    return aDegrees;
+}
+
+// One frame of follow mode: ease V's position towards where Minecraft's player is, and teleport V there.
+// Minecraft only sends its position 20 times a second, so easing hides the steps between updates.
+void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext::IScriptable>& aPlayer,
+                const RED4ext::Vector4& aCurrent)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+
+    // Minecraft yaw: 0 = south, increasing clockwise from above. Cyberpunk yaw: 0 = north, increasing counter-clockwise.
+    const float targetYaw = WrapDegrees(180.0f - aMc.yaw);
+
+    if (!g_follow.active)
+    {
+        g_follow.active = true;
+        g_follow.failures = 0;
+        g_follow.haveSent = false;
+        g_follow.last = now;
+        g_follow.x = aMc.x;
+        g_follow.y = aMc.y;
+        g_follow.z = aMc.z;
+        g_follow.yaw = targetYaw;
+        g_sdk->logger->Info(g_handle, "follow: engaged, V now follows Minecraft's player");
+        (void)aCurrent;
+    }
+    else
+    {
+        double dt = std::chrono::duration<double>(now - g_follow.last).count();
+        g_follow.last = now;
+        if (dt > 0.1)
+        {
+            dt = 0.1;
+        }
+
+        const double dx = aMc.x - g_follow.x;
+        const double dy = aMc.y - g_follow.y;
+        const double dz = aMc.z - g_follow.z;
+        if (dx * dx + dy * dy + dz * dz > 8.0 * 8.0)
+        {
+            g_follow.x = aMc.x; // far away (a jump or a teleport): don't glide, just go
+            g_follow.y = aMc.y;
+            g_follow.z = aMc.z;
+        }
+        else
+        {
+            const double alpha = 1.0 - std::exp(-dt * 25.0);
+            g_follow.x += dx * alpha;
+            g_follow.y += dy * alpha;
+            g_follow.z += dz * alpha;
+        }
+
+        const float yawAlpha = static_cast<float>(1.0 - std::exp(-dt * 25.0));
+        g_follow.yaw = WrapDegrees(g_follow.yaw + WrapDegrees(targetYaw - g_follow.yaw) * yawAlpha);
+    }
+
+    // Standing still: don't keep re-teleporting to the same spot.
+    if (g_follow.haveSent)
+    {
+        const double mx = g_follow.x - g_follow.lastSentX;
+        const double my = g_follow.y - g_follow.lastSentY;
+        const double mz = g_follow.z - g_follow.lastSentZ;
+        if (mx * mx + my * my + mz * mz < 0.005 * 0.005 && std::fabs(WrapDegrees(g_follow.yaw - g_follow.lastSentYaw)) < 0.2f)
+        {
+            return;
+        }
+    }
+
+    // Minecraft (X east, Y up, -Z north) -> Cyberpunk (X east, Y north, Z up).
+    if (TeleportPlayer(aPlayer, g_follow.x, -g_follow.z, g_follow.y, g_follow.yaw, true))
+    {
+        g_follow.failures = 0;
+        g_follow.haveSent = true;
+        g_follow.lastSentX = g_follow.x;
+        g_follow.lastSentY = g_follow.y;
+        g_follow.lastSentZ = g_follow.z;
+        g_follow.lastSentYaw = g_follow.yaw;
+    }
+    else if (++g_follow.failures >= 30)
+    {
+        g_follow.gaveUp = true;
+        g_follow.active = false;
+        g_sdk->logger->Error(g_handle, "follow: the teleport keeps failing, giving up (use /ccstop then /ccfollow in Minecraft to retry)");
+    }
+}
+
+void StopFollow(const char* aReason)
+{
+    if (g_follow.active)
+    {
+        g_follow.active = false;
+        g_sdk->logger->InfoF(g_handle, "follow: stopped (%s)", aReason);
+    }
 }
 
 // Called every frame while the game is in its "Running" state (on the game's main thread).
@@ -193,6 +333,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
         {
             HandleCommand(command, player);
         }
+        StopFollow("no player right now");
         link.PublishPlayer(false, 0.0, 0.0, 0.0);
         if (g_hadPlayer)
         {
@@ -237,6 +378,24 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     if (haveCommand)
     {
         HandleCommand(command, player);
+    }
+
+    // Is Minecraft asking us to follow its player?
+    cybercraft::Link::McSnapshot mc{};
+    const bool mcAlive = link.McPid() != 0 && (GetTickCount64() - link.McHeartbeatMs()) < 3000;
+    const bool mcFollow = mcAlive && link.ReadMcState(mc) && (mc.flags & cybercraft::proto::kMcInWorld) != 0 &&
+                          (mc.flags & cybercraft::proto::kMcFollow) != 0;
+    if (mcFollow)
+    {
+        if (!g_follow.gaveUp)
+        {
+            StepFollow(mc, player, position);
+        }
+    }
+    else
+    {
+        g_follow.gaveUp = false;
+        StopFollow(mcAlive ? "Minecraft stopped asking" : "Minecraft is gone");
     }
 
     // Cyberpunk is Z-up (X east, Y north) in metres; Minecraft is Y-up (X east, -Z north) in blocks.
@@ -294,7 +453,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 4, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
