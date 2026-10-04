@@ -1,5 +1,6 @@
-add_library(CyberCraft SHARED src/main.cpp)
+add_library(CyberCraft SHARED src/main.cpp src/Link.cpp src/Link.hpp)
 
+target_include_directories(CyberCraft PRIVATE "${CMAKE_SOURCE_DIR}/protocol")
 target_link_libraries(CyberCraft PRIVATE RED4ext::SDK)
 target_compile_definitions(CyberCraft PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(CyberCraft PROPERTIES PREFIX "")

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "cybercraft",
+  "version": "${version}",
+  "name": "CyberCraft",
+  "description": "Play Cyberpunk 2077 with Minecraft physics, inventory and blocks.",
+  "authors": ["Kyran"],
+  "contact": {
+    "sources": "https://github.com/Kyran-0412/CyberCraft"
+  },
+  "environment": "client",
+  "entrypoints": {
+    "main": ["dev.cybercraft.CyberCraft"],
+    "client": ["dev.cybercraft.client.CyberCraftClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

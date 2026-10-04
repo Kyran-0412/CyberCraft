@@ -10,8 +10,8 @@ Tested against Cyberpunk 2077 **game version 2.31** (Steam), RED4ext and Cyber E
 
 ## Phases
 
-0. **Hello world**: a RED4ext plugin that logs V's position once a second. (current)
-1. **Link**: shared memory between the plugin and a Fabric mod; positions both ways.
+0. **Hello world**: a RED4ext plugin that logs V's position once a second. (done)
+1. **Link**: shared memory between the plugin and a Fabric mod. 1a: V's position reaches Minecraft (current). 1b: Minecraft's position goes back and moves V.
 2. **Walk**: Night City collision fed into Minecraft physics.
 3. **HUD and hand**: the Minecraft hotbar and held item drawn over the game.
 4. **Combat**: invisible Minecraft proxies for NPCs, damage both ways.
@@ -30,8 +30,21 @@ cmake --build build --config Release
 `<game>\red4ext\plugins\CyberCraft\CyberCraft.dll`. Then start the game and check
 `<game>\red4ext\logs\CyberCraft.log`.
 
+## Building the Minecraft mod (Windows)
+
+Needs JDK 25.
+
+```
+cd fabric
+.\gradlew runClient
+```
+
+This starts a development Minecraft with the mod. Start Cyberpunk (with the plugin) as well; the Minecraft
+console prints "linked to Cyberpunk" and V's position once a second. Minecraft's log is also in
+`fabric\run\logs\latest.log`.
+
 ## Credits
 
-Architecture and ideas from [SkyCraft](https://github.com/chasmlol/SkyCraft) (MIT). Plugin built on
+Architecture and ideas from [SkyCraft](https://github.com/chasmlol/SkyCraft) (MIT); see NOTICE.md. Plugin built on
 [RED4ext](https://github.com/WopsS/RED4ext) and [RED4ext.SDK](https://github.com/WopsS/RED4ext.SDK).
 Not affiliated with CD PROJEKT RED, Mojang or Microsoft.
