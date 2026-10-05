@@ -14,6 +14,7 @@
 // can see it, the drawing itself works. Every 5 seconds a status line goes to the log.
 
 #include "Overlay.hpp"
+#include "Depth.hpp"
 #include "Input.hpp"
 #include "Link.hpp"
 
@@ -695,6 +696,7 @@ float4 PS(VSOut i) : SV_Target
 		{
 			++g_presents;
 			LogStatus();
+			cybercraft::depth::Report();
 			if (!g_inHook && a_swapChain == g_gameSwapChain && (a_flags & DXGI_PRESENT_TEST) == 0) {
 				g_inHook = true;
 				Draw(a_swapChain);

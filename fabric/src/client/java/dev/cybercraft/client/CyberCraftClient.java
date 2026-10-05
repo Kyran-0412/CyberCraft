@@ -167,6 +167,14 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: vertical field of view set to %.2f.", fovOverride)));
 					return 1;
 				})));
+			// /ccdepthprobe  turns the depth-buffer probe on or off (it writes what it sees to Cyberpunk's CyberCraft.log).
+			dispatcher.register(ClientCommands.literal("ccdepthprobe").executes(c -> {
+				depthProbe = !depthProbe;
+				c.getSource().sendFeedback(Component.literal(depthProbe
+					? "CyberCraft: depth probe on. Look at Cyberpunk's CyberCraft.log in about 10 seconds; type /ccdepthprobe again to switch it off."
+					: "CyberCraft: depth probe off."));
+				return 1;
+			}));
 			// /ccalign  lines up the street where you stand with Minecraft's whole-number heights, so blocks built there sit exactly on it.
 			dispatcher.register(ClientCommands.literal("ccalign").executes(c -> {
 				c.getSource().sendFeedback(Component.literal(requestAlign()));
@@ -318,6 +326,7 @@ public final class CyberCraftClient implements ClientModInitializer {
 	// Which camera the plugin publishes (0 transform, 1 camera data, 2 projected, 3 projected with the position solved too) and whether the camera's tilt is applied (0 off, 1 on, -1 reversed).
 	private static volatile int camSource = 0;
 	private static volatile int rollMode = 1;
+	private static volatile boolean depthProbe;
 	private static boolean activeBefore;
 	private static boolean savedBobView;
 	private static Object savedDamageTilt;
@@ -596,12 +605,12 @@ public final class CyberCraftClient implements ClientModInitializer {
 		boolean screenOpen = client.gui.screen() != null;
 		float sensitivity = client.options.sensitivity().get().floatValue();
 		if (player == null) {
-			CyberLink.publishMcState(false, false, false, camSource, sensitivity, 0, 0, 0, 0, 0);
+			CyberLink.publishMcState(false, false, false, camSource, depthProbe, sensitivity, 0, 0, 0, 0, 0);
 		} else if (following) {
 			// The ground Minecraft walks on is Night City's own, so the player's position is V's position.
-			CyberLink.publishMcState(true, true, screenOpen, camSource, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, true, screenOpen, camSource, depthProbe, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
 		} else {
-			CyberLink.publishMcState(true, false, screenOpen, camSource, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, false, screenOpen, camSource, depthProbe, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
 		}
 
 		if (!haveState) {

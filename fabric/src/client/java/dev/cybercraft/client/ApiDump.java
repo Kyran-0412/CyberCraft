@@ -39,6 +39,10 @@ public final class ApiDump {
 		{ "com.mojang.renderpearl.api.commands.CommandEncoder", "" },
 		{ "com.mojang.renderpearl.api.device.GpuDevice", "" },
 		{ "com.mojang.blaze3d.systems.RenderSystem", "device,encoder,clear,target,viewport,scissor" },
+		{ "com.mojang.renderpearl.api.GpuFormat", "" },
+		{ "com.mojang.renderpearl.api.textures.GpuTexture", "" },
+		{ "com.mojang.renderpearl.api.textures.GpuTextureView", "" },
+		{ "com.mojang.renderpearl.api.buffers.GpuBuffer", "" },
 		{ "net.minecraft.client.renderer.FirstPersonHandsAndItemsRenderer", "render,hand,item,submit" },
 		{ "net.minecraft.client.gui.render.GuiRenderer", "render,clear,target,depth,submit" },
 	};
@@ -85,6 +89,13 @@ public final class ApiDump {
 		}
 		lines.add(header.toString());
 
+		if (cls.isEnum()) {
+			StringBuilder constants = new StringBuilder("  enum constants:");
+			for (Object constant : cls.getEnumConstants()) {
+				constants.append(' ').append(constant);
+			}
+			lines.add(constants.toString());
+		}
 		for (Field f : cls.getDeclaredFields()) {
 			if (matches(f.getName(), words)) {
 				lines.add("  field  " + modifiers(f.getModifiers()) + shorten(f.getType().getTypeName()) + " " + f.getName());

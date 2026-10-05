@@ -73,6 +73,9 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   streets are at heights like 22.6, so a block built "on" the street really starts 0.6 m under it; since Minecraft's blocks are
   drawn over the game and not hidden by the ground, that sunken part shows through the road and makes the block seem to slide as you
   move. Stand where you want to build, on level ground, and type `/ccalign` once before building (it is remembered between runs).
+* **`/ccdepthprobe`** (probe, changes nothing visible) watches the game's depth textures and writes what it sees to `CyberCraft.log` every
+  4 seconds: which textures are used as depth buffers, how big they are, what happens to them afterwards, and whether their memory is
+  reused. This is groundwork for hiding blocks behind buildings and the ground, which needs a copy of the game's depth buffer.
 * `/ccfov` shows the vertical field of view in use, `/ccfov <degrees>` overrides it to fine-tune, `/ccfov auto` goes
   back. `/ccworld` hides or shows the blocks. `/ccdump` writes the names of Minecraft's rendering methods to a file.
 

@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 14;
+	inline constexpr std::uint32_t kVersion = 15;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -81,6 +81,7 @@ namespace cybercraft::proto
 		kMcFollow = 1u << 1,   // Cyberpunk should keep moving V to (targetX, targetY, targetZ)
 		kMcScreenOpen = 1u << 2,  // a Minecraft screen (inventory, chat, ...) is open: the mouse moves a cursor instead of looking
 		// bits 3-4: which camera source the plugin should publish (see CamSource)
+		kMcDepthProbe = 1u << 5,  // watch the game's depth textures and log what is seen (/ccdepthprobe)
 	};
 	inline constexpr std::uint32_t kMcCamSourceShift = 3;
 

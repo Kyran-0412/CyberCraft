@@ -7,6 +7,7 @@
 // log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
 #include "Camera.hpp"
+#include "Depth.hpp"
 #include "Ground.hpp"
 #include "Input.hpp"
 #include "Mapping.hpp"
@@ -558,6 +559,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     {
         cybercraft::camera::SetSource(static_cast<int>((mc.flags >> cybercraft::proto::kMcCamSourceShift) & 3u));
     }
+    cybercraft::depth::SetProbe(mcAlive && (mc.flags & cybercraft::proto::kMcDepthProbe) != 0);
     cybercraft::input::Update(mcFollow && !g_follow.gaveUp, true, mc);
     if (mcFollow)
     {
@@ -602,6 +604,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         cybercraft::overlay::Init(aHandle, aSdk);
         cybercraft::input::Init(aHandle, aSdk);
         cybercraft::camera::Init(aHandle, aSdk);
+        cybercraft::depth::Init(aHandle, aSdk);
         cybercraft::mapping::Load();
         aSdk->logger->InfoF(aHandle, "vertical offset between the game and Minecraft: %.3f", cybercraft::mapping::Offset());
 
@@ -627,6 +630,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
     }
     case RED4ext::v1::EMainReason::Unload:
     {
+        cybercraft::depth::Shutdown();
         cybercraft::input::Uninstall();
         cybercraft::overlay::Uninstall();
         cybercraft::Link::Get().Close();
@@ -641,7 +645,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 12, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 13, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

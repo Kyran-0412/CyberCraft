@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 14;
+	public static final int VERSION = 15;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -50,6 +50,7 @@ public final class Proto {
 	public static final int MC_IN_WORLD = 1;
 	public static final int MC_FOLLOW = 2;
 	public static final int MC_SCREEN_OPEN = 4; // a Minecraft screen (inventory, chat, ...) is open
+	public static final int MC_DEPTH_PROBE = 1 << 5; // watch the game's depth textures and log what is seen
 	public static final int MC_CAM_SOURCE_SHIFT = 3; // bits 3-4: which camera the plugin should publish: 0 transform, 1 data, 2 projected
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock) ----
