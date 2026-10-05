@@ -6,19 +6,23 @@
 // position Minecraft's player has. Once a second it writes a line to the RED4ext
 // log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
+#include "Ground.hpp"
 #include "Link.hpp"
 
 #include <cybercraft_protocol.h>
 
 #include <RED4ext/RED4ext.hpp>
 #include <RED4ext/Scripting/Natives/Generated/EulerAngles.hpp>
+#include <RED4ext/Scripting/Natives/Quaternion.hpp>
 #include <RED4ext/Scripting/Natives/ScriptGameInstance.hpp>
 #include <RED4ext/Scripting/Natives/Vector4.hpp>
 
 #include <Windows.h>
 
 #include <chrono>
+#include <cctype>
 #include <cmath>
+#include <string>
 
 namespace
 {
@@ -39,12 +43,20 @@ struct FollowState
     bool gaveUp = false; // too many failures; stays off until Minecraft stops asking and asks again
     double x = 0.0, y = 0.0, z = 0.0; // smoothed target, protocol (Minecraft-axes) coordinates
     float yaw = 0.0f;                  // smoothed, Cyberpunk degrees
+    float pitch = 0.0f;                // smoothed, Minecraft degrees
     double lastSentX = 0.0, lastSentY = 0.0, lastSentZ = 0.0;
     float lastSentYaw = 0.0f;
     bool haveSent = false;
     int failures = 0;
     std::chrono::steady_clock::time_point last{};
 } g_follow;
+
+// V's first-person camera: used to tilt V's view up and down to match Minecraft's.
+RED4ext::CClassFunction* g_getFppCamera = nullptr;
+RED4ext::CClassFunction* g_cameraSetOrientation = nullptr;
+bool g_cameraLookedUp = false;
+bool g_cameraBroken = false;
+bool g_cameraLoggedFirst = false;
 
 // Cached after the first successful teleport (class and function pointers don't change while the game runs).
 RED4ext::CClass* g_facilityCls = nullptr;
@@ -181,6 +193,112 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
     link.AckCommand(aCommand.seq, TeleportPlayer(aPlayer, cx, cy, cz));
 }
 
+bool ContainsIgnoreCase(const std::string& aText, const char* aPart)
+{
+    std::string text = aText;
+    std::string part = aPart;
+    for (auto& c : text) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+    for (auto& c : part) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+    return text.find(part) != std::string::npos;
+}
+
+// Writes the camera component's functions and properties that look related to looking up and down to the
+// log once, so that if the guess below is wrong, the right names are in the file.
+void DumpCameraApi(RED4ext::CClass* aClass)
+{
+    static const char* kWords[] = {"pitch", "orient", "rotat", "tilt", "look", "heading", "yaw"};
+    g_sdk->logger->InfoF(g_handle, "camera: V's camera component is a %s; functions and properties that may matter:", aClass->name.ToString());
+    int lines = 0;
+    for (auto* cls = aClass; cls && lines < 80; cls = cls->parent)
+    {
+        for (uint32_t i = 0; i < cls->funcs.Size() && lines < 80; ++i)
+        {
+            const std::string name = cls->funcs[i]->shortName.ToString();
+            for (auto* word : kWords)
+            {
+                if (ContainsIgnoreCase(name, word))
+                {
+                    g_sdk->logger->InfoF(g_handle, "  fn   %s::%s", cls->name.ToString(), name.c_str());
+                    ++lines;
+                    break;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < cls->props.Size() && lines < 80; ++i)
+        {
+            const std::string name = cls->props[i]->name.ToString();
+            for (auto* word : kWords)
+            {
+                if (ContainsIgnoreCase(name, word))
+                {
+                    g_sdk->logger->InfoF(g_handle, "  prop %s::%s", cls->name.ToString(), name.c_str());
+                    ++lines;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Tilts V's first-person camera to look up or down like the Minecraft player does. aMcPitch is Minecraft's
+// pitch in degrees: -90 straight up, +90 straight down. (Teleport can only turn V left and right.)
+void ApplyCameraPitch(RED4ext::Handle<RED4ext::IScriptable>& aPlayer, float aMcPitch)
+{
+    if (g_cameraBroken)
+    {
+        return;
+    }
+
+    if (!g_cameraLookedUp)
+    {
+        g_cameraLookedUp = true;
+        auto rtti = RED4ext::CRTTISystem::Get();
+        auto puppet = rtti->GetClass("PlayerPuppet");
+        g_getFppCamera = puppet ? puppet->GetFunction("GetFPPCameraComponent") : nullptr;
+        if (!g_getFppCamera)
+        {
+            g_sdk->logger->Error(g_handle, "camera: could not find PlayerPuppet::GetFPPCameraComponent; up and down looking is off");
+            g_cameraBroken = true;
+            return;
+        }
+    }
+
+    RED4ext::Handle<RED4ext::IScriptable> camera;
+    RED4ext::ExecuteFunction(aPlayer.instance, g_getFppCamera, &camera);
+    if (!camera)
+    {
+        return; // no camera right now (a cutscene, a loading screen)
+    }
+
+    if (!g_cameraSetOrientation)
+    {
+        auto cls = camera.instance->GetType();
+        DumpCameraApi(cls);
+        g_cameraSetOrientation = cls ? cls->GetFunction("SetLocalOrientation") : nullptr;
+        if (!g_cameraSetOrientation)
+        {
+            g_sdk->logger->Error(g_handle, "camera: no SetLocalOrientation on V's camera; up and down looking is off (see the list above)");
+            g_cameraBroken = true;
+            return;
+        }
+    }
+
+    // A tilt about the camera's own left-right axis (X). Minecraft's pitch is positive looking down, so flip it.
+    const float pitch = std::fmax(-85.0f, std::fmin(85.0f, aMcPitch));
+    const float half = -pitch * 3.14159265f / 180.0f * 0.5f;
+    RED4ext::Quaternion orientation(std::sin(half), 0.0f, 0.0f, std::cos(half));
+
+    RED4ext::StackArgs_t args;
+    args.emplace_back(nullptr, &orientation);
+    const bool executed = RED4ext::ExecuteFunction(camera.instance, g_cameraSetOrientation, nullptr, args);
+
+    if (!g_cameraLoggedFirst)
+    {
+        g_cameraLoggedFirst = true;
+        g_sdk->logger->InfoF(g_handle, "camera: set pitch %.1f (executed=%d)", pitch, executed ? 1 : 0);
+    }
+}
+
 // Wraps an angle difference into -180..180.
 float WrapDegrees(float aDegrees)
 {
@@ -216,6 +334,7 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
         g_follow.y = aMc.y;
         g_follow.z = aMc.z;
         g_follow.yaw = targetYaw;
+        g_follow.pitch = aMc.pitch;
         g_sdk->logger->Info(g_handle, "follow: engaged, V now follows Minecraft's player");
         (void)aCurrent;
     }
@@ -247,7 +366,11 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
 
         const float yawAlpha = static_cast<float>(1.0 - std::exp(-dt * 25.0));
         g_follow.yaw = WrapDegrees(g_follow.yaw + WrapDegrees(targetYaw - g_follow.yaw) * yawAlpha);
+        g_follow.pitch += (aMc.pitch - g_follow.pitch) * yawAlpha; // Minecraft only sends 20 updates a second: ease between them
     }
+
+    // Looking up and down is separate from the position; do it every frame.
+    ApplyCameraPitch(aPlayer, g_follow.pitch);
 
     // Standing still: don't keep re-teleporting to the same spot.
     if (g_follow.haveSent)
@@ -334,6 +457,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
             HandleCommand(command, player);
         }
         StopFollow("no player right now");
+        cybercraft::ground::Reset();
         link.PublishPlayer(false, 0.0, 0.0, 0.0);
         if (g_hadPlayer)
         {
@@ -398,6 +522,12 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
         StopFollow(mcAlive ? "Minecraft stopped asking" : "Minecraft is gone");
     }
 
+    // Look at the ground around V (only worth doing while Minecraft is running with a world open).
+    if (mcAlive && (mc.flags & cybercraft::proto::kMcInWorld) != 0)
+    {
+        cybercraft::ground::Update(position.X, position.Y, position.Z);
+    }
+
     // Cyberpunk is Z-up (X east, Y north) in metres; Minecraft is Y-up (X east, -Z north) in blocks.
     link.PublishPlayer(true, position.X, position.Z, -position.Y);
 
@@ -418,6 +548,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
     {
         g_handle = aHandle;
         g_sdk = aSdk;
+        cybercraft::ground::Init(aHandle, aSdk);
 
         aSdk->logger->InfoF(aHandle, "CyberCraft loaded (game version %u.%u.%u)", static_cast<unsigned>(aSdk->runtime->major),
                             static_cast<unsigned>(aSdk->runtime->minor), static_cast<unsigned>(aSdk->runtime->patch));
@@ -453,7 +584,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 4, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 6, 1);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

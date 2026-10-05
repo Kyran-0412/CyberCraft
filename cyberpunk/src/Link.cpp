@@ -47,6 +47,18 @@ namespace cybercraft
 		base_ = static_cast<std::uint8_t*>(view);
 		std::memset(base_, 0, static_cast<std::size_t>(size));
 
+		// Every ground slot starts out as "no data": a cell that can't exist, and no ground.
+		{
+			float noGround = proto::kNoGround;
+			std::uint32_t bits;
+			std::memcpy(&bits, &noGround, sizeof(bits));
+			const std::uint64_t empty = std::uint64_t(bits) | (std::uint64_t(0x8000) << 32) | (std::uint64_t(0x8000) << 48);
+			auto* slots = reinterpret_cast<std::uint64_t*>(base_ + proto::kOffGround);
+			for (std::uint32_t i = 0; i < proto::kGroundN * proto::kGroundN; ++i) {
+				slots[i] = empty;
+			}
+		}
+
 		auto* header = reinterpret_cast<proto::Header*>(base_ + proto::kOffHeader);
 		header->version = proto::kVersion;
 		header->gamePid = ::GetCurrentProcessId();

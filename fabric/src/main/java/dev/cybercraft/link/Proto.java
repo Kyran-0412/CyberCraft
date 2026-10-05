@@ -6,9 +6,9 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 3;
+	public static final int VERSION = 4;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
-	public static final long MAPPING_BYTES = 0x1000;
+	public static final long MAPPING_BYTES = 0x9000;
 
 	// ---- header @0x0 ----
 	public static final long OFF_HEADER = 0x0;
@@ -59,6 +59,13 @@ public final class Proto {
 	public static final int RESULT_NONE = 0;
 	public static final int RESULT_OK = 1;
 	public static final int RESULT_FAILED = 2;
+
+	// ---- ground heights @0x1000 (Cyberpunk -> Minecraft) ----
+	// A GROUND_N x GROUND_N torus of 64-bit slots, one per 1 m cell (= Minecraft block column):
+	//   bits 0..31 float height (Minecraft Y), bits 32..47 int16 bx, bits 48..63 int16 bz.
+	public static final long OFF_GROUND = 0x1000;
+	public static final int GROUND_N = 64;
+	public static final int GROUND_RADIUS = 20; // cells scanned around V
 
 	private Proto() {
 	}

@@ -1,4 +1,4 @@
-add_library(CyberCraft SHARED src/main.cpp src/Link.cpp src/Link.hpp)
+add_library(CyberCraft SHARED src/main.cpp src/Link.cpp src/Link.hpp src/Ground.cpp src/Ground.hpp)
 
 target_include_directories(CyberCraft PRIVATE "${CMAKE_SOURCE_DIR}/protocol")
 target_link_libraries(CyberCraft PRIVATE RED4ext::SDK)

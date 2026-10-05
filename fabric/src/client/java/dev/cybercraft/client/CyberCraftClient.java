@@ -9,19 +9,26 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.phys.Vec3;
 
 public final class CyberCraftClient implements ClientModInitializer {
 	private static final CyberLink.GameState STATE = new CyberLink.GameState();
+	private static final long SYNC_TIMEOUT_MS = 20_000;
+
 	private static int ticks;
 	private static boolean wasActive;
 	// The teleport we asked for and haven't heard back about yet (0: none).
 	private static int pendingSeq;
 
-	// Follow mode: V is moved to where Minecraft's player is, plus a fixed offset. The offset is worked out
-	// when /ccfollow is typed, so V starts exactly where V is and moves by whatever Minecraft's player moves.
+	// /ccfollow, step 1 ("syncing"): the player is moved to V's spot and held there until the ground
+	// under it has been built. Step 2 ("following"): V copies the player's movement.
+	private static boolean syncing;
 	private static boolean following;
-	private static double offsetX, offsetY, offsetZ;
+	private static double holdX, holdY, holdZ;
+	private static long syncStartedMs;
 
 	@Override
 	public void onInitializeClient() {
@@ -49,7 +56,8 @@ public final class CyberCraftClient implements ClientModInitializer {
 								}))))
 			);
 
-			// /ccfollow  V starts copying this Minecraft player's movement.   /ccstop  V stops.
+			// /ccfollow  builds Night City's ground around V, moves you onto it, and V starts copying you.
+			// /ccstop    V stops following, and the ground stops being updated.
 			dispatcher.register(ClientCommands.literal("ccfollow").executes(c -> {
 				c.getSource().sendFeedback(Component.literal(startFollowing()));
 				return 1;
@@ -83,9 +91,13 @@ public final class CyberCraftClient implements ClientModInitializer {
 	}
 
 	private static String startFollowing() {
-		LocalPlayer player = Minecraft.getInstance().player;
+		Minecraft client = Minecraft.getInstance();
+		LocalPlayer player = client.player;
 		if (player == null) {
 			return "CyberCraft: open a world first.";
+		}
+		if (client.getSingleplayerServer() == null) {
+			return "CyberCraft: this needs a singleplayer world.";
 		}
 		if (!CyberLink.active()) {
 			return "CyberCraft: Cyberpunk isn't linked. Start the game with the plugin installed.";
@@ -93,21 +105,50 @@ public final class CyberCraftClient implements ClientModInitializer {
 		if (!CyberLink.readGameState(STATE) || !STATE.inGame()) {
 			return "CyberCraft: Cyberpunk is linked, but no save is loaded.";
 		}
-		offsetX = STATE.x - player.getX();
-		offsetY = STATE.y - player.getY();
-		offsetZ = STATE.z - player.getZ();
-		following = true;
-		CyberCraft.LOG.info("CyberCraft: follow on (offset {}, {}, {})", String.format("%.2f", offsetX), String.format("%.2f", offsetY), String.format("%.2f", offsetZ));
-		return "CyberCraft: V now follows you. Walk around in this window. /ccstop to stop.";
+
+		// Start building the ground, and put the player at V's spot (above the ground if we already know it).
+		GroundMirror.start();
+		double surface = GroundMirror.surfaceAt(STATE.x, STATE.z);
+		holdX = STATE.x;
+		holdZ = STATE.z;
+		holdY = Double.isNaN(surface) ? STATE.y + 2.0 : surface;
+		teleportPlayer(client, holdX, holdY, holdZ);
+		following = false;
+		syncing = true;
+		syncStartedMs = System.currentTimeMillis();
+		CyberCraft.LOG.info("CyberCraft: moving the player to V's spot ({}, {}, {}) and building the ground",
+			String.format("%.2f", holdX), String.format("%.2f", holdY), String.format("%.2f", holdZ));
+		return "CyberCraft: building Night City's ground around V. V will follow you once it's ready. /ccstop to stop.";
 	}
 
 	private static String stopFollowing() {
-		if (!following) {
-			return "CyberCraft: V wasn't following.";
+		if (!following && !syncing && !GroundMirror.enabled()) {
+			return "CyberCraft: nothing to stop.";
 		}
 		following = false;
+		syncing = false;
+		GroundMirror.stop();
 		CyberCraft.LOG.info("CyberCraft: follow off");
 		return "CyberCraft: V stopped following.";
+	}
+
+	/** Moves the Minecraft player (and its copy on the integrated server) to a position. Same approach as SkyCraft. */
+	private static void teleportPlayer(Minecraft client, double x, double y, double z) {
+		LocalPlayer player = client.player;
+		player.setPos(x, y, z);
+		player.setDeltaMovement(Vec3.ZERO);
+		player.resetFallDistance();
+		var server = client.getSingleplayerServer();
+		if (server != null) {
+			var uuid = player.getUUID();
+			server.execute(() -> {
+				ServerPlayer sp = server.getPlayerList().getPlayer(uuid);
+				if (sp != null) {
+					sp.teleportTo(x, y, z);
+					sp.resetFallDistance();
+				}
+			});
+		}
 	}
 
 	private static void tick(Minecraft client) {
@@ -120,28 +161,68 @@ public final class CyberCraftClient implements ClientModInitializer {
 			if (!active) {
 				pendingSeq = 0;
 				following = false;
+				syncing = false;
+				GroundMirror.stop();
 			}
 		}
 		if (!active) {
 			return;
 		}
 
-		// Tell Cyberpunk where Minecraft's player is (every tick). With follow off it just says "don't move V".
 		LocalPlayer player = client.player;
 		if (player == null) {
 			following = false;
+			syncing = false;
+			GroundMirror.stop();
+		}
+
+		boolean second = ++ticks % 20 == 0;
+		boolean needState = second || pendingSeq != 0 || following || syncing || GroundMirror.enabled();
+		boolean haveState = needState && CyberLink.readGameState(STATE);
+
+		if (haveState) {
+			GroundMirror.tick(client, STATE);
+		}
+
+		// Step 1: hold the player at V's spot until the ground has been built under them.
+		if (syncing && player != null) {
+			// Stand on the ground as soon as Cyberpunk has told us where it is; until then hover near V.
+			double surface = GroundMirror.surfaceAt(holdX, holdZ);
+			boolean known = !Double.isNaN(surface);
+			if (known) {
+				holdY = surface;
+			}
+			player.setPos(holdX, holdY, holdZ);
+			player.setDeltaMovement(Vec3.ZERO);
+			player.resetFallDistance();
+			BlockPos below = new BlockPos((int) Math.floor(holdX), (int) Math.floor(holdY) - 1, (int) Math.floor(holdZ));
+			if (known && client.level != null && !client.level.getBlockState(below).isAir()) {
+				syncing = false;
+				following = true;
+				CyberCraft.LOG.info("CyberCraft: ground is ready, V now follows the player");
+			} else if (System.currentTimeMillis() - syncStartedMs > SYNC_TIMEOUT_MS) {
+				syncing = false;
+				GroundMirror.stop();
+				CyberCraft.LOG.warn("CyberCraft: gave up waiting for the ground under V ({}; ground under V known: {})", GroundMirror.describe(), known);
+			} else if (second) {
+				CyberCraft.LOG.info("CyberCraft: waiting for the ground under V ({}; ground under V known: {})", GroundMirror.describe(), known);
+			}
+		}
+
+		// Tell Cyberpunk where Minecraft's player is (every tick). With follow off it just says "don't move V".
+		if (player == null) {
 			CyberLink.publishMcState(false, false, 0, 0, 0, 0, 0);
 		} else if (following) {
-			CyberLink.publishMcState(true, true, player.getX() + offsetX, player.getY() + offsetY, player.getZ() + offsetZ, player.getYRot(), player.getXRot());
+			// V's height is the player's, corrected for the gap between the block tops and the real street.
+			double x = player.getX();
+			double z = player.getZ();
+			double y = player.getY() + GroundMirror.groundError(x, z);
+			CyberLink.publishMcState(true, true, x, y, z, player.getYRot(), player.getXRot());
 		} else {
 			CyberLink.publishMcState(true, false, 0, 0, 0, player.getYRot(), player.getXRot());
 		}
 
-		boolean second = ++ticks % 20 == 0;
-		if (!second && pendingSeq == 0) {
-			return;
-		}
-		if (!CyberLink.readGameState(STATE)) {
+		if (!haveState) {
 			return;
 		}
 

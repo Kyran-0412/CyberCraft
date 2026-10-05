@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 3;
+	inline constexpr std::uint32_t kVersion = 4;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -26,7 +26,10 @@ namespace cybercraft::proto
 	inline constexpr std::uint64_t kOffGameState = 0x100;  // Cyberpunk -> Minecraft
 	inline constexpr std::uint64_t kOffMcState = 0x200;    // Minecraft -> Cyberpunk: where Minecraft wants V
 	inline constexpr std::uint64_t kOffMcCommand = 0x300;  // Minecraft -> Cyberpunk: one-off commands
-	inline constexpr std::uint64_t kMappingBytes = 0x1000;
+	inline constexpr std::uint64_t kOffGround = 0x1000;   // Cyberpunk -> Minecraft: ground heights, see GroundSlot
+	inline constexpr std::uint32_t kGroundN = 64;         // the ground grid is kGroundN x kGroundN cells (a torus)
+	inline constexpr std::int32_t  kGroundRadius = 20;    // cells scanned around V (must be < kGroundN / 2)
+	inline constexpr std::uint64_t kMappingBytes = kOffGround + std::uint64_t(kGroundN) * kGroundN * 8;
 
 	// ---- header @0x0 ------------------------------------------------------------------------
 	struct Header
@@ -97,4 +100,18 @@ namespace cybercraft::proto
 		double        x, y, z;
 	};
 	static_assert(sizeof(McCommand) == 0x20);
+
+	// ---- ground heights @0x1000 --------------------------------------------------------------
+	// Cyberpunk shoots rays down onto the street around V and stores what it finds, one 1 m x 1 m cell
+	// (= one Minecraft block column) per slot. The grid wraps around (a torus): the cell (bx, bz) lives in
+	// slot ((bz mod N) * N + (bx mod N)), and the slot says which cell it currently holds, so Minecraft can
+	// tell fresh data from old data left over from another place. Each slot is one 64-bit value, written
+	// atomically, so no lock is needed.
+	//
+	//   bits  0..31  float  height of the ground surface (Minecraft Y = Cyberpunk Z), or kNoGround
+	//   bits 32..47  int16  bx   Minecraft block X of the cell
+	//   bits 48..63  int16  bz   Minecraft block Z of the cell
+	//
+	// Cell (bx, bz) is the square X in [bx, bx+1), Z in [bz, bz+1) in Minecraft coordinates.
+	inline constexpr float kNoGround = -1.0e30f;
 }

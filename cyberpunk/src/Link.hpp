@@ -14,6 +14,9 @@ namespace cybercraft
 		void Close();
 		bool IsOpen() const { return base_ != nullptr; }
 
+		// Start of the shared memory (for the ground grid, which Ground.cpp writes directly).
+		std::uint8_t* Base() const { return base_; }
+
 		// Call every frame: proves to Minecraft that this game is alive.
 		void Beat();
 

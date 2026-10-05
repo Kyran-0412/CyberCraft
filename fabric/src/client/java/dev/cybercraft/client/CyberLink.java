@@ -195,6 +195,26 @@ public final class CyberLink {
 		return base + 2;
 	}
 
+	/**
+	 * The ground height Cyberpunk found for the Minecraft block column (bx, bz): the height in blocks,
+	 * {@code Float.NEGATIVE_INFINITY} if it looked and found no ground, or {@code NaN} if that cell hasn't
+	 * been scanned (yet).
+	 */
+	public static float groundHeight(int bx, int bz) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return Float.NaN;
+		}
+		int ix = Math.floorMod(bx, GROUND_N);
+		int iz = Math.floorMod(bz, GROUND_N);
+		long v = s.get(JAVA_LONG, OFF_GROUND + ((long) iz * GROUND_N + ix) * 8L);
+		if ((short) (v >>> 32) != (short) bx || (short) (v >>> 48) != (short) bz) {
+			return Float.NaN; // the slot holds some other cell
+		}
+		float h = Float.intBitsToFloat((int) v);
+		return h < -1.0e29f ? Float.NEGATIVE_INFINITY : h;
+	}
+
 	/** Seqlock read of the game state into {@code out}. Returns false if the link is down or the writer was mid-update every try. */
 	public static boolean readGameState(GameState out) {
 		MemorySegment s = shm;
