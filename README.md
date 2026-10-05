@@ -13,7 +13,7 @@ Tested against Cyberpunk 2077 **game version 2.31** (Steam), RED4ext and Cyber E
 0. **Hello world**: a RED4ext plugin that logs V's position once a second. (done)
 1. **Link**: shared memory between the plugin and a Fabric mod. 1a: V's position reaches Minecraft (done). 1b-i: a Minecraft command teleports V (done). 1b-ii: Minecraft's player position drives V (done).
 2. **Walk**: Night City collision fed into Minecraft physics. 2a: the ground around V built as blocks from raycasts (done). 2b-i: the ground as smooth invisible collision instead of blocks (done). 2b-ii: walls, trees, lamp posts and other obstacles (current). 2b-iii: bridges and other layers.
-3. **HUD and hand**: the Minecraft hotbar and held item drawn over the game.
+3. **Input and display**: 3b: the Minecraft hotbar, hearts, held item and screens drawn over the game (current). 3a: keyboard and mouse forwarded to Minecraft so you play in the Cyberpunk window.
 4. **Combat**: invisible Minecraft proxies for NPCs, damage both ways.
 5. **Blocks**: place and break blocks in Night City, depth-composited.
 
@@ -48,6 +48,15 @@ console prints "linked to Cyberpunk" and V's position once a second. Minecraft's
 Start Cyberpunk and the development Minecraft, load a save in Cyberpunk, and in Minecraft open any world.
 Press `T` and type `/cctp` (V moves 5 m up), or `/cctp <east> <north> <up>` for an offset in metres.
 The result is in Minecraft's console and in `red4ext\logs\CyberCraft.log`.
+
+### Seeing Minecraft's HUD over Cyberpunk (Phase 3b)
+
+While `/ccfollow` is on, Minecraft stops drawing the world (you still see it in Cyberpunk) and draws only its hotbar,
+hearts, held item and screens on a transparent background. The plugin hooks the game's swapchain and draws those over
+every frame. For the first 30 seconds, until the first HUD frame arrives, a small cyan square in the top-left corner
+of the Cyberpunk screen shows that the drawing itself works. Make the Minecraft window about as big as the Cyberpunk
+screen (the HUD is drawn at the Minecraft window's size, then stretched to the screen). Cyberpunk should be in
+borderless or windowed mode with DLSS frame generation off while testing.
 
 ### Trying follow mode and the ground (Phase 2b-ii)
 

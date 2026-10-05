@@ -45,7 +45,8 @@ namespace cybercraft
 		}
 
 		base_ = static_cast<std::uint8_t*>(view);
-		std::memset(base_, 0, static_cast<std::size_t>(size));
+		// The pixel slots at the end are big and the OS hands them out zeroed already: only clear the control part.
+		std::memset(base_, 0, static_cast<std::size_t>(proto::kOffOverlayPixels));
 
 		// Every ground slot starts out as "no data": a cell that can't exist, and no ground.
 		{
@@ -58,6 +59,8 @@ namespace cybercraft
 				slots[i] = empty;
 			}
 		}
+
+		reinterpret_cast<proto::OverlayCtl*>(base_ + proto::kOffOverlayCtl)->front = overlayFront_;
 
 		auto* header = reinterpret_cast<proto::Header*>(base_ + proto::kOffHeader);
 		header->version = proto::kVersion;
@@ -101,6 +104,7 @@ namespace cybercraft
 		seq.store(start + 1, std::memory_order_relaxed);  // odd: write in progress
 		std::atomic_thread_fence(std::memory_order_release);
 
+		inGame_ = a_inGame;
 		state->flags = a_inGame ? proto::kGameInGame : 0;
 		state->posX = a_x;
 		state->posY = a_y;
@@ -167,6 +171,44 @@ namespace cybercraft
 	{
 		cmdAck_ = a_seq;
 		cmdResult_ = a_ok ? proto::kResultOk : proto::kResultFailed;
+	}
+
+	bool Link::AcquireOverlayFrame()
+	{
+		if (!base_) {
+			return false;
+		}
+		auto* ctl = reinterpret_cast<proto::OverlayCtl*>(base_ + proto::kOffOverlayCtl);
+		auto  state = Atomic(ctl->state);
+		if ((state.load(std::memory_order_acquire) & proto::kOverlayDirty) == 0) {
+			return false;  // nothing newer than the frame we already have
+		}
+		const std::uint32_t old = state.exchange(overlayFront_, std::memory_order_acq_rel);
+		if ((old & proto::kOverlayDirty) == 0) {
+			return false;
+		}
+		overlayFront_ = old & 3;
+		Atomic(ctl->front).store(overlayFront_, std::memory_order_release);  // so a Minecraft that starts later can work out its own slot
+		return true;
+	}
+
+	const proto::OverlaySlotHdr* Link::OverlayFrontHeader() const
+	{
+		return reinterpret_cast<const proto::OverlaySlotHdr*>(base_ + proto::kOffOverlaySlotHdr) + overlayFront_;
+	}
+
+	const std::uint8_t* Link::OverlayFrontPixels() const
+	{
+		return base_ + proto::kOffOverlayPixels + std::uint64_t(overlayFront_) * proto::kOverlaySlotBytes;
+	}
+
+	std::uint64_t Link::OverlayFramesPublished() const
+	{
+		if (!base_) {
+			return 0;
+		}
+		auto* ctl = reinterpret_cast<proto::OverlayCtl*>(base_ + proto::kOffOverlayCtl);
+		return Atomic(ctl->framesPublished).load(std::memory_order_acquire);
 	}
 
 	std::uint32_t Link::McPid() const

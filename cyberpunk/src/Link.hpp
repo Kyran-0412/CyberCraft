@@ -2,6 +2,11 @@
 
 #include <cstdint>
 
+namespace cybercraft::proto
+{
+	struct OverlaySlotHdr;
+}
+
 namespace cybercraft
 {
 	// The Cyberpunk end of the shared-memory link. We create the mapping; the Minecraft mod opens it.
@@ -13,6 +18,7 @@ namespace cybercraft
 		bool Create();  // idempotent
 		void Close();
 		bool IsOpen() const { return base_ != nullptr; }
+		bool InGame() const { return inGame_; }  // a save is loaded and V exists
 
 		// Start of the shared memory (for the ground grid, which Ground.cpp writes directly).
 		std::uint8_t* Base() const { return base_; }
@@ -49,6 +55,13 @@ namespace cybercraft
 		// Tell Minecraft what happened to that command; sent with the next PublishPlayer.
 		void AckCommand(std::uint32_t a_seq, bool a_ok);
 
+		// The newest overlay frame (Minecraft's HUD). AcquireOverlayFrame() makes it the front frame, if there is a
+		// newer one than the front frame already; the accessors then read the front frame. Render thread only.
+		bool AcquireOverlayFrame();
+		const proto::OverlaySlotHdr* OverlayFrontHeader() const;
+		const std::uint8_t* OverlayFrontPixels() const;
+		std::uint64_t OverlayFramesPublished() const;
+
 		std::uint32_t McPid() const;
 		std::uint64_t McHeartbeatMs() const;
 
@@ -61,5 +74,7 @@ namespace cybercraft
 		std::uint32_t lastSeenCmdSeq_{ 0 };
 		std::uint32_t cmdAck_{ 0 };
 		std::uint32_t cmdResult_{ 0 };
+		std::uint32_t overlayFront_{ 2 };
+		bool inGame_{ false };
 	};
 }

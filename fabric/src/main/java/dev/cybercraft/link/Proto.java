@@ -6,9 +6,8 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 7;
+	public static final int VERSION = 8;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
-	public static final long MAPPING_BYTES = 0x19000;
 
 	// ---- header @0x0 ----
 	public static final long OFF_HEADER = 0x0;
@@ -71,6 +70,29 @@ public final class Proto {
 	public static final int GROUND_RADIUS = 28; // cells scanned around V
 	public static final int OBSTACLE_SUB = 8; // sub-squares per cell side
 	public static final double OBSTACLE_HEIGHT = 2.5; // how tall a blocked sub-square is
+
+	// ---- overlay triple buffer (Minecraft -> Cyberpunk): the HUD, hand and screens as RGBA pixels ----
+	// state: bits 0-1 = index of the "middle" slot, bit 2 = the middle slot holds a frame not yet drawn. Minecraft
+	// renders into its private back slot, then exchanges state with (back | OVERLAY_DIRTY) and keeps the returned
+	// index as its new back slot. At the start: middle = 0, Minecraft's back slot = 1, Cyberpunk's front slot = 2.
+	public static final long OFF_OVERLAY_CTL = 0x19000;
+	public static final long OC_STATE = 0; // u32
+	public static final long OC_FRONT = 4; // u32, the slot Cyberpunk is showing
+	public static final long OC_FRAMES_PUBLISHED = 8; // u64
+	public static final long OFF_OVERLAY_SLOT_HDR = 0x19040;
+	public static final long SLOT_HDR_SIZE = 0x40;
+	public static final long SH_WIDTH = 0; // u32
+	public static final long SH_HEIGHT = 4; // u32
+	public static final long SH_FLAGS = 8; // u32, bit 0: rows are bottom-up
+	public static final long SH_FRAME_ID = 16; // u64
+	public static final long OFF_OVERLAY_PIXELS = 0x20000;
+	public static final int MAX_OVERLAY_W = 3840;
+	public static final int MAX_OVERLAY_H = 2160;
+	public static final long OVERLAY_SLOT_BYTES = (long) MAX_OVERLAY_W * MAX_OVERLAY_H * 4;
+	public static final int OVERLAY_SLOTS = 3;
+	public static final int OVERLAY_DIRTY = 1 << 2;
+
+	public static final long MAPPING_BYTES = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * OVERLAY_SLOTS;
 
 	private Proto() {
 	}

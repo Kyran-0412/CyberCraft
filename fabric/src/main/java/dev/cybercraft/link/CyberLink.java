@@ -51,6 +51,10 @@ public final class CyberLink {
 
 	private static long mcFrame;
 
+	private static final VarHandle INT_VH = JAVA_INT.varHandle();
+	private static final VarHandle LONG_VH = JAVA_LONG.varHandle();
+	private static int overlayBack = 1; // Minecraft's private overlay slot; Cyberpunk's front slot starts at 2, the middle at 0
+
 	private static volatile MemorySegment shm;
 	private static long lastOpenAttempt;
 	private static int gamePid;
@@ -143,12 +147,43 @@ public final class CyberLink {
 			seg.set(JAVA_LONG, OFF_HEADER + H_MC_HEARTBEAT, tickCount());
 			VarHandle.releaseFence();
 			gamePid = seg.get(JAVA_INT, OFF_HEADER + H_GAME_PID);
+			// Our private overlay slot is the one that is neither Cyberpunk's front slot nor the middle one.
+			int middle = seg.get(JAVA_INT, OFF_OVERLAY_CTL + OC_STATE) & 3;
+			int front = seg.get(JAVA_INT, OFF_OVERLAY_CTL + OC_FRONT);
+			int back = 3 - middle - front;
+			overlayBack = front >= 0 && front <= 2 && middle <= 2 && front != middle && back >= 0 && back <= 2 ? back : 1;
 			shm = seg;
 			lastOpenError = -1;
 			CyberCraft.LOG.info("CyberCraft: linked to Cyberpunk (pid {})", gamePid);
 		} catch (Throwable t) {
 			CyberCraft.LOG.error("CyberCraft: failed to open shared memory", t);
 		}
+	}
+
+	/** The shared memory, once opened (whether or not Cyberpunk is still alive). */
+	public static MemorySegment segment() {
+		return shm;
+	}
+
+	/** The byte offset where the next overlay frame should be written. */
+	public static long overlayBackSlotOffset() {
+		return OFF_OVERLAY_PIXELS + overlayBack * OVERLAY_SLOT_BYTES;
+	}
+
+	/** Hands the frame just written at {@link #overlayBackSlotOffset()} to Cyberpunk. */
+	public static void publishOverlay(int width, int height, boolean bottomUp, long frameId) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return;
+		}
+		long hdr = OFF_OVERLAY_SLOT_HDR + overlayBack * SLOT_HDR_SIZE;
+		s.set(JAVA_INT, hdr + SH_WIDTH, width);
+		s.set(JAVA_INT, hdr + SH_HEIGHT, height);
+		s.set(JAVA_INT, hdr + SH_FLAGS, bottomUp ? 1 : 0);
+		s.set(JAVA_LONG, hdr + SH_FRAME_ID, frameId);
+		int old = (int) INT_VH.getAndSet(s, OFF_OVERLAY_CTL + OC_STATE, overlayBack | OVERLAY_DIRTY);
+		overlayBack = old & 3;
+		LONG_VH.getAndAdd(s, OFF_OVERLAY_CTL + OC_FRAMES_PUBLISHED, 1L);
 	}
 
 	/**

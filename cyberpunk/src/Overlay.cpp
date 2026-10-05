@@ -1,0 +1,755 @@
+// Phase 3b: draws Minecraft's HUD over Cyberpunk.
+//
+// Minecraft renders only its hotbar, hearts, held item and screens on a transparent background and copies the
+// pixels into shared memory (see OverlayCtl in the protocol). Here, just before the game presents each frame,
+// the newest of those pixels are uploaded to a texture and drawn over the back buffer with the game's own
+// D3D12 device and command queue.
+//
+// The game's swapchain is found through the RED4ext SDK (GpuApi::GetDeviceData), and its Present functions are
+// replaced by patching the swapchain's vtable. Everything below Install() runs on the game's render thread,
+// inside Present.
+//
+// A small cyan square is drawn in the top-left corner of the screen whenever there is no HUD to show: for the
+// first 30 seconds after a save loads, and whenever Minecraft is linked but no HUD frames are arriving. If you
+// can see it, the drawing itself works. Every 5 seconds a status line goes to the log.
+
+#include "Overlay.hpp"
+#include "Link.hpp"
+
+#include <cybercraft_protocol.h>
+
+#include <RED4ext/GpuApi/DeviceData.hpp>
+
+#include <d3d12.h>
+#include <d3dcompiler.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+
+#include <Windows.h>
+
+#include <chrono>
+#include <cstring>
+
+using Microsoft::WRL::ComPtr;
+
+namespace cybercraft::overlay
+{
+	namespace
+	{
+		constexpr UINT kFrames = 3;                 // frames in flight
+		constexpr UINT kPresentIndex = 8;           // IDXGISwapChain::Present
+		constexpr UINT kPresent1Index = 22;         // IDXGISwapChain1::Present1
+		constexpr double kBadgeSeconds = 30.0;      // how long after a save loads the test square is shown while Minecraft isn't linked
+		constexpr double kStaleSeconds = 1.0;       // a HUD frame older than this is not drawn
+
+		using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+		using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+
+		RED4ext::v1::PluginHandle g_handle = nullptr;
+		const RED4ext::v1::Sdk* g_sdk = nullptr;
+
+		bool g_installed = false;
+		bool g_triedInstall = false;
+		void** g_vtable = nullptr;
+		PresentFn g_origPresent = nullptr;
+		Present1Fn g_origPresent1 = nullptr;
+		IDXGISwapChain* g_gameSwapChain = nullptr;  // not owned
+		std::chrono::steady_clock::time_point g_installTime{};
+
+		// Counters for the status line.
+		std::chrono::steady_clock::time_point g_lastStatus{};
+		std::uint64_t g_presents = 0;
+		std::uint64_t g_drawCalls = 0;
+		std::uint64_t g_hudDraws = 0;
+		std::uint64_t g_badgeDraws = 0;
+		std::uint64_t g_framesUploaded = 0;
+		bool g_wasInGame = false;
+		std::chrono::steady_clock::time_point g_inGameSince{};
+
+		const char* kShaderSource = R"HLSL(
+cbuffer P : register(b0) { float flipY; float mode; };
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut VS(uint id : SV_VertexID)
+{
+	VSOut o;
+	float2 uv = float2((id << 1) & 2, id & 2);
+	o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	o.uv = uv;
+	return o;
+}
+float4 PS(VSOut i) : SV_Target
+{
+	if (mode > 0.5) {
+		return float4(0.0, 0.5, 0.6, 0.6);   // the test square: cyan at 60%, premultiplied
+	}
+	float2 uv = i.uv;
+	if (flipY > 0.5) { uv.y = 1.0 - uv.y; }
+	return tex.Sample(samp, uv);             // premultiplied alpha straight from Minecraft
+}
+)HLSL";
+
+		struct Gpu
+		{
+			bool failed = false;
+			bool ready = false;
+
+			ComPtr<ID3D12Device> device;
+			ComPtr<ID3D12CommandQueue> queue;
+			ComPtr<ID3D12RootSignature> rootSignature;
+			ComPtr<ID3D12PipelineState> pso;
+			DXGI_FORMAT psoFormat = DXGI_FORMAT_UNKNOWN;
+			ComPtr<ID3DBlob> vs, ps;
+			ComPtr<ID3D12DescriptorHeap> rtvHeap;
+			ComPtr<ID3D12DescriptorHeap> srvHeap;
+			UINT rtvSize = 0;
+			ComPtr<ID3D12CommandAllocator> allocator[kFrames];
+			ComPtr<ID3D12GraphicsCommandList> list;
+			ComPtr<ID3D12Fence> fence;
+			HANDLE fenceEvent = nullptr;
+			UINT64 fenceValue = 0;
+			UINT64 frameFence[kFrames] = {};
+			UINT frame = 0;
+
+			// The HUD texture and the upload buffers that feed it.
+			ComPtr<ID3D12Resource> texture;
+			UINT texW = 0, texH = 0;
+			ComPtr<ID3D12Resource> upload[kFrames];
+			UINT64 uploadSize[kFrames] = {};
+			bool haveFrame = false;
+			bool flipY = false;
+			std::uint64_t lastFrameCount = 0;
+			std::chrono::steady_clock::time_point lastNewFrame{};
+
+			bool loggedFormat = false;
+			bool loggedFirstFrame = false;
+		} g;
+
+		void LogError(const char* a_what, HRESULT a_hr)
+		{
+			g_sdk->logger->ErrorF(g_handle, "overlay: %s failed (HRESULT 0x%08X); the HUD overlay is off", a_what, static_cast<unsigned>(a_hr));
+		}
+
+		void WaitIdle()
+		{
+			if (!g.fence || !g.fenceEvent) {
+				return;
+			}
+			if (g.fence->GetCompletedValue() < g.fenceValue) {
+				g.fence->SetEventOnCompletion(g.fenceValue, g.fenceEvent);
+				::WaitForSingleObject(g.fenceEvent, 2000);
+			}
+		}
+
+		DXGI_FORMAT Typed(DXGI_FORMAT a_format)
+		{
+			switch (a_format) {
+			case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+				return DXGI_FORMAT_R8G8B8A8_UNORM;
+			case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+				return DXGI_FORMAT_B8G8R8A8_UNORM;
+			case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+				return DXGI_FORMAT_R10G10B10A2_UNORM;
+			case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+				return DXGI_FORMAT_R16G16B16A16_FLOAT;
+			default:
+				return a_format;
+			}
+		}
+
+		bool IsSrgb(DXGI_FORMAT a_format)
+		{
+			return a_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || a_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+		}
+
+		// Everything that doesn't depend on the back buffer's size: device, queue, command lists, fence, heaps.
+		bool InitDevice(IDXGISwapChain* a_swapChain)
+		{
+			// The swapchain won't hand over its command queue (GetDevice answers "no such interface" for it, which
+			// can mean the game's swapchain is wrapped by something like NVIDIA Streamline), so use the game's own
+			// device and main command queue, which the RED4ext SDK knows the location of.
+			auto* data = RED4ext::GpuApi::GetDeviceData();
+			if (!data || !data->device || !data->directCommandQueue) {
+				g_sdk->logger->Error(g_handle, "overlay: the SDK has no device or command queue for the game; the HUD overlay is off");
+				return false;
+			}
+			g.device = data->device;
+			g.queue = data->directCommandQueue;
+			HRESULT hr = S_OK;
+
+			// Sanity checks, logged so that a wrong guess shows up in the log instead of as a crash later.
+			ComPtr<ID3D12Device> queueDevice;
+			if (SUCCEEDED(g.queue->GetDevice(IID_PPV_ARGS(&queueDevice)))) {
+				if (queueDevice.Get() != g.device.Get()) {
+					g_sdk->logger->Warn(g_handle, "overlay: the queue belongs to a different device than the SDK's device; using the queue's");
+					g.device = queueDevice;
+				}
+			}
+			const D3D12_COMMAND_QUEUE_DESC queueDesc = g.queue->GetDesc();
+			g_sdk->logger->InfoF(g_handle, "overlay: using the game's command queue %p (type %d) on device %p", static_cast<void*>(g.queue.Get()),
+				static_cast<int>(queueDesc.Type), static_cast<void*>(g.device.Get()));
+			if (queueDesc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+				g_sdk->logger->Error(g_handle, "overlay: that is not a direct command queue, so it can't draw; the HUD overlay is off");
+				return false;
+			}
+			{
+				ComPtr<ID3D12Device> viaSwapChain;
+				const HRESULT swapHr = a_swapChain->GetDevice(IID_PPV_ARGS(&viaSwapChain));
+				g_sdk->logger->InfoF(g_handle, "overlay: swapchain->GetDevice(ID3D12Device) = 0x%08X%s", static_cast<unsigned>(swapHr),
+					SUCCEEDED(swapHr) ? (viaSwapChain.Get() == g.device.Get() ? " (same device)" : " (a DIFFERENT device)") : "");
+			}
+
+			for (UINT i = 0; i < kFrames; ++i) {
+				hr = g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g.allocator[i]));
+				if (FAILED(hr)) {
+					LogError("creating a command allocator", hr);
+					return false;
+				}
+			}
+			hr = g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.allocator[0].Get(), nullptr, IID_PPV_ARGS(&g.list));
+			if (FAILED(hr)) {
+				LogError("creating the command list", hr);
+				return false;
+			}
+			g.list->Close();
+
+			hr = g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence));
+			if (FAILED(hr)) {
+				LogError("creating the fence", hr);
+				return false;
+			}
+			g.fenceEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+			D3D12_DESCRIPTOR_HEAP_DESC rtv{};
+			rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			rtv.NumDescriptors = kFrames;
+			hr = g.device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&g.rtvHeap));
+			if (FAILED(hr)) {
+				LogError("creating the render target heap", hr);
+				return false;
+			}
+			g.rtvSize = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+			D3D12_DESCRIPTOR_HEAP_DESC srv{};
+			srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+			srv.NumDescriptors = 1;
+			srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+			hr = g.device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&g.srvHeap));
+			if (FAILED(hr)) {
+				LogError("creating the texture heap", hr);
+				return false;
+			}
+
+			// Shaders and the root signature.
+			ComPtr<ID3DBlob> errors;
+			hr = ::D3DCompile(kShaderSource, std::strlen(kShaderSource), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &g.vs, &errors);
+			if (FAILED(hr)) {
+				LogError("compiling the vertex shader", hr);
+				if (errors) {
+					g_sdk->logger->Error(g_handle, static_cast<const char*>(errors->GetBufferPointer()));
+				}
+				return false;
+			}
+			errors.Reset();
+			hr = ::D3DCompile(kShaderSource, std::strlen(kShaderSource), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &g.ps, &errors);
+			if (FAILED(hr)) {
+				LogError("compiling the pixel shader", hr);
+				if (errors) {
+					g_sdk->logger->Error(g_handle, static_cast<const char*>(errors->GetBufferPointer()));
+				}
+				return false;
+			}
+
+			D3D12_DESCRIPTOR_RANGE range{};
+			range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+			range.NumDescriptors = 1;
+			range.BaseShaderRegister = 0;
+			range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+			D3D12_ROOT_PARAMETER params[2]{};
+			params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+			params[0].DescriptorTable.NumDescriptorRanges = 1;
+			params[0].DescriptorTable.pDescriptorRanges = &range;
+			params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+			params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+			params[1].Constants.ShaderRegister = 0;
+			params[1].Constants.Num32BitValues = 2;
+			params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+			D3D12_STATIC_SAMPLER_DESC sampler{};
+			sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+			sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+			sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+			sampler.MaxLOD = D3D12_FLOAT32_MAX;
+			sampler.ShaderRegister = 0;
+			sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+			D3D12_ROOT_SIGNATURE_DESC rs{};
+			rs.NumParameters = 2;
+			rs.pParameters = params;
+			rs.NumStaticSamplers = 1;
+			rs.pStaticSamplers = &sampler;
+			rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+			           D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+
+			ComPtr<ID3DBlob> blob;
+			errors.Reset();
+			hr = ::D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &errors);
+			if (FAILED(hr)) {
+				LogError("serializing the root signature", hr);
+				return false;
+			}
+			hr = g.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g.rootSignature));
+			if (FAILED(hr)) {
+				LogError("creating the root signature", hr);
+				return false;
+			}
+			return true;
+		}
+
+		// The pipeline depends on the back buffer's format; make it again if that changes.
+		bool EnsurePipeline(DXGI_FORMAT a_format)
+		{
+			if (g.pso && g.psoFormat == a_format) {
+				return true;
+			}
+			WaitIdle();
+			g.pso.Reset();
+
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+			desc.pRootSignature = g.rootSignature.Get();
+			desc.VS = { g.vs->GetBufferPointer(), g.vs->GetBufferSize() };
+			desc.PS = { g.ps->GetBufferPointer(), g.ps->GetBufferSize() };
+			auto& blend = desc.BlendState.RenderTarget[0];
+			blend.BlendEnable = TRUE;
+			blend.SrcBlend = D3D12_BLEND_ONE;  // premultiplied alpha
+			blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+			blend.BlendOp = D3D12_BLEND_OP_ADD;
+			blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+			blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+			blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+			blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			desc.SampleMask = UINT_MAX;
+			desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+			desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			desc.RasterizerState.DepthClipEnable = TRUE;
+			desc.DepthStencilState.DepthEnable = FALSE;
+			desc.DepthStencilState.StencilEnable = FALSE;
+			desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			desc.NumRenderTargets = 1;
+			desc.RTVFormats[0] = a_format;
+			desc.SampleDesc.Count = 1;
+
+			const HRESULT hr = g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g.pso));
+			if (FAILED(hr)) {
+				LogError("creating the pipeline for the back buffer's format", hr);
+				return false;
+			}
+			g.psoFormat = a_format;
+			return true;
+		}
+
+		D3D12_HEAP_PROPERTIES HeapProps(D3D12_HEAP_TYPE a_type)
+		{
+			D3D12_HEAP_PROPERTIES p{};
+			p.Type = a_type;
+			p.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+			p.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+			p.CreationNodeMask = 1;
+			p.VisibleNodeMask = 1;
+			return p;
+		}
+
+		D3D12_RESOURCE_DESC BufferDesc(UINT64 a_size)
+		{
+			D3D12_RESOURCE_DESC d{};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			d.Width = a_size;
+			d.Height = 1;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.Format = DXGI_FORMAT_UNKNOWN;
+			d.SampleDesc.Count = 1;
+			d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			return d;
+		}
+
+		// (Re)creates the HUD texture to fit a frame of a_w x a_h pixels.
+		bool EnsureTexture(UINT a_w, UINT a_h, DXGI_FORMAT a_format)
+		{
+			if (g.texture && g.texW == a_w && g.texH == a_h) {
+				return true;
+			}
+			WaitIdle();
+			g.texture.Reset();
+
+			D3D12_RESOURCE_DESC desc{};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			desc.Width = a_w;
+			desc.Height = a_h;
+			desc.DepthOrArraySize = 1;
+			desc.MipLevels = 1;
+			desc.Format = a_format;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+			const auto heap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+			HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+				IID_PPV_ARGS(&g.texture));
+			if (FAILED(hr)) {
+				LogError("creating the HUD texture", hr);
+				return false;
+			}
+			g.texW = a_w;
+			g.texH = a_h;
+
+			D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+			view.Format = a_format;
+			view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			view.Texture2D.MipLevels = 1;
+			g.device->CreateShaderResourceView(g.texture.Get(), &view, g.srvHeap->GetCPUDescriptorHandleForHeapStart());
+			return true;
+		}
+
+		bool EnsureUpload(UINT a_slot, UINT64 a_size)
+		{
+			if (g.upload[a_slot] && g.uploadSize[a_slot] >= a_size) {
+				return true;
+			}
+			g.upload[a_slot].Reset();
+			const auto heap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+			const auto desc = BufferDesc(a_size);
+			const HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+				IID_PPV_ARGS(&g.upload[a_slot]));
+			if (FAILED(hr)) {
+				LogError("creating an upload buffer", hr);
+				return false;
+			}
+			g.uploadSize[a_slot] = a_size;
+			return true;
+		}
+
+		D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* a_resource, D3D12_RESOURCE_STATES a_before, D3D12_RESOURCE_STATES a_after)
+		{
+			D3D12_RESOURCE_BARRIER b{};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = a_resource;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = a_before;
+			b.Transition.StateAfter = a_after;
+			return b;
+		}
+
+		void Draw(IDXGISwapChain* a_swapChain)
+		{
+			auto& link = Link::Get();
+			if (!link.IsOpen()) {
+				return;
+			}
+
+			const auto now = std::chrono::steady_clock::now();
+
+			// Is there a HUD to draw, or only the test square?
+			const bool mcAlive = link.McPid() != 0 && (::GetTickCount64() - link.McHeartbeatMs()) < 3000;
+			const std::uint64_t published = mcAlive ? link.OverlayFramesPublished() : 0;
+			if (published != g.lastFrameCount) {
+				g.lastFrameCount = published;
+				g.lastNewFrame = now;
+			}
+			const bool hudFresh = mcAlive && g.haveFrame && std::chrono::duration<double>(now - g.lastNewFrame).count() < kStaleSeconds;
+			const bool inGame = link.InGame();
+			if (inGame && !g_wasInGame) {
+				g_inGameSince = now;
+			}
+			g_wasInGame = inGame;
+			// The test square: Minecraft is linked but no HUD is arriving, or a save loaded less than 30 s ago.
+			const bool badge = !hudFresh && inGame && (mcAlive || std::chrono::duration<double>(now - g_inGameSince).count() < kBadgeSeconds);
+			const bool newFrame = mcAlive && link.AcquireOverlayFrame();
+			if (!hudFresh && !newFrame && !badge) {
+				return;  // nothing to draw
+			}
+			++g_drawCalls;
+
+			if (g.failed) {
+				return;
+			}
+
+			// The back buffer.
+			ComPtr<IDXGISwapChain3> sc3;
+			if (FAILED(a_swapChain->QueryInterface(IID_PPV_ARGS(&sc3)))) {
+				return;
+			}
+			ComPtr<ID3D12Resource> backBuffer;
+			if (FAILED(sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backBuffer)))) {
+				return;
+			}
+			const D3D12_RESOURCE_DESC bb = backBuffer->GetDesc();
+			const DXGI_FORMAT rtvFormat = Typed(bb.Format);
+			if (!g.loggedFormat) {
+				g.loggedFormat = true;
+				g_sdk->logger->InfoF(g_handle, "overlay: back buffer is %u x %u, format %d", static_cast<unsigned>(bb.Width), bb.Height, static_cast<int>(bb.Format));
+				if (rtvFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || rtvFormat == DXGI_FORMAT_R10G10B10A2_UNORM) {
+					g_sdk->logger->Info(g_handle, "overlay: the game looks to be in HDR; the HUD's colours may look off there");
+				}
+			}
+
+			if (!g.ready) {
+				if (!InitDevice(a_swapChain)) {
+					g.failed = true;
+					return;
+				}
+				g.ready = true;
+				g_sdk->logger->Info(g_handle, "overlay: D3D12 resources ready");
+			}
+			if (!EnsurePipeline(rtvFormat)) {
+				g.failed = true;
+				return;
+			}
+
+			// Wait until the GPU is done with this frame's allocator and upload buffer.
+			const UINT slot = g.frame % kFrames;
+			if (g.fence->GetCompletedValue() < g.frameFence[slot]) {
+				g.fence->SetEventOnCompletion(g.frameFence[slot], g.fenceEvent);
+				::WaitForSingleObject(g.fenceEvent, 1000);
+			}
+			if (FAILED(g.allocator[slot]->Reset()) || FAILED(g.list->Reset(g.allocator[slot].Get(), nullptr))) {
+				return;
+			}
+
+			// A new HUD frame: copy it up to the GPU.
+			bool uploaded = false;
+			if (newFrame) {
+				const auto* hdr = link.OverlayFrontHeader();
+				const UINT w = hdr->width;
+				const UINT h = hdr->height;
+				if (w > 0 && h > 0 && w <= proto::kMaxOverlayW && h <= proto::kMaxOverlayH) {
+					const DXGI_FORMAT texFormat = IsSrgb(bb.Format) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+					const UINT rowBytes = w * 4;
+					const UINT rowPitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+					if (EnsureTexture(w, h, texFormat) && EnsureUpload(slot, UINT64(rowPitch) * h)) {
+						void* mapped = nullptr;
+						const D3D12_RANGE noRead{ 0, 0 };
+						if (SUCCEEDED(g.upload[slot]->Map(0, &noRead, &mapped))) {
+							const std::uint8_t* src = link.OverlayFrontPixels();
+							auto* dst = static_cast<std::uint8_t*>(mapped);
+							for (UINT y = 0; y < h; ++y) {
+								std::memcpy(dst + UINT64(y) * rowPitch, src + UINT64(y) * rowBytes, rowBytes);
+							}
+							g.upload[slot]->Unmap(0, nullptr);
+
+							D3D12_TEXTURE_COPY_LOCATION to{};
+							to.pResource = g.texture.Get();
+							to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+							to.SubresourceIndex = 0;
+							D3D12_TEXTURE_COPY_LOCATION from{};
+							from.pResource = g.upload[slot].Get();
+							from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+							from.PlacedFootprint.Offset = 0;
+							from.PlacedFootprint.Footprint.Format = texFormat;
+							from.PlacedFootprint.Footprint.Width = w;
+							from.PlacedFootprint.Footprint.Height = h;
+							from.PlacedFootprint.Footprint.Depth = 1;
+							from.PlacedFootprint.Footprint.RowPitch = rowPitch;
+
+							auto toCopy = Transition(g.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+							g.list->ResourceBarrier(1, &toCopy);
+							g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+							auto toRead = Transition(g.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+							g.list->ResourceBarrier(1, &toRead);
+
+							g.flipY = (hdr->flags & 1) != 0;
+							g.haveFrame = true;
+							uploaded = true;
+							++g_framesUploaded;
+							if (!g.loggedFirstFrame) {
+								g.loggedFirstFrame = true;
+								g_sdk->logger->InfoF(g_handle, "overlay: first HUD frame received (%u x %u)", w, h);
+							}
+						}
+					}
+				}
+			}
+			const bool drawHud = (hudFresh || uploaded) && g.haveFrame && g.texture;
+
+			// Draw onto the back buffer.
+			auto toTarget = Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			g.list->ResourceBarrier(1, &toTarget);
+
+			D3D12_CPU_DESCRIPTOR_HANDLE rtv = g.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+			rtv.ptr += SIZE_T(slot) * g.rtvSize;
+			D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
+			rtvDesc.Format = rtvFormat;
+			rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+			g.device->CreateRenderTargetView(backBuffer.Get(), &rtvDesc, rtv);
+
+			g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+			ID3D12DescriptorHeap* heaps[] = { g.srvHeap.Get() };
+			g.list->SetDescriptorHeaps(1, heaps);
+			g.list->SetGraphicsRootSignature(g.rootSignature.Get());
+			g.list->SetPipelineState(g.pso.Get());
+			g.list->SetGraphicsRootDescriptorTable(0, g.srvHeap->GetGPUDescriptorHandleForHeapStart());
+			g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+			D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(bb.Width), float(bb.Height), 0.0f, 1.0f };
+			g.list->RSSetViewports(1, &viewport);
+
+			if (drawHud) {
+				++g_hudDraws;
+				D3D12_RECT scissor{ 0, 0, LONG(bb.Width), LONG(bb.Height) };
+				g.list->RSSetScissorRects(1, &scissor);
+				const float constants[2] = { g.flipY ? 1.0f : 0.0f, 0.0f };
+				g.list->SetGraphicsRoot32BitConstants(1, 2, constants, 0);
+				g.list->DrawInstanced(3, 1, 0, 0);
+			} else if (badge) {
+				++g_badgeDraws;
+				D3D12_RECT scissor{ 8, 8, 72, 72 };  // the test square
+				g.list->RSSetScissorRects(1, &scissor);
+				const float constants[2] = { 0.0f, 1.0f };
+				g.list->SetGraphicsRoot32BitConstants(1, 2, constants, 0);
+				g.list->DrawInstanced(3, 1, 0, 0);
+			}
+
+			auto toPresent = Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+			g.list->ResourceBarrier(1, &toPresent);
+
+			if (FAILED(g.list->Close())) {
+				return;
+			}
+			ID3D12CommandList* lists[] = { g.list.Get() };
+			g.queue->ExecuteCommandLists(1, lists);
+			g.queue->Signal(g.fence.Get(), ++g.fenceValue);
+			g.frameFence[slot] = g.fenceValue;
+			++g.frame;
+		}
+
+		bool g_inHook = false;
+
+		void LogStatus()
+		{
+			const auto now = std::chrono::steady_clock::now();
+			if (now - g_lastStatus < std::chrono::seconds(5)) {
+				return;
+			}
+			g_lastStatus = now;
+			auto& link = Link::Get();
+			const bool mcAlive = link.IsOpen() && link.McPid() != 0 && (::GetTickCount64() - link.McHeartbeatMs()) < 3000;
+			g_sdk->logger->InfoF(g_handle,
+				"overlay: status: %llu presents, in game=%d, Minecraft linked=%d, frames sent by Minecraft so far=%llu, frames uploaded=%llu, HUD draws=%llu, test-square draws=%llu, GPU ready=%d, failed=%d",
+				static_cast<unsigned long long>(g_presents), link.InGame() ? 1 : 0, mcAlive ? 1 : 0,
+				static_cast<unsigned long long>(mcAlive ? link.OverlayFramesPublished() : 0), static_cast<unsigned long long>(g_framesUploaded),
+				static_cast<unsigned long long>(g_hudDraws), static_cast<unsigned long long>(g_badgeDraws), g.ready ? 1 : 0, g.failed ? 1 : 0);
+			g_presents = 0;
+		}
+
+		HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* a_swapChain, UINT a_sync, UINT a_flags)
+		{
+			++g_presents;
+			LogStatus();
+			if (!g_inHook && a_swapChain == g_gameSwapChain && (a_flags & DXGI_PRESENT_TEST) == 0) {
+				g_inHook = true;
+				Draw(a_swapChain);
+				g_inHook = false;
+			}
+			return g_origPresent(a_swapChain, a_sync, a_flags);
+		}
+
+		HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* a_swapChain, UINT a_sync, UINT a_flags, const DXGI_PRESENT_PARAMETERS* a_params)
+		{
+			++g_presents;
+			LogStatus();
+			if (!g_inHook && static_cast<IDXGISwapChain*>(a_swapChain) == g_gameSwapChain && (a_flags & DXGI_PRESENT_TEST) == 0) {
+				g_inHook = true;
+				Draw(a_swapChain);
+				g_inHook = false;
+			}
+			return g_origPresent1(a_swapChain, a_sync, a_flags, a_params);
+		}
+
+		// The first swapchain the game has in use, or null. (Plain data only, so a bad read can be caught.)
+		IDXGISwapChain* FindGameSwapChain()
+		{
+			auto* data = RED4ext::GpuApi::GetDeviceData();
+			if (!data) {
+				return nullptr;
+			}
+			auto& chains = data->swapChains;
+			for (std::size_t i = 0; i < 32; ++i) {
+				auto& entry = chains.resources[i];
+				if (entry.refCount >= 0 && entry.instance.swapChain.Get() != nullptr) {
+					return entry.instance.swapChain.Get();
+				}
+			}
+			return nullptr;
+		}
+
+		void Patch(UINT a_index, void* a_hook, void** a_original)
+		{
+			void** slot = &g_vtable[a_index];
+			DWORD oldProtect = 0;
+			if (::VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+				*a_original = *slot;
+				*slot = a_hook;
+				::VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+			}
+		}
+	}
+
+	void Init(RED4ext::v1::PluginHandle a_handle, const RED4ext::v1::Sdk* a_sdk)
+	{
+		g_handle = a_handle;
+		g_sdk = a_sdk;
+	}
+
+	void Install()
+	{
+		if (g_installed || g_triedInstall) {
+			return;
+		}
+
+		// The swapchain may not exist yet when the game first starts running: look again every couple of
+		// seconds, and give up after a minute or so.
+		static int calls = 0;
+		static int attempts = 0;
+		if (calls++ % 120 != 0) {
+			return;
+		}
+		if (++attempts > 30) {
+			g_triedInstall = true;
+			g_sdk->logger->Warn(g_handle, "overlay: gave up looking for the game's swapchain; the HUD overlay is off");
+			return;
+		}
+
+		IDXGISwapChain* swapChain = FindGameSwapChain();
+		if (!swapChain) {
+			return;
+		}
+		ComPtr<IDXGISwapChain3> check;
+		if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&check)))) {
+			g_triedInstall = true;
+			g_sdk->logger->Warn(g_handle, "overlay: the game's swapchain doesn't answer as an IDXGISwapChain3; the HUD overlay is off");
+			return;
+		}
+		g_triedInstall = true;
+
+		g_gameSwapChain = swapChain;
+		g_vtable = *reinterpret_cast<void***>(swapChain);
+		Patch(kPresentIndex, reinterpret_cast<void*>(&HookPresent), reinterpret_cast<void**>(&g_origPresent));
+		Patch(kPresent1Index, reinterpret_cast<void*>(&HookPresent1), reinterpret_cast<void**>(&g_origPresent1));
+		g_installTime = std::chrono::steady_clock::now();
+		g_installed = g_origPresent != nullptr && g_origPresent1 != nullptr;
+		g_sdk->logger->InfoF(g_handle, "overlay: hooked the game's swapchain %p (Present %p, Present1 %p)", static_cast<void*>(swapChain),
+			reinterpret_cast<void*>(g_origPresent), reinterpret_cast<void*>(g_origPresent1));
+	}
+
+	void Uninstall()
+	{
+		if (!g_installed || !g_vtable) {
+			return;
+		}
+		Patch(kPresentIndex, reinterpret_cast<void*>(g_origPresent), reinterpret_cast<void**>(&g_origPresent));
+		Patch(kPresent1Index, reinterpret_cast<void*>(g_origPresent1), reinterpret_cast<void**>(&g_origPresent1));
+		g_installed = false;
+	}
+}

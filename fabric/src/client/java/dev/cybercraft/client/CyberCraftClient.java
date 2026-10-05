@@ -178,6 +178,14 @@ public final class CyberCraftClient implements ClientModInitializer {
 
 	private static int pushCount;
 
+	/**
+	 * True while Cyberpunk is the one showing the world (following, or about to): Minecraft then draws only its
+	 * hand, HUD and screens on a transparent background and sends them to Cyberpunk to draw over the game.
+	 */
+	public static boolean overlayActive() {
+		return (following || syncing) && CyberLink.active();
+	}
+
 	private static void keepOutOfGround(Minecraft client, LocalPlayer player) {
 		double x = player.getX();
 		double y = player.getY();

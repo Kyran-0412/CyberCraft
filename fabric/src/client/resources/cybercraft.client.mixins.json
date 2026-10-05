@@ -3,7 +3,10 @@
   "package": "dev.cybercraft.client.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
-    "EntityCollideMixin"
+    "EntityCollideMixin",
+    "FramerateLimitTrackerMixin",
+    "LevelRendererMixin",
+    "MinecraftMixin"
   ],
   "injectors": { "defaultRequire": 1 }
 }

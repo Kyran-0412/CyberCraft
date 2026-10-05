@@ -7,6 +7,7 @@
 // log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
 #include "Ground.hpp"
+#include "Overlay.hpp"
 #include "Link.hpp"
 
 #include <cybercraft_protocol.h>
@@ -418,6 +419,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
 
     auto& link = cybercraft::Link::Get();
     link.Beat();
+    cybercraft::overlay::Install(); // finds the swapchain and hooks Present (once; does nothing after that)
 
     const auto now = Clock::now();
     const bool logNow = (now - g_lastLog) >= std::chrono::seconds(1);
@@ -549,6 +551,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         g_handle = aHandle;
         g_sdk = aSdk;
         cybercraft::ground::Init(aHandle, aSdk);
+        cybercraft::overlay::Init(aHandle, aSdk);
 
         aSdk->logger->InfoF(aHandle, "CyberCraft loaded (game version %u.%u.%u)", static_cast<unsigned>(aSdk->runtime->major),
                             static_cast<unsigned>(aSdk->runtime->minor), static_cast<unsigned>(aSdk->runtime->patch));
@@ -572,6 +575,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
     }
     case RED4ext::v1::EMainReason::Unload:
     {
+        cybercraft::overlay::Uninstall();
         cybercraft::Link::Get().Close();
         break;
     }
@@ -584,7 +588,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 6, 1);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 7, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

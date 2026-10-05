@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 7;
+	inline constexpr std::uint32_t kVersion = 8;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -30,7 +30,15 @@ namespace cybercraft::proto
 	inline constexpr std::uint32_t kGroundN = 64;         // the ground grid is kGroundN x kGroundN cells (a torus)
 	inline constexpr std::int32_t  kGroundRadius = 28;    // cells scanned around V (must be < kGroundN / 2)
 	inline constexpr std::uint64_t kGroundSlotBytes = 24; // three 64-bit words per cell
-	inline constexpr std::uint64_t kMappingBytes = kOffGround + std::uint64_t(kGroundN) * kGroundN * kGroundSlotBytes;
+	static_assert(kOffGround + std::uint64_t(kGroundN) * kGroundN * kGroundSlotBytes <= 0x19000, "the ground grid must end before the overlay control block");
+	inline constexpr std::uint64_t kOffOverlayCtl = 0x19000;      // Minecraft -> Cyberpunk: which overlay frame is newest, see OverlayCtl
+	inline constexpr std::uint64_t kOffOverlaySlotHdr = 0x19040;  // 3 x 0x40: size and flags of each overlay slot
+	inline constexpr std::uint64_t kOffOverlayPixels = 0x20000;   // 3 slots of RGBA pixels
+	inline constexpr std::uint32_t kMaxOverlayW = 3840;
+	inline constexpr std::uint32_t kMaxOverlayH = 2160;
+	inline constexpr std::uint64_t kOverlaySlotBytes = std::uint64_t(kMaxOverlayW) * kMaxOverlayH * 4;
+	inline constexpr std::uint32_t kOverlaySlots = 3;
+	inline constexpr std::uint64_t kMappingBytes = kOffOverlayPixels + kOverlaySlotBytes * kOverlaySlots;
 
 	// ---- header @0x0 ------------------------------------------------------------------------
 	struct Header
@@ -128,4 +136,32 @@ namespace cybercraft::proto
 	inline constexpr float kNoGround = -1.0e30f;
 	inline constexpr int   kObstacleSub = 8;            // sub-squares per cell side
 	inline constexpr float kObstacleHeight = 2.5f;      // how tall a blocked sub-square is
+
+	// ---- overlay triple buffer @0x19000 -------------------------------------------------------
+	// Minecraft draws its hotbar, hearts, held item and screens on a transparent background and copies
+	// them (RGBA, premultiplied alpha) into one of three slots; Cyberpunk draws the newest one over the game.
+	// state: bits 0-1 = index of the "middle" slot, bit 2 = the middle slot holds a frame not yet drawn.
+	// Writer (Minecraft) renders into its private back slot, then exchanges state with (back | kOverlayDirty) and
+	// keeps the returned index as its new back slot. Reader (Cyberpunk) exchanges state with its front index
+	// only when the dirty bit is set, and keeps the returned index as its new front slot.
+	// Start: middle = 0, Minecraft's back slot = 1, Cyberpunk's front slot = 2.
+	inline constexpr std::uint32_t kOverlayDirty = 1u << 2;
+
+	struct OverlayCtl
+	{
+		std::uint32_t state;
+		std::uint32_t front;  // the slot Cyberpunk is showing now; Minecraft's own slot is the one that is neither this nor the middle
+		std::uint64_t framesPublished;
+	};
+
+	struct OverlaySlotHdr
+	{
+		std::uint32_t width;
+		std::uint32_t height;
+		std::uint32_t flags;  // bit 0: the rows are bottom-up (OpenGL order)
+		std::uint32_t pad;
+		std::uint64_t frameId;
+		std::uint8_t  reserved[0x40 - 0x18];
+	};
+	static_assert(sizeof(OverlaySlotHdr) == 0x40);
 }

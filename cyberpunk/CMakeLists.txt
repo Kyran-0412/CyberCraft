@@ -1,7 +1,7 @@
-add_library(CyberCraft SHARED src/main.cpp src/Link.cpp src/Link.hpp src/Ground.cpp src/Ground.hpp)
+add_library(CyberCraft SHARED src/main.cpp src/Link.cpp src/Link.hpp src/Ground.cpp src/Ground.hpp src/Overlay.cpp src/Overlay.hpp)
 
 target_include_directories(CyberCraft PRIVATE "${CMAKE_SOURCE_DIR}/protocol")
-target_link_libraries(CyberCraft PRIVATE RED4ext::SDK)
+target_link_libraries(CyberCraft PRIVATE RED4ext::SDK d3d12 dxgi d3dcompiler)
 target_compile_definitions(CyberCraft PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(CyberCraft PROPERTIES PREFIX "")
 
