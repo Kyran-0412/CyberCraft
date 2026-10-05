@@ -454,6 +454,19 @@ public final class CyberCraftClient implements ClientModInitializer {
 				+ "vertical field of view used %.2f (asked %.2f), picture shape used %.3f (the game's %.3f, Minecraft's window %dx%d = %.3f)",
 			framesSinceReport / Math.max(0.5, 3.0), usedX - asked[0], usedY - asked[1], usedZ - asked[2], yawDiff, usedPitch - asked[4],
 			usedVfov, cameraFov(), usedAspect, CAMERA.aspect, target.width, target.height, (double) target.width / Math.max(1, target.height)));
+		// Where does the Minecraft player look, compared with where the picture's camera looks? (What you break is decided from the
+		// player's view unless EntityPickMixin takes over; this line shows how far apart the two are.)
+		LocalPlayer self = client.player;
+		if (self != null) {
+			double pitchDiff = asked[4] - self.getXRot();
+			double yawDiffToPlayer = asked[3] - self.getYRot();
+			while (yawDiffToPlayer > 180.0) yawDiffToPlayer -= 360.0;
+			while (yawDiffToPlayer < -180.0) yawDiffToPlayer += 360.0;
+			double horizontal = Math.hypot(asked[0] - self.getX(), asked[2] - self.getZ());
+			CyberCraft.LOG.info(String.format(
+				"CyberCraft: aim: the picture's camera looks %.2f deg lower (pitch %.2f vs the player's %.2f) and %.2f deg to the side than the Minecraft player; its eye is %.3f blocks higher and %.3f blocks away horizontally",
+				pitchDiff, asked[4], (double) self.getXRot(), yawDiffToPlayer, asked[1] - self.getEyeY(), horizontal));
+		}
 		framesSinceReport = 0;
 	}
 

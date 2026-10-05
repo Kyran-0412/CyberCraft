@@ -85,6 +85,9 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   world is, first from the change in view direction, then correcting for the camera having moved using the picture's depth. The hand, hotbar and
   screens are a separate layer and are not moved. `/ccdelay <ms>` sets how far behind the newest published camera the game's own picture is (what the
   blocks are aimed at): if the blocks swing ahead of the world when you turn, raise it; if they trail, lower it. Needs prediction (`/ccpredict`) at 0.
+* **Aiming.** What you break, place and use is now worked out along the picture's own camera ray, through the middle of the screen where the
+  crosshair is, instead of from the Minecraft player's eyes (`EntityPickMixin`). Every few seconds Minecraft's console also prints an `aim:` line saying
+  how far the picture's camera is from the player's view, which shows where a mismatch came from.
 * **`/ccdepthdebug`** cycles a debug view of the depth test: 1 shows the game's depth over the whole screen (near dark, far light), 2 shows
   the blocks' distance as grey, 3 colours block pixels red where the game's world hides them and green where they show. The capture also
   checks its copy of the game's depth against the game's own rays and switches to another depth texture if the values don't fit.

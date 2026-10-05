@@ -6,6 +6,7 @@
     "CameraMixin",
     "CloudRendererMixin",
     "EntityCollideMixin",
+    "EntityPickMixin",
     "FramerateLimitTrackerMixin",
     "GameRendererMixin",
     "GlCommandEncoderMixin",
