@@ -28,7 +28,9 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
 using Microsoft::WRL::ComPtr;
@@ -65,6 +67,9 @@ namespace cybercraft::overlay
 		std::uint64_t g_hudDraws = 0;
 		std::uint64_t g_badgeDraws = 0;
 		std::uint64_t g_framesUploaded = 0;
+		double g_ageSum = 0.0;
+		double g_ageMax = 0.0;
+		std::uint64_t g_ageCount = 0;
 		bool g_wasInGame = false;
 		std::chrono::steady_clock::time_point g_inGameSince{};
 
@@ -135,6 +140,7 @@ float4 PS(VSOut i) : SV_Target
 
 			bool loggedFormat = false;
 			bool loggedFirstFrame = false;
+			UINT warnedW = 0, warnedH = 0;
 		} g;
 
 		void LogError(const char* a_what, HRESULT a_hr)
@@ -574,9 +580,25 @@ float4 PS(VSOut i) : SV_Target
 							g.haveFrame = true;
 							uploaded = true;
 							++g_framesUploaded;
+							const double age = link.CameraAgeMs(hdr->cameraFrame);
+							if (age >= 0.0) {
+								g_ageSum += age;
+								g_ageMax = std::max(g_ageMax, age);
+								++g_ageCount;
+							}
 							if (!g.loggedFirstFrame) {
 								g.loggedFirstFrame = true;
 								g_sdk->logger->InfoF(g_handle, "overlay: first HUD frame received (%u x %u)", w, h);
+							}
+							// The picture is stretched over the whole screen, so it has to be the same shape as the screen
+							// for Minecraft's blocks to line up with Night City.
+							const float hudAspect = float(w) / float(h);
+							const float screenAspect = float(bb.Width) / float(bb.Height);
+							if (std::fabs(hudAspect - screenAspect) > 0.02f * screenAspect && (g.warnedW != w || g.warnedH != h)) {
+								g.warnedW = w;
+								g.warnedH = h;
+								g_sdk->logger->WarnF(g_handle, "overlay: Minecraft's window is %u x %u (shape %.3f) but the game screen is %u x %u (shape %.3f); blocks will not line up. Resize Minecraft's window to the same shape",
+									w, h, hudAspect, static_cast<unsigned>(bb.Width), bb.Height, screenAspect);
 							}
 						}
 					}
@@ -660,6 +682,12 @@ float4 PS(VSOut i) : SV_Target
 				static_cast<unsigned long long>(g_presents), link.InGame() ? 1 : 0, mcAlive ? 1 : 0,
 				static_cast<unsigned long long>(mcAlive ? link.OverlayFramesPublished() : 0), static_cast<unsigned long long>(g_framesUploaded),
 				static_cast<unsigned long long>(g_hudDraws), static_cast<unsigned long long>(g_badgeDraws), g.ready ? 1 : 0, g.failed ? 1 : 0);
+			if (g_ageCount > 0) {
+				g_sdk->logger->InfoF(g_handle, "overlay: delay: the picture Minecraft sends was drawn through a camera published %.0f ms earlier on average (up to %.0f ms), over %llu frames; the game presented about %.0f frames a second, Minecraft sent about %.0f",
+					g_ageSum / double(g_ageCount), g_ageMax, static_cast<unsigned long long>(g_ageCount), double(g_presents) / 5.0, double(g_ageCount) / 5.0);
+			}
+			g_ageSum = g_ageMax = 0.0;
+			g_ageCount = 0;
 			g_presents = 0;
 		}
 

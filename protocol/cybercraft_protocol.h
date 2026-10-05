@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 9;
+	inline constexpr std::uint32_t kVersion = 14;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -26,6 +26,7 @@ namespace cybercraft::proto
 	inline constexpr std::uint64_t kOffGameState = 0x100;  // Cyberpunk -> Minecraft
 	inline constexpr std::uint64_t kOffMcState = 0x200;    // Minecraft -> Cyberpunk: where Minecraft wants V
 	inline constexpr std::uint64_t kOffMcCommand = 0x300;  // Minecraft -> Cyberpunk: one-off commands
+	inline constexpr std::uint64_t kOffCamera = 0x400;     // Cyberpunk -> Minecraft: the game's camera, see CameraState
 	inline constexpr std::uint64_t kOffGround = 0x1000;   // Cyberpunk -> Minecraft: ground heights, see GroundSlot
 	inline constexpr std::uint32_t kGroundN = 64;         // the ground grid is kGroundN x kGroundN cells (a torus)
 	inline constexpr std::int32_t  kGroundRadius = 28;    // cells scanned around V (must be < kGroundN / 2)
@@ -68,8 +69,10 @@ namespace cybercraft::proto
 		std::uint32_t cmdAck;     // seq of the last McCommand Cyberpunk has dealt with
 		std::uint32_t cmdResult;  // CommandResult for that command
 		float         lookYaw, lookPitch;  // where the player is looking while input is routed, Minecraft degrees
+		float         verticalOffset;      // Minecraft Y = Cyberpunk Z - verticalOffset (see /ccalign)
+		float         pad;
 	};
-	static_assert(sizeof(GameState) == 0x38);
+	static_assert(sizeof(GameState) == 0x40);
 
 	// ---- Minecraft -> Cyberpunk state @0x200 (seqlock: seq is odd while being written) ------
 	enum McFlags : std::uint32_t
@@ -77,6 +80,16 @@ namespace cybercraft::proto
 		kMcInWorld = 1u << 0,  // Minecraft has a world open and a player in it
 		kMcFollow = 1u << 1,   // Cyberpunk should keep moving V to (targetX, targetY, targetZ)
 		kMcScreenOpen = 1u << 2,  // a Minecraft screen (inventory, chat, ...) is open: the mouse moves a cursor instead of looking
+		// bits 3-4: which camera source the plugin should publish (see CamSource)
+	};
+	inline constexpr std::uint32_t kMcCamSourceShift = 3;
+
+	enum CamSource : std::uint32_t
+	{
+		kCamTransform = 0,  // the camera's world transform, as the camera system reports it
+		kCamData = 1,       // the camera system's "active camera data"
+		kCamProjected = 2,  // the camera's orientation worked out from where the game projects points to the screen
+		kCamProjectedPos = 3,  // that, and the camera's position worked out the same way from points close to it
 	};
 
 	struct McState
@@ -98,6 +111,7 @@ namespace cybercraft::proto
 	{
 		kCmdNone = 0,
 		kCmdTeleport = 1,  // move V to (x, y, z), Minecraft coordinates
+		kCmdAlignGround = 2,  // set the vertical offset so that the street under V lands on a whole-number height
 	};
 
 	enum CommandResult : std::uint32_t
@@ -166,7 +180,8 @@ namespace cybercraft::proto
 		std::uint32_t flags;  // bit 0: the rows are bottom-up (OpenGL order)
 		std::uint32_t pad;
 		std::uint64_t frameId;
-		std::uint8_t  reserved[0x40 - 0x18];
+		std::uint64_t cameraFrame;  // CameraState::frameCounter of the camera Minecraft drew this frame through
+		std::uint8_t  reserved[0x40 - 0x20];
 	};
 	static_assert(sizeof(OverlaySlotHdr) == 0x40);
 
@@ -197,4 +212,26 @@ namespace cybercraft::proto
 		std::int32_t  a, b, c;
 	};
 	static_assert(sizeof(InputEvent) == 16);
+
+	// ---- the game's camera @0x400 (seqlock: seq is odd while being written) -------------------
+	// Minecraft draws its blocks looking through this camera, so they line up with Night City.
+	enum CameraFlags : std::uint32_t
+	{
+		kCameraValid = 1u << 0,  // the plugin could read the camera this frame
+	};
+
+	struct CameraState
+	{
+		std::uint32_t seq;
+		std::uint32_t flags;  // CameraFlags
+		double        posX, posY, posZ;  // the camera's position, Minecraft coordinates (blocks)
+		float         yaw, pitch;        // where it looks, Minecraft degrees (yaw 0 = south, pitch positive = down)
+		float         vfov;              // vertical field of view, degrees
+		float         aspect;            // width / height of the game's screen
+		std::uint64_t frameCounter;
+		float         velX, velY, velZ;  // how fast the camera is moving, blocks per second (smoothed)
+		float         yawRate, pitchRate;  // how fast it is turning, degrees per second (smoothed)
+		float         roll;                // how far the camera is tilted sideways, degrees (positive = right side up)
+	};
+	static_assert(sizeof(CameraState) == 0x50);
 }

@@ -70,6 +70,7 @@ public final class CyberLink {
 		public int cmdAck; // seq of the last command Cyberpunk dealt with
 		public int cmdResult; // Proto.RESULT_*
 		public float lookYaw, lookPitch; // where the player looks while input is routed (Minecraft degrees)
+		public float verticalOffset; // Minecraft Y = Cyberpunk Z - this
 
 		public boolean inGame() {
 			return (this.flags & GAME_IN_GAME) != 0;
@@ -168,6 +169,54 @@ public final class CyberLink {
 		}
 	}
 
+	/** The game's camera, in Minecraft coordinates and degrees. */
+	public static final class CameraState {
+		public boolean valid;
+		public double x, y, z;
+		public float yaw, pitch;
+		public float vfov; // vertical field of view, degrees
+		public float aspect; // width / height of the game's screen
+		public float velX, velY, velZ; // how fast the camera moves, blocks per second
+		public float yawRate, pitchRate; // how fast it turns, degrees per second
+		public float roll; // degrees
+		public long frame; // the plugin's counter for this camera
+	}
+
+	/** Seqlock read of the game's camera into {@code out}. Returns false if the link is down or the read kept failing. */
+	public static boolean readCamera(CameraState out) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return false;
+		}
+		for (int attempt = 0; attempt < 8; attempt++) {
+			int seq1 = s.get(JAVA_INT, OFF_CAMERA + CAM_SEQ);
+			if ((seq1 & 1) != 0) {
+				continue;
+			}
+			VarHandle.acquireFence();
+			out.valid = (s.get(JAVA_INT, OFF_CAMERA + CAM_FLAGS) & CAMERA_VALID) != 0;
+			out.x = s.get(JAVA_DOUBLE, OFF_CAMERA + CAM_X);
+			out.y = s.get(JAVA_DOUBLE, OFF_CAMERA + CAM_Y);
+			out.z = s.get(JAVA_DOUBLE, OFF_CAMERA + CAM_Z);
+			out.yaw = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_YAW);
+			out.pitch = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_PITCH);
+			out.vfov = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_VFOV);
+			out.aspect = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_ASPECT);
+			out.velX = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_VEL_X);
+			out.velY = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_VEL_Y);
+			out.velZ = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_VEL_Z);
+			out.yawRate = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_YAW_RATE);
+			out.pitchRate = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_PITCH_RATE);
+			out.roll = s.get(JAVA_FLOAT, OFF_CAMERA + CAM_ROLL);
+			out.frame = s.get(JAVA_LONG, OFF_CAMERA + CAM_FRAME);
+			VarHandle.acquireFence();
+			if (seq1 == s.get(JAVA_INT, OFF_CAMERA + CAM_SEQ)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Receives one keyboard or mouse event from Cyberpunk. */
 	public interface InputSink {
 		void accept(int type, int code, int a, int b, int c);
@@ -208,7 +257,7 @@ public final class CyberLink {
 	}
 
 	/** Hands the frame just written at {@link #overlayBackSlotOffset()} to Cyberpunk. */
-	public static void publishOverlay(int width, int height, boolean bottomUp, long frameId) {
+	public static void publishOverlay(int width, int height, boolean bottomUp, long frameId, long cameraFrame) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return;
@@ -218,6 +267,7 @@ public final class CyberLink {
 		s.set(JAVA_INT, hdr + SH_HEIGHT, height);
 		s.set(JAVA_INT, hdr + SH_FLAGS, bottomUp ? 1 : 0);
 		s.set(JAVA_LONG, hdr + SH_FRAME_ID, frameId);
+		s.set(JAVA_LONG, hdr + SH_CAMERA_FRAME, cameraFrame);
 		int old = (int) INT_VH.getAndSet(s, OFF_OVERLAY_CTL + OC_STATE, overlayBack | OVERLAY_DIRTY);
 		overlayBack = old & 3;
 		LONG_VH.getAndAdd(s, OFF_OVERLAY_CTL + OC_FRAMES_PUBLISHED, 1L);
@@ -227,7 +277,7 @@ public final class CyberLink {
 	 * Tells Cyberpunk what Minecraft wants. With {@code follow} set, Cyberpunk keeps moving V to (x, y, z)
 	 * (the same coordinate space as the game state position) and turns V to face {@code yaw}.
 	 */
-	public static void publishMcState(boolean inWorld, boolean follow, boolean screenOpen, float sensitivity, double x, double y, double z, float yaw, float pitch) {
+	public static void publishMcState(boolean inWorld, boolean follow, boolean screenOpen, int camSource, float sensitivity, double x, double y, double z, float yaw, float pitch) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return;
@@ -235,7 +285,7 @@ public final class CyberLink {
 		int base = s.get(JAVA_INT, OFF_MC_STATE + M_SEQ) & ~1;
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 1); // odd: write in progress
 		VarHandle.releaseFence();
-		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0) | (screenOpen ? MC_SCREEN_OPEN : 0));
+		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0) | (screenOpen ? MC_SCREEN_OPEN : 0) | ((camSource & 3) << MC_CAM_SOURCE_SHIFT));
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_X, x);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Y, y);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Z, z);
@@ -321,6 +371,24 @@ public final class CyberLink {
 		return value < -1.0e29f ? Float.NEGATIVE_INFINITY : value;
 	}
 
+	/** Asks Cyberpunk to set the vertical offset so the street under V lands on a whole-number height. Returns the command's number (0: link down). */
+	public static int sendAlignGround() {
+		MemorySegment s = shm;
+		if (s == null) {
+			return 0;
+		}
+		int base = s.get(JAVA_INT, OFF_MC_COMMAND + C_SEQ) & ~1;
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 1);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_KIND, CMD_ALIGN_GROUND);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_X, 0.0);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Y, 0.0);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Z, 0.0);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 2);
+		return base + 2;
+	}
+
 	/** Seqlock read of the game state into {@code out}. Returns false if the link is down or the writer was mid-update every try. */
 	public static boolean readGameState(GameState out) {
 		MemorySegment s = shm;
@@ -342,6 +410,7 @@ public final class CyberLink {
 			out.cmdResult = s.get(JAVA_INT, OFF_GAME_STATE + G_CMD_RESULT);
 			out.lookYaw = s.get(JAVA_FLOAT, OFF_GAME_STATE + G_LOOK_YAW);
 			out.lookPitch = s.get(JAVA_FLOAT, OFF_GAME_STATE + G_LOOK_PITCH);
+			out.verticalOffset = s.get(JAVA_FLOAT, OFF_GAME_STATE + G_VERT_OFFSET);
 			VarHandle.acquireFence();
 			int seq2 = s.get(JAVA_INT, OFF_GAME_STATE + G_SEQ);
 			if (seq1 == seq2) {

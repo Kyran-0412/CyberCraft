@@ -79,6 +79,104 @@ public final class CyberCraftClient implements ClientModInitializer {
 					: "CyberCraft: block-style collision on (the old way)."));
 				return 1;
 			}));
+			// /ccworld  turns drawing Minecraft's blocks over Cyberpunk off and on.
+			dispatcher.register(ClientCommands.literal("ccworld").executes(c -> {
+				worldVisible = !worldVisible;
+				c.getSource().sendFeedback(Component.literal(worldVisible
+					? "CyberCraft: Minecraft's blocks are drawn over Cyberpunk."
+					: "CyberCraft: Minecraft's blocks are hidden (only the HUD is drawn)."));
+				return 1;
+			}));
+			// /cccamsrc                          shows which camera the plugin publishes.
+			// /cccamsrc transform|data|projected  chooses it. "projected" follows camera shake and hit reactions.
+			dispatcher.register(ClientCommands.literal("cccamsrc")
+				.executes(c -> {
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera source is " + new String[] { "transform", "data", "projected", "projectedpos" }[camSource]));
+					return 1;
+				})
+				.then(ClientCommands.literal("transform").executes(c -> {
+					camSource = 0;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera source: transform"));
+					return 1;
+				}))
+				.then(ClientCommands.literal("data").executes(c -> {
+					camSource = 1;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera source: data"));
+					return 1;
+				}))
+				.then(ClientCommands.literal("projected").executes(c -> {
+					camSource = 2;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera source: projected"));
+					return 1;
+				}))
+				.then(ClientCommands.literal("projectedpos").executes(c -> {
+					camSource = 3;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera source: projected, with the position solved too"));
+					return 1;
+				})));
+			// /ccroll  on|off|flip  applies the camera's sideways tilt (when it is knocked about); flip reverses its direction.
+			dispatcher.register(ClientCommands.literal("ccroll")
+				.executes(c -> {
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera tilt is " + (rollMode == 0 ? "off" : rollMode > 0 ? "on" : "on, reversed")));
+					return 1;
+				})
+				.then(ClientCommands.literal("on").executes(c -> {
+					rollMode = 1;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera tilt on"));
+					return 1;
+				}))
+				.then(ClientCommands.literal("off").executes(c -> {
+					rollMode = 0;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera tilt off"));
+					return 1;
+				}))
+				.then(ClientCommands.literal("flip").executes(c -> {
+					rollMode = -1;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: camera tilt on, reversed"));
+					return 1;
+				})));
+			// /ccpredict        shows how many milliseconds ahead of the camera's position Minecraft draws.
+			// /ccpredict <ms>   sets it (0 = off). Raise it if the blocks slide the way you move, lower it if they slide against.
+			dispatcher.register(ClientCommands.literal("ccpredict")
+				.executes(c -> {
+					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: drawing the camera %.0f ms ahead.", predictMs)));
+					return 1;
+				})
+				.then(ClientCommands.argument("ms", DoubleArgumentType.doubleArg(0, 200)).executes(c -> {
+					predictMs = DoubleArgumentType.getDouble(c, "ms");
+					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: drawing the camera %.0f ms ahead.", predictMs)));
+					return 1;
+				})));
+			// /ccfov           shows the field of view in use.
+			// /ccfov <degrees> uses this vertical field of view instead of the game's (to fine-tune the alignment).
+			// /ccfov auto      goes back to the game's.
+			dispatcher.register(ClientCommands.literal("ccfov")
+				.executes(c -> {
+					c.getSource().sendFeedback(Component.literal(String.format(
+						"CyberCraft: vertical field of view in use %.2f (the game's: %.2f%s), screen shape %.3f. Camera %s.",
+						cameraFov(), CAMERA.vfov, fovOverride > 0 ? ", overridden" : "", CAMERA.aspect, cameraValid ? "linked" : "not available")));
+					return 1;
+				})
+				.then(ClientCommands.literal("auto").executes(c -> {
+					fovOverride = 0;
+					c.getSource().sendFeedback(Component.literal("CyberCraft: using the game's field of view."));
+					return 1;
+				}))
+				.then(ClientCommands.argument("degrees", DoubleArgumentType.doubleArg(10, 150)).executes(c -> {
+					fovOverride = DoubleArgumentType.getDouble(c, "degrees");
+					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: vertical field of view set to %.2f.", fovOverride)));
+					return 1;
+				})));
+			// /ccalign  lines up the street where you stand with Minecraft's whole-number heights, so blocks built there sit exactly on it.
+			dispatcher.register(ClientCommands.literal("ccalign").executes(c -> {
+				c.getSource().sendFeedback(Component.literal(requestAlign()));
+				return 1;
+			}));
+			// /ccdump  writes the names of Minecraft's camera and rendering methods to a file (groundwork for drawing blocks).
+			dispatcher.register(ClientCommands.literal("ccdump").executes(c -> {
+				c.getSource().sendFeedback(Component.literal(ApiDump.run()));
+				return 1;
+			}));
 			// /ccblocks  shows the ground as real blocks too (a debugging view of what Cyberpunk found).
 			dispatcher.register(ClientCommands.literal("ccblocks").executes(c -> {
 				if (GroundMirror.enabled()) {
@@ -113,6 +211,25 @@ public final class CyberCraftClient implements ClientModInitializer {
 		CyberCraft.LOG.info("CyberCraft: asked Cyberpunk to teleport V by east={} north={} up={} (command {})", east, north, up, seq);
 		return String.format("CyberCraft: asked Cyberpunk to move V by east %.1f, north %.1f, up %.1f m. Check the log for the result.", east, north, up);
 	}
+
+	/** Asks Cyberpunk to line the street under V up with a whole-number height. */
+	private static String requestAlign() {
+		if (!CyberLink.active()) {
+			return "CyberCraft: Cyberpunk isn't linked. Start the game with the plugin installed.";
+		}
+		if (!CyberLink.readGameState(STATE) || !STATE.inGame()) {
+			return "CyberCraft: Cyberpunk is linked, but no save is loaded.";
+		}
+		int seq = CyberLink.sendAlignGround();
+		if (seq == 0) {
+			return "CyberCraft: couldn't send the command.";
+		}
+		pendingSeq = seq;
+		alignRequested = true;
+		return "CyberCraft: lining the street up with Minecraft's heights. Stand where you want to build, on level ground; blocks you already built here will move up or down by under half a block.";
+	}
+
+	private static boolean alignRequested;
 
 	private static String startFollowing() {
 		Minecraft client = Minecraft.getInstance();
@@ -183,6 +300,98 @@ public final class CyberCraftClient implements ClientModInitializer {
 	private static int pushCount;
 	private static volatile boolean routedFlag;
 
+	// The game's camera, read at the start of every Minecraft frame. While drawWorld() is true, Minecraft's own camera
+	// is replaced by it (see CameraMixin) and the world is drawn, without sky or clouds, on a transparent background.
+	private static final CyberLink.CameraState CAMERA = new CyberLink.CameraState();
+	private static volatile boolean cameraValid;
+	private static volatile boolean worldVisible = true; // /ccworld
+	private static volatile double fovOverride; // /ccfov <degrees>; 0 = use what the game reports
+	// The picture takes a few tens of milliseconds to get from Minecraft to the screen (it is drawn, copied back from
+	// the graphics card, shared, then drawn again by Cyberpunk), so blocks drawn from the camera's position at the start
+	// of that trip end up slightly behind when the camera is moving. Minecraft draws the camera's position that far ahead,
+	// using how fast the Minecraft player is moving (known exactly, unlike a speed worked out from the camera, which is
+	// noisy). Only the position is moved ahead, never the direction. /ccpredict tunes it.
+	private static volatile double predictMs = 0;
+	private static volatile double playerVelX, playerVelY, playerVelZ; // blocks per second
+	private static double lastPlayerX, lastPlayerY, lastPlayerZ;
+	private static boolean havePlayerSample;
+	// Which camera the plugin publishes (0 transform, 1 camera data, 2 projected, 3 projected with the position solved too) and whether the camera's tilt is applied (0 off, 1 on, -1 reversed).
+	private static volatile int camSource = 0;
+	private static volatile int rollMode = 1;
+	private static boolean activeBefore;
+	private static boolean savedBobView;
+	private static Object savedDamageTilt;
+
+	/** Is Minecraft drawing its blocks (and entities) over Cyberpunk, through Cyberpunk's camera? */
+	public static boolean drawWorld() {
+		return overlayActive() && worldVisible && cameraValid;
+	}
+
+	/** The camera Minecraft should use: x, y, z, yaw, pitch (valid while {@link #drawWorld()} is true). */
+	/** The plugin's counter for the camera Minecraft read at the start of this frame. */
+	public static long cameraFrame() {
+		return CAMERA.frame;
+	}
+
+	// What Minecraft actually renders through, noted by LevelRendererMixin, and a once-a-second comparison with what was asked for.
+	private static volatile double usedX, usedY, usedZ;
+	private static volatile float usedYaw, usedPitch, usedProjX, usedProjY;
+	private static volatile boolean usedValid;
+	private static long reportAt;
+	private static int framesSinceReport;
+
+	public static void noteRenderCamera(double x, double y, double z, float yaw, float pitch, float projX, float projY) {
+		usedX = x;
+		usedY = y;
+		usedZ = z;
+		usedYaw = yaw;
+		usedPitch = pitch;
+		usedProjX = projX;
+		usedProjY = projY;
+		usedValid = true;
+	}
+
+	private static void reportCamera(Minecraft client) {
+		framesSinceReport++;
+		long now = System.currentTimeMillis();
+		if (now < reportAt) {
+			return;
+		}
+		double seconds = reportAt == 0 ? 1.0 : 1.0 + (now - reportAt) / 1000.0;
+		reportAt = now + 3000;
+		if (!drawWorld() || !usedValid) {
+			framesSinceReport = 0;
+			return;
+		}
+		double[] asked = cameraPose();
+		double yawDiff = usedYaw - asked[3];
+		while (yawDiff > 180.0) yawDiff -= 360.0;
+		while (yawDiff < -180.0) yawDiff += 360.0;
+		double usedVfov = Math.toDegrees(2.0 * Math.atan(1.0 / usedProjY));
+		double usedAspect = usedProjY / usedProjX;
+		var target = client.gameRenderer.mainRenderTarget();
+		CyberCraft.LOG.info(String.format(
+			"CyberCraft: world drawing: %.0f frames a second; camera used vs asked for: position off by (%.3f, %.3f, %.3f) blocks, yaw off by %.3f deg, pitch off by %.3f deg; "
+				+ "vertical field of view used %.2f (asked %.2f), picture shape used %.3f (the game's %.3f, Minecraft's window %dx%d = %.3f)",
+			framesSinceReport / Math.max(0.5, 3.0), usedX - asked[0], usedY - asked[1], usedZ - asked[2], yawDiff, usedPitch - asked[4],
+			usedVfov, cameraFov(), usedAspect, CAMERA.aspect, target.width, target.height, (double) target.width / Math.max(1, target.height)));
+		framesSinceReport = 0;
+	}
+
+	public static int rollMode() {
+		return rollMode;
+	}
+
+	public static double[] cameraPose() {
+		double s = predictMs / 1000.0;
+		return new double[] { CAMERA.x + playerVelX * s, CAMERA.y + playerVelY * s, CAMERA.z + playerVelZ * s, CAMERA.yaw, CAMERA.pitch, CAMERA.roll };
+	}
+
+	/** The vertical field of view Minecraft should use, in degrees. */
+	public static double cameraFov() {
+		return fovOverride > 0 ? fovOverride : CAMERA.vfov;
+	}
+
 	/** True while Cyberpunk is sending its keyboard and mouse to Minecraft: Minecraft then ignores its own window's. */
 	public static boolean inputRouted() {
 		return routedFlag;
@@ -195,13 +404,37 @@ public final class CyberCraftClient implements ClientModInitializer {
 	public static void beginFrame() {
 		CyberLink.poll();
 		Minecraft client = Minecraft.getInstance();
+		boolean active = overlayActive();
+		if (active && !activeBefore) {
+			// Minecraft's own frame pacing would hold the picture back: no VSync, a high frame limit. (Same as SkyCraft.)
+			client.options.enableVsync().set(false);
+			client.options.framerateLimit().set(144);
+			// Minecraft's walking sway moves the view, but the camera is Cyberpunk's, and V is not walking: it would
+			// make the blocks bob. Off while this is on; put back afterwards.
+			savedBobView = client.options.bobView().get();
+			client.options.bobView().set(false);
+			// The same for the shake Minecraft gives the view when its player is hurt.
+			savedDamageTilt = OptionTweaks.get(client.options, "damageTiltStrength");
+			if (savedDamageTilt != null) {
+				OptionTweaks.set(client.options, "damageTiltStrength", 0.0);
+			}
+		} else if (!active && activeBefore) {
+			client.options.bobView().set(savedBobView);
+			if (savedDamageTilt != null) {
+				OptionTweaks.set(client.options, "damageTiltStrength", savedDamageTilt);
+			}
+		}
+		activeBefore = active;
 		if (!CyberLink.active() || !CyberLink.readGameState(STATE)) {
+			cameraValid = false;
 			if (routedFlag) {
 				routedFlag = false;
 				InputBridge.releaseAll();
 			}
 			return;
 		}
+		cameraValid = CyberLink.readCamera(CAMERA) && CAMERA.valid;
+		reportCamera(client);
 		boolean routing = STATE.routing() && (following || syncing);
 		if (routing != routedFlag) {
 			routedFlag = routing;
@@ -271,6 +504,34 @@ public final class CyberCraftClient implements ClientModInitializer {
 	private static void tick(Minecraft client) {
 		CyberLink.poll();
 
+		// How fast the Minecraft player is moving, from where it was a tick ago (one tick = 1/20 s). A jump of more than
+		// a few blocks in one tick is a teleport, not walking: it doesn't count.
+		LocalPlayer mover = client.player;
+		if (mover != null) {
+			double px = mover.getX();
+			double py = mover.getY();
+			double pz = mover.getZ();
+			if (havePlayerSample) {
+				double vx = (px - lastPlayerX) * 20.0;
+				double vy = (py - lastPlayerY) * 20.0;
+				double vz = (pz - lastPlayerZ) * 20.0;
+				double speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+				if (speed > 25.0) {
+					vx = vy = vz = 0.0;
+				}
+				playerVelX = vx;
+				playerVelY = vy;
+				playerVelZ = vz;
+			}
+			lastPlayerX = px;
+			lastPlayerY = py;
+			lastPlayerZ = pz;
+			havePlayerSample = true;
+		} else {
+			havePlayerSample = false;
+			playerVelX = playerVelY = playerVelZ = 0.0;
+		}
+
 		boolean active = CyberLink.active();
 		if (active != wasActive) {
 			wasActive = active;
@@ -335,12 +596,12 @@ public final class CyberCraftClient implements ClientModInitializer {
 		boolean screenOpen = client.gui.screen() != null;
 		float sensitivity = client.options.sensitivity().get().floatValue();
 		if (player == null) {
-			CyberLink.publishMcState(false, false, false, sensitivity, 0, 0, 0, 0, 0);
+			CyberLink.publishMcState(false, false, false, camSource, sensitivity, 0, 0, 0, 0, 0);
 		} else if (following) {
 			// The ground Minecraft walks on is Night City's own, so the player's position is V's position.
-			CyberLink.publishMcState(true, true, screenOpen, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, true, screenOpen, camSource, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
 		} else {
-			CyberLink.publishMcState(true, false, screenOpen, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, false, screenOpen, camSource, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
 		}
 
 		if (!haveState) {
@@ -349,7 +610,14 @@ public final class CyberCraftClient implements ClientModInitializer {
 
 		// Did Cyberpunk deal with our teleport?
 		if (pendingSeq != 0 && STATE.cmdAck == pendingSeq) {
-			CyberCraft.LOG.info("CyberCraft: command {} {}", pendingSeq, STATE.cmdResult == Proto.RESULT_OK ? "done: Cyberpunk teleported V" : "FAILED: see Cyberpunk's CyberCraft.log");
+			if (alignRequested) {
+				alignRequested = false;
+				CyberCraft.LOG.info(STATE.cmdResult == Proto.RESULT_OK
+					? String.format("CyberCraft: aligned: Minecraft's height is now the game's minus %.3f", STATE.verticalOffset)
+					: "CyberCraft: aligning FAILED: see Cyberpunk's CyberCraft.log");
+			} else {
+				CyberCraft.LOG.info("CyberCraft: command {} {}", pendingSeq, STATE.cmdResult == Proto.RESULT_OK ? "done: Cyberpunk teleported V" : "FAILED: see Cyberpunk's CyberCraft.log");
+			}
 			pendingSeq = 0;
 		}
 

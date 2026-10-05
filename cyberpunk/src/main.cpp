@@ -6,8 +6,10 @@
 // position Minecraft's player has. Once a second it writes a line to the RED4ext
 // log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
+#include "Camera.hpp"
 #include "Ground.hpp"
 #include "Input.hpp"
+#include "Mapping.hpp"
 #include "Overlay.hpp"
 #include "Link.hpp"
 
@@ -172,6 +174,30 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
 {
     auto& link = cybercraft::Link::Get();
 
+    if (aCommand.kind == cybercraft::proto::kCmdAlignGround)
+    {
+        if (!aPlayer)
+        {
+            link.AckCommand(aCommand.seq, false);
+            return;
+        }
+        RED4ext::Vector4 position;
+        RED4ext::ExecuteFunction(aPlayer.instance, g_getWorldPosition, &position);
+        double ground = cybercraft::ground::HeightAt(position.X, position.Y);
+        if (std::isnan(ground))
+        {
+            ground = position.Z; // the scan hasn't looked here yet: V's feet will do
+        }
+        const double oldOffset = cybercraft::mapping::Offset();
+        const double newOffset = ground - std::round(ground);
+        cybercraft::ground::OffsetChanged(oldOffset, newOffset);
+        cybercraft::mapping::SetOffset(newOffset);
+        g_sdk->logger->InfoF(g_handle, "align: the street under V is at height %.3f; vertical offset %.3f -> %.3f, so it now counts as height %.0f in Minecraft",
+            ground, oldOffset, newOffset, std::round(ground));
+        link.AckCommand(aCommand.seq, true);
+        return;
+    }
+
     if (aCommand.kind != cybercraft::proto::kCmdTeleport)
     {
         g_sdk->logger->WarnF(g_handle, "command #%u: unknown kind %u", aCommand.seq, aCommand.kind);
@@ -189,7 +215,7 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
     // Minecraft (X east, Y up, -Z north) -> Cyberpunk (X east, Y north, Z up).
     const double cx = aCommand.x;
     const double cy = -aCommand.z;
-    const double cz = aCommand.y;
+    const double cz = aCommand.y + cybercraft::mapping::Offset();
     g_sdk->logger->InfoF(g_handle, "command #%u: teleport V to x=%.2f y=%.2f z=%.2f", aCommand.seq, cx, cy, cz);
 
     link.AckCommand(aCommand.seq, TeleportPlayer(aPlayer, cx, cy, cz));
@@ -398,7 +424,7 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
     }
 
     // Minecraft (X east, Y up, -Z north) -> Cyberpunk (X east, Y north, Z up).
-    if (TeleportPlayer(aPlayer, g_follow.x, -g_follow.z, g_follow.y, g_follow.yaw, true))
+    if (TeleportPlayer(aPlayer, g_follow.x, -g_follow.z, g_follow.y + cybercraft::mapping::Offset(), g_follow.yaw, true))
     {
         g_follow.failures = 0;
         g_follow.haveSent = true;
@@ -474,6 +500,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
         StopFollow("no player right now");
         cybercraft::input::Update(false, false, cybercraft::Link::McSnapshot{});
         cybercraft::ground::Reset();
+        cybercraft::camera::Reset();
         link.PublishPlayer(false, 0.0, 0.0, 0.0);
         if (g_hadPlayer)
         {
@@ -488,6 +515,8 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
         g_sdk->logger->Info(g_handle, "player found");
         g_hadPlayer = true;
     }
+
+    cybercraft::camera::Update(player); // publishes the game's camera for Minecraft to draw its blocks through
 
     if (!g_lookedUpFunction)
     {
@@ -525,6 +554,10 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     const bool mcAlive = link.McPid() != 0 && (GetTickCount64() - link.McHeartbeatMs()) < 3000;
     const bool mcFollow = mcAlive && link.ReadMcState(mc) && (mc.flags & cybercraft::proto::kMcInWorld) != 0 &&
                           (mc.flags & cybercraft::proto::kMcFollow) != 0;
+    if (mcAlive)
+    {
+        cybercraft::camera::SetSource(static_cast<int>((mc.flags >> cybercraft::proto::kMcCamSourceShift) & 3u));
+    }
     cybercraft::input::Update(mcFollow && !g_follow.gaveUp, true, mc);
     if (mcFollow)
     {
@@ -546,7 +579,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     }
 
     // Cyberpunk is Z-up (X east, Y north) in metres; Minecraft is Y-up (X east, -Z north) in blocks.
-    link.PublishPlayer(true, position.X, position.Z, -position.Y);
+    link.PublishPlayer(true, position.X, position.Z - cybercraft::mapping::Offset(), -position.Y);
 
     if (logNow)
     {
@@ -568,6 +601,9 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         cybercraft::ground::Init(aHandle, aSdk);
         cybercraft::overlay::Init(aHandle, aSdk);
         cybercraft::input::Init(aHandle, aSdk);
+        cybercraft::camera::Init(aHandle, aSdk);
+        cybercraft::mapping::Load();
+        aSdk->logger->InfoF(aHandle, "vertical offset between the game and Minecraft: %.3f", cybercraft::mapping::Offset());
 
         aSdk->logger->InfoF(aHandle, "CyberCraft loaded (game version %u.%u.%u)", static_cast<unsigned>(aSdk->runtime->major),
                             static_cast<unsigned>(aSdk->runtime->minor), static_cast<unsigned>(aSdk->runtime->patch));
@@ -605,7 +641,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 8, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 12, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

@@ -3,6 +3,8 @@
   "package": "dev.cybercraft.client.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "CameraMixin",
+    "CloudRendererMixin",
     "EntityCollideMixin",
     "FramerateLimitTrackerMixin",
     "InputConstantsMixin",

@@ -20,12 +20,12 @@ import net.minecraft.client.Minecraft;
  * says the copy finished, typically a frame later.
  */
 public final class FrameExporter {
-	private static final int STAGING = 3;
+	private static final int STAGING = 4;
 	private static final int FREE = 0;
 	private static final int PENDING = 1;
 	private static final int READY = 2;
 	// Capturing more often than this is a waste: Cyberpunk draws the newest one each of its frames anyway.
-	private static final long MIN_CAPTURE_GAP_NANOS = 8_000_000L;
+	private static final long MIN_CAPTURE_GAP_NANOS = 2_000_000L;
 
 	private static final Staging[] staging = new Staging[STAGING];
 	private static long nextFrameId = 1;
@@ -38,6 +38,7 @@ public final class FrameExporter {
 		int height;
 		volatile int state = FREE;
 		long frameId;
+		long cameraFrame;
 	}
 
 	private FrameExporter() {
@@ -120,6 +121,7 @@ public final class FrameExporter {
 		final Staging captured = slot;
 		captured.state = PENDING;
 		captured.frameId = nextFrameId++;
+		captured.cameraFrame = CyberCraftClient.cameraFrame();
 		lastCapture = now;
 		framesCaptured++;
 		RenderSystem.getDevice().createCommandEncoder().copyTextureToBuffer(color, captured.buffer, 0L, () -> captured.state = READY, 0);
@@ -143,7 +145,7 @@ public final class FrameExporter {
 				MemorySegment src = MemorySegment.ofBuffer(view.data());
 				MemorySegment.copy(src, 0, shm, CyberLink.overlayBackSlotOffset(), Math.min(bytes, src.byteSize()));
 			}
-			CyberLink.publishOverlay(newest.width, newest.height, true, newest.frameId);
+			CyberLink.publishOverlay(newest.width, newest.height, true, newest.frameId, newest.cameraFrame);
 			framesShipped++;
 		}
 		// Anything older than what we just shipped is useless now.

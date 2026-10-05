@@ -17,6 +17,7 @@
 
 #include "Ground.hpp"
 #include "Link.hpp"
+#include "Mapping.hpp"
 
 #include <cybercraft_protocol.h>
 
@@ -128,13 +129,16 @@ namespace cybercraft::ground
 			const auto bits = std::uint32_t(value & 0xFFFFFFFFu);
 			float height;
 			std::memcpy(&height, &bits, sizeof(height));
-			return height <= proto::kNoGround * 0.5f ? std::nanf("") : height;
+			// Stored in Minecraft's height; the scanner works in Cyberpunk's.
+			return height <= proto::kNoGround * 0.5f ? std::nanf("") : height + float(mapping::Offset());
 		}
 
 		void StoreHeight(int a_bx, int a_bz, float a_height)
 		{
+			// a_height is Cyberpunk's height (or the "no ground" marker, which is kept as it is).
+			const float stored = a_height <= proto::kNoGround * 0.5f ? a_height : a_height - float(mapping::Offset());
 			std::atomic_ref<std::uint64_t>(*SlotWord(a_bx, a_bz, 0))
-				.store(PackWord(a_height, std::int16_t(a_bx), std::int16_t(a_bz)), std::memory_order_release);
+				.store(PackWord(stored, std::int16_t(a_bx), std::int16_t(a_bz)), std::memory_order_release);
 		}
 
 		// The mask of blocked sub-squares (0: nothing in the way) goes in word 2, then word 1 says which cell it
@@ -481,6 +485,38 @@ namespace cybercraft::ground
 	{
 		g_handle = a_handle;
 		g_sdk = a_sdk;
+	}
+
+	double HeightAt(double a_x, double a_y)
+	{
+		if (!Link::Get().IsOpen()) {
+			return std::nan("");
+		}
+		const float h = StoredHeight(int(std::floor(a_x)), int(std::floor(-a_y)));
+		return std::isnan(h) ? std::nan("") : double(h);
+	}
+
+	void OffsetChanged(double a_oldOffset, double a_newOffset)
+	{
+		if (!Link::Get().IsOpen()) {
+			return;
+		}
+		// Heights are stored as (Cyberpunk Z - offset): with a new offset every stored value moves by the difference.
+		const float delta = float(a_oldOffset - a_newOffset);
+		auto* words = reinterpret_cast<std::uint64_t*>(Link::Get().Base() + proto::kOffGround);
+		for (std::uint32_t i = 0; i < proto::kGroundN * proto::kGroundN; ++i) {
+			std::uint64_t& word = words[i * 3];
+			const auto bits = std::uint32_t(word & 0xFFFFFFFFu);
+			float height;
+			std::memcpy(&height, &bits, sizeof(height));
+			if (height <= proto::kNoGround * 0.5f) {
+				continue;
+			}
+			height += delta;
+			std::uint32_t newBits;
+			std::memcpy(&newBits, &height, sizeof(newBits));
+			word = (word & 0xFFFFFFFF00000000ull) | newBits;
+		}
 	}
 
 	void Reset()

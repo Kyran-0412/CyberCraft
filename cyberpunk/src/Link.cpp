@@ -1,4 +1,5 @@
 #include "Link.hpp"
+#include "Mapping.hpp"
 
 #include <cybercraft_protocol.h>
 
@@ -108,6 +109,7 @@ namespace cybercraft
 		state->flags = (a_inGame ? proto::kGameInGame : 0) | (routing_ ? proto::kGameRouting : 0);
 		state->lookYaw = lookYaw_;
 		state->lookPitch = lookPitch_;
+		state->verticalOffset = static_cast<float>(mapping::Offset());
 		state->posX = a_x;
 		state->posY = a_y;
 		state->posZ = a_z;
@@ -173,6 +175,47 @@ namespace cybercraft
 	{
 		cmdAck_ = a_seq;
 		cmdResult_ = a_ok ? proto::kResultOk : proto::kResultFailed;
+	}
+
+	void Link::PublishCamera(bool a_valid, double a_x, double a_y, double a_z, float a_yaw, float a_pitch, float a_vfov, float a_aspect,
+		float a_velX, float a_velY, float a_velZ, float a_yawRate, float a_pitchRate, float a_roll)
+	{
+		if (!base_) {
+			return;
+		}
+		auto* state = reinterpret_cast<proto::CameraState*>(base_ + proto::kOffCamera);
+		auto  seq = Atomic(state->seq);
+		const auto start = seq.load(std::memory_order_relaxed);
+		seq.store(start + 1, std::memory_order_relaxed);  // odd: write in progress
+		std::atomic_thread_fence(std::memory_order_release);
+
+		state->flags = a_valid ? proto::kCameraValid : 0;
+		state->posX = a_x;
+		state->posY = a_y;
+		state->posZ = a_z;
+		state->yaw = a_yaw;
+		state->pitch = a_pitch;
+		state->vfov = a_vfov;
+		state->aspect = a_aspect;
+		state->velX = a_velX;
+		state->velY = a_velY;
+		state->velZ = a_velZ;
+		state->yawRate = a_yawRate;
+		state->pitchRate = a_pitchRate;
+		state->roll = a_roll;
+		++cameraFrame_;
+		state->frameCounter = cameraFrame_;
+		cameraTimes_[cameraFrame_ & 1023] = std::chrono::steady_clock::now();
+
+		seq.store(start + 2, std::memory_order_release);  // even: done
+	}
+
+	double Link::CameraAgeMs(std::uint64_t a_cameraFrame) const
+	{
+		if (a_cameraFrame == 0 || a_cameraFrame > cameraFrame_ || cameraFrame_ - a_cameraFrame >= 1024) {
+			return -1.0;
+		}
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cameraTimes_[a_cameraFrame & 1023]).count();
 	}
 
 	void Link::PushInput(std::uint16_t a_type, std::uint16_t a_code, std::int32_t a_a, std::int32_t a_b, std::int32_t a_c)

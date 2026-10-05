@@ -13,7 +13,7 @@ public abstract class FramerateLimitTrackerMixin {
 	@Inject(method = "getFramerateLimit", at = @At("HEAD"), cancellable = true)
 	private void cybercraft$fastEnough(CallbackInfoReturnable<Integer> cir) {
 		if (CyberCraftClient.overlayActive()) {
-			cir.setReturnValue(120);
+			cir.setReturnValue(144);
 		}
 	}
 }

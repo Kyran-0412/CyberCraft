@@ -49,6 +49,33 @@ Start Cyberpunk and the development Minecraft, load a save in Cyberpunk, and in 
 Press `T` and type `/cctp` (V moves 5 m up), or `/cctp <east> <north> <up>` for an offset in metres.
 The result is in Minecraft's console and in `red4ext\logs\CyberCraft.log`.
 
+### Drawing Minecraft's blocks over Cyberpunk (Phase 5a)
+
+While `/ccfollow` is on, the plugin publishes the game's camera (position, direction and a measured field of view)
+and Minecraft draws its blocks, entities and hand through that camera, without sky or clouds, on a transparent
+background; the result is drawn over the game together with the HUD. This version does not hide blocks behind
+buildings yet (no depth test), and blocks are lit by Minecraft's own light.
+
+* Use a **Void world** (Create New World > World > World Type: Superflat > Customize > Presets > The Void), or Minecraft's
+  own ground will be drawn too. Night City's ground is not made of blocks.
+* Make the Minecraft window the same **shape** as the Cyberpunk screen (for 1440 x 900, any 16:10 size), since the
+  picture is stretched over the screen. The plugin logs a warning if the shapes differ.
+* Try `/fill ~-3 ~1 ~5 ~3 ~3 ~5 minecraft:stone_bricks` (a wall 5 blocks south of you) and walk and turn: the wall
+  should stay where it is in Night City.
+* The game's camera is worked out three ways (its transform, its camera data, and the direction the picture really looks in,
+  measured through the game's own world-to-screen function) because only the last is known to follow camera shake, head bob and
+  hit reactions. `/cccamsrc transform|data|projected|projectedpos` chooses which is published (default: transform, which follows shake and hits fine); the plugin logs how much
+  they disagree every 2 seconds. `/ccroll on|off|flip` applies the camera's sideways tilt. `/ccpredict <ms>` draws the camera's *position* that many
+  milliseconds ahead using how fast the Minecraft player is moving (off by default: it makes the blocks jitter).
+  Every few seconds the plugin log says how old the camera was when the picture drawn through it reaches the screen, and
+  Minecraft's console says whether the camera, field of view and picture shape it really renders through match what was asked. VSync, Minecraft's own view bobbing and its damage shake are switched off in Minecraft while this is on (and put back afterwards).
+* **`/ccalign`** lines up the street where you stand with Minecraft's whole-number heights. Blocks sit on whole-number heights, but
+  streets are at heights like 22.6, so a block built "on" the street really starts 0.6 m under it; since Minecraft's blocks are
+  drawn over the game and not hidden by the ground, that sunken part shows through the road and makes the block seem to slide as you
+  move. Stand where you want to build, on level ground, and type `/ccalign` once before building (it is remembered between runs).
+* `/ccfov` shows the vertical field of view in use, `/ccfov <degrees>` overrides it to fine-tune, `/ccfov auto` goes
+  back. `/ccworld` hides or shows the blocks. `/ccdump` writes the names of Minecraft's rendering methods to a file.
+
 ### Playing in the Cyberpunk window (Phase 3a)
 
 With `/ccfollow` on, the keyboard and mouse of the **Cyberpunk window** go to Minecraft: WASD, space, shift, the mouse

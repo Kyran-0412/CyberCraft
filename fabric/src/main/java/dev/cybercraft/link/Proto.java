@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 9;
+	public static final int VERSION = 14;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -30,6 +30,7 @@ public final class Proto {
 	public static final long G_CMD_RESULT = 44; // u32, RESULT_*
 	public static final long G_LOOK_YAW = 48; // float, where the player looks while input is routed, Minecraft degrees
 	public static final long G_LOOK_PITCH = 52; // float
+	public static final long G_VERT_OFFSET = 56; // float: Minecraft Y = Cyberpunk Z - this (see /ccalign)
 
 	public static final int GAME_IN_GAME = 1;
 	public static final int GAME_ROUTING = 2; // Cyberpunk is sending the keyboard and mouse to Minecraft (the input ring)
@@ -49,6 +50,7 @@ public final class Proto {
 	public static final int MC_IN_WORLD = 1;
 	public static final int MC_FOLLOW = 2;
 	public static final int MC_SCREEN_OPEN = 4; // a Minecraft screen (inventory, chat, ...) is open
+	public static final int MC_CAM_SOURCE_SHIFT = 3; // bits 3-4: which camera the plugin should publish: 0 transform, 1 data, 2 projected
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock) ----
 	public static final long OFF_MC_COMMAND = 0x300;
@@ -59,6 +61,7 @@ public final class Proto {
 	public static final long C_Z = 24;
 
 	public static final int CMD_TELEPORT = 1;
+	public static final int CMD_ALIGN_GROUND = 2;
 
 	public static final int RESULT_NONE = 0;
 	public static final int RESULT_OK = 1;
@@ -90,6 +93,7 @@ public final class Proto {
 	public static final long SH_HEIGHT = 4; // u32
 	public static final long SH_FLAGS = 8; // u32, bit 0: rows are bottom-up
 	public static final long SH_FRAME_ID = 16; // u64
+	public static final long SH_CAMERA_FRAME = 24; // u64, the camera frame this picture was drawn through
 	public static final long OFF_OVERLAY_PIXELS = 0x20000;
 	public static final int MAX_OVERLAY_W = 3840;
 	public static final int MAX_OVERLAY_H = 2160;
@@ -98,6 +102,26 @@ public final class Proto {
 	public static final int OVERLAY_DIRTY = 1 << 2;
 
 	public static final long MAPPING_BYTES = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * OVERLAY_SLOTS;
+
+	// ---- the game's camera @0x400 (seqlock): Minecraft draws its blocks looking through it ----
+	public static final long OFF_CAMERA = 0x400;
+	public static final long CAM_SEQ = 0; // u32, odd while being written
+	public static final long CAM_FLAGS = 4; // u32, bit 0: valid
+	public static final long CAM_X = 8; // double, Minecraft coordinates
+	public static final long CAM_Y = 16;
+	public static final long CAM_Z = 24;
+	public static final long CAM_YAW = 32; // float, Minecraft degrees (0 = south)
+	public static final long CAM_PITCH = 36; // float, positive = down
+	public static final long CAM_VFOV = 40; // float, vertical field of view in degrees
+	public static final long CAM_ASPECT = 44; // float, width / height of the game's screen
+	public static final long CAM_FRAME = 48; // u64
+	public static final long CAM_VEL_X = 56; // float, blocks per second
+	public static final long CAM_VEL_Y = 60;
+	public static final long CAM_VEL_Z = 64;
+	public static final long CAM_YAW_RATE = 68; // float, degrees per second
+	public static final long CAM_PITCH_RATE = 72;
+	public static final long CAM_ROLL = 76; // float, degrees: how far the camera is tilted sideways (positive = right side up)
+	public static final int CAMERA_VALID = 1;
 
 	// ---- input ring @0x1A000 (Cyberpunk produces, Minecraft consumes) ----
 	// Entries are 16 bytes: u16 type, u16 code, i32 a, i32 b, i32 c.
