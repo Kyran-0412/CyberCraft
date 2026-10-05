@@ -18,6 +18,9 @@ import org.jspecify.annotations.Nullable;
  * block, so a slope is made of steps far below Minecraft's 0.6 step height and feels like a ramp.
  * Where neighbouring cells differ by more than MAX_STEP the surface is not blended: the jump stays a
  * sharp edge, which Minecraft treats as a step or a wall.
+ *
+ * Cells where the plugin found something in the way (a wall, tree or lamp post) are also solid: a full
+ * 1 m x 1 m column from the ground up to the obstacle's top.
  */
 public final class GroundCollision {
 	/** Biggest height difference between neighbouring cells that is still treated as a slope. */
@@ -75,7 +78,14 @@ public final class GroundCollision {
 		if (Double.isNaN(h[1][1])) {
 			return null; // no ground known in this block's own cell
 		}
-		// Far above the highest ground, or well under the lowest: nothing here.
+		// Anything standing in the way in this block's own cell?
+		float obstacle = CyberLink.obstacleTop(bx, bz);
+		hash = 31 * hash + Float.floatToRawIntBits(obstacle);
+		boolean blocked = !Float.isNaN(obstacle) && !Float.isInfinite(obstacle);
+		if (blocked) {
+			highest = Math.max(highest, obstacle);
+		}
+		// Far above the highest ground or obstacle, or well under the lowest ground: nothing here.
 		if (by > Math.ceil(highest) + 0.5 || by + 1 < Math.floor(lowest) - DEPTH) {
 			return null;
 		}
@@ -86,6 +96,15 @@ public final class GroundCollision {
 			return cached.shape;
 		}
 		VoxelShape shape = build(h, by, bx, bz);
+		if (blocked) {
+			// The obstacle: the whole column from the ground up to its top.
+			double low = Math.max(0.0, h[1][1] - by);
+			double high = Math.min(1.0, obstacle - by);
+			if (high - low > 1.0e-3) {
+				VoxelShape column = Shapes.box(0, low, 0, 1, high, 1);
+				shape = shape == null ? column : Shapes.or(shape, column);
+			}
+		}
 		if (CACHE.size() > CACHE_LIMIT) {
 			CACHE.clear();
 		}

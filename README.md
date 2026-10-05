@@ -12,7 +12,7 @@ Tested against Cyberpunk 2077 **game version 2.31** (Steam), RED4ext and Cyber E
 
 0. **Hello world**: a RED4ext plugin that logs V's position once a second. (done)
 1. **Link**: shared memory between the plugin and a Fabric mod. 1a: V's position reaches Minecraft (done). 1b-i: a Minecraft command teleports V (done). 1b-ii: Minecraft's player position drives V (done).
-2. **Walk**: Night City collision fed into Minecraft physics. 2a: the ground around V built as blocks from raycasts (done). 2b-i: the ground as smooth invisible collision instead of blocks (current). 2b-ii: walls and buildings. 2b-iii: bridges and other layers.
+2. **Walk**: Night City collision fed into Minecraft physics. 2a: the ground around V built as blocks from raycasts (done). 2b-i: the ground as smooth invisible collision instead of blocks (done). 2b-ii: walls, trees, lamp posts and other obstacles (current). 2b-iii: bridges and other layers.
 3. **HUD and hand**: the Minecraft hotbar and held item drawn over the game.
 4. **Combat**: invisible Minecraft proxies for NPCs, damage both ways.
 5. **Blocks**: place and break blocks in Night City, depth-composited.
@@ -49,16 +49,17 @@ Start Cyberpunk and the development Minecraft, load a save in Cyberpunk, and in 
 Press `T` and type `/cctp` (V moves 5 m up), or `/cctp <east> <north> <up>` for an offset in metres.
 The result is in Minecraft's console and in `red4ext\logs\CyberCraft.log`.
 
-### Trying follow mode and the ground (Phase 2b-i)
+### Trying follow mode and the ground (Phase 2b-ii)
 
-Open a **Superflat** Creative world in Minecraft and type `/ccfollow`. The plugin shoots rays down around V
-and the mod turns what they find into invisible collision, so you walk on Night City's real roads and
-terrain with smooth slopes. You are moved to V's spot and V copies your movement and the way you look;
-click the Minecraft window and use WASD and the mouse. `/ccstop` ends it. `/ccblocks` also shows the ground
-as real blocks, which is useful for seeing what the scan found.
+Open a **Superflat** Creative world in Minecraft and type `/ccfollow`. The plugin looks at the 1 m cells around
+V (as many per frame as fit in 2.5 ms): a ray down finds the ground, and a box test finds anything standing on
+it, such as walls, trees and lamp posts. The mod turns both into invisible collision, so you walk on Night
+City's real roads and terrain with smooth slopes and are stopped by obstacles. You are moved to V's spot and
+V copies your movement and the way you look; click the Minecraft window and use WASD and the mouse.
+`/ccstop` ends it. `/ccblocks` also shows the ground as real blocks, a debugging view of what the scan found.
 
-Walls and buildings are not solid yet (a single layer of ground is found per column), so V walks through
-them. Bridges and other levels are only seen at V's own height.
+Obstacles are blocky: a thin pole is a 1 m x 1 m pillar, a blocked cell is solid up to 2.5 m, and tree leaves
+(which have no collision in the game) are not solid. Bridges and other levels are only seen at V's own height.
 
 ## Credits
 

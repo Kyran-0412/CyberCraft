@@ -1,17 +1,24 @@
-// Phase 2a: find the ground around V.
+// Phases 2a and 2b-ii: find the ground around V, and what is standing on it.
 //
-// A few rays per frame are shot straight down on a 1 m grid around V, using the game's own physics query
-// (SpatialQueriesSystem.SyncRaycastByCollisionGroup, the same function redscript mods use). Each hit's
-// height goes into the shared ground grid for the Minecraft mod to build as blocks.
+// Using the game's own physics queries (SpatialQueriesSystem, the same functions redscript mods use), the
+// plugin looks at the 1 m cells around V, nearest first, as many per frame as fit in a small time budget:
 //
-// Each ray starts a little above where the ground is expected to be (from the last scan of that cell, or
-// from its neighbour nearer to V), so it finds the street under V rather than the roof above it.
+//   * A ray is shot straight down through the cell's centre to find the ground's height.
+//     It starts a little above where the ground is expected to be (from the neighbouring cell nearer to V),
+//     so it finds the street under V rather than the roof above it.
+//   * A box about 1.4 m tall, sitting 0.7 m above that ground (higher than Minecraft's 0.6 m step height),
+//     is tested for overlap with the world. If it touches anything, the cell is marked as an obstacle:
+//     Minecraft makes it solid up to head height. This catches walls, trees, lamp posts and the like,
+//     which vertical rays slip past.
+//
+// Everything goes into the shared ground grid for the Minecraft mod to read.
 
 #include "Ground.hpp"
 #include "Link.hpp"
 
 #include <cybercraft_protocol.h>
 
+#include <RED4ext/Scripting/Natives/Generated/EulerAngles.hpp>
 #include <RED4ext/Scripting/Natives/ScriptGameInstance.hpp>
 #include <RED4ext/Scripting/Natives/physicsTraceResult.hpp>
 #include <RED4ext/Scripting/Natives/Vector4.hpp>
@@ -23,21 +30,35 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace cybercraft::ground
 {
 	namespace
 	{
-		constexpr int kCellsPerFrame = 80;       // cells per frame (each costs 1 to 2 rays; tune with the timings in the log)
+		// How much of each frame the scan may use. Cells are scanned until the budget runs out (but at least
+		// kMinCells and at most kMaxCells). A faster PC gets through more cells in the same time.
+		constexpr double kBudgetMs = 2.5;
+		constexpr int kMinCells = 16;
+		constexpr int kMaxCells = 800;
 
-		// Collision groups to try, in order. Roads, paths and buildings are in "Static"; the ground itself
-		// (grass, dirt, sand) is in "Terrain". A ray only moves on to the next group if the last found nothing.
+		// Collision groups to try for the ground, in order. Roads, paths and buildings are in "Static"; the
+		// ground itself (grass, dirt, sand) is in "Terrain". A ray only moves on to the next group if the last
+		// found nothing.
 		constexpr const char* kGroups[] = { "Static", "Terrain" };
 		constexpr int kGroupCount = sizeof(kGroups) / sizeof(kGroups[0]);
-		constexpr double kRayUp = 2.5;           // start this far above the expected ground
-		constexpr double kRayDown = 4.0;         // and end this far below it
-		constexpr double kRetryRange = 12.0;     // second try, if the first ray found nothing
+		constexpr double kRayUp = 2.5;        // start this far above the expected ground
+		constexpr double kRayDown = 4.0;      // and end this far below it
+		constexpr double kRetryRange = 12.0;  // second try, if the first ray found nothing
+
+		// Obstacles: groups tested, and the box tested in each cell (all relative to the ground at the cell's centre).
+		constexpr const char* kObstacleGroups[] = { "Static" };
+		constexpr int kObstacleGroupCount = sizeof(kObstacleGroups) / sizeof(kObstacleGroups[0]);
+		constexpr double kObstacleBottom = 0.7;   // the box starts this far above the ground
+		constexpr double kObstacleBoxHeight = 1.4;
+		constexpr double kObstacleHalfWidth = 0.5;
+		constexpr double kObstacleSolidHeight = 2.5;  // a blocked cell is solid up to this far above the ground
 
 		RED4ext::v1::PluginHandle g_handle = nullptr;
 		const RED4ext::v1::Sdk* g_sdk = nullptr;
@@ -47,9 +68,16 @@ namespace cybercraft::ground
 		bool g_failed = false; // gave up: don't spam the log
 		RED4ext::IScriptable* g_spatial = nullptr;
 		RED4ext::CClassFunction* g_raycast = nullptr;
+		RED4ext::CClassFunction* g_overlap = nullptr;
 		RED4ext::physics::TraceResult g_trace{};  // the script type "TraceResult": the SDK has its exact layout
 		bool g_loggedFirstHit = false;
 		bool g_loggedExecFail = false;
+
+		// Obstacle testing: off until the game's Overlap function has been checked against known cases.
+		bool g_obstaclesOn = false;
+		bool g_calibrated = false;
+		double g_boxScale = 1.0;  // 1: Overlap takes half-widths, 2: it takes full widths
+		const char* g_lastGroundGroup = nullptr;
 
 		struct CellOffset
 		{
@@ -58,32 +86,34 @@ namespace cybercraft::ground
 		std::vector<CellOffset> g_order;  // every cell within the scan radius, nearest to V first
 		std::size_t g_next = 0;
 
-		// Timings, reported once a second.
+		// Timings, reported every few seconds.
 		std::chrono::steady_clock::time_point g_lastReport{};
-		std::uint64_t g_rays = 0, g_hits = 0;
+		std::uint64_t g_cells = 0, g_hits = 0, g_blocked = 0, g_frames = 0;
 		std::uint64_t g_groupHits[kGroupCount] = {};
-		double g_rayMicros = 0.0;
+		std::uint64_t g_obstacleHits[kObstacleGroupCount] = {};
+		double g_scanMicros = 0.0;
 
-		std::uint64_t PackSlot(float a_height, std::int16_t a_bx, std::int16_t a_bz)
+		std::uint64_t PackWord(float a_value, std::int16_t a_bx, std::int16_t a_bz)
 		{
 			std::uint32_t bits;
-			std::memcpy(&bits, &a_height, sizeof(bits));
+			std::memcpy(&bits, &a_value, sizeof(bits));
 			return std::uint64_t(bits) | (std::uint64_t(std::uint16_t(a_bx)) << 32) | (std::uint64_t(std::uint16_t(a_bz)) << 48);
 		}
 
-		std::uint64_t* SlotAddress(int a_bx, int a_bz)
+		// Word 0 of a cell's slot is the ground, word 1 the obstacle.
+		std::uint64_t* SlotWord(int a_bx, int a_bz, int a_word)
 		{
 			const int n = int(proto::kGroundN);
 			const int ix = ((a_bx % n) + n) % n;
 			const int iz = ((a_bz % n) + n) % n;
 			auto* base = Link::Get().Base();
-			return reinterpret_cast<std::uint64_t*>(base + proto::kOffGround) + (iz * n + ix);
+			return reinterpret_cast<std::uint64_t*>(base + proto::kOffGround) + (iz * n + ix) * 2 + a_word;
 		}
 
 		// The height stored for a cell, or NaN if the slot holds some other cell (or nothing).
 		float StoredHeight(int a_bx, int a_bz)
 		{
-			const std::uint64_t value = std::atomic_ref<std::uint64_t>(*SlotAddress(a_bx, a_bz)).load(std::memory_order_acquire);
+			const std::uint64_t value = std::atomic_ref<std::uint64_t>(*SlotWord(a_bx, a_bz, 0)).load(std::memory_order_acquire);
 			const auto bx = std::int16_t(std::uint16_t(value >> 32));
 			const auto bz = std::int16_t(std::uint16_t(value >> 48));
 			if (bx != std::int16_t(a_bx) || bz != std::int16_t(a_bz)) {
@@ -97,8 +127,14 @@ namespace cybercraft::ground
 
 		void StoreHeight(int a_bx, int a_bz, float a_height)
 		{
-			std::atomic_ref<std::uint64_t>(*SlotAddress(a_bx, a_bz))
-				.store(PackSlot(a_height, std::int16_t(a_bx), std::int16_t(a_bz)), std::memory_order_release);
+			std::atomic_ref<std::uint64_t>(*SlotWord(a_bx, a_bz, 0))
+				.store(PackWord(a_height, std::int16_t(a_bx), std::int16_t(a_bz)), std::memory_order_release);
+		}
+
+		void StoreObstacle(int a_bx, int a_bz, float a_top)
+		{
+			std::atomic_ref<std::uint64_t>(*SlotWord(a_bx, a_bz, 1))
+				.store(PackWord(a_top, std::int16_t(a_bx), std::int16_t(a_bz)), std::memory_order_release);
 		}
 
 		void BuildOrder()
@@ -118,7 +154,17 @@ namespace cybercraft::ground
 			g_next = 0;
 		}
 
-		// Finds the game's spatial queries system and the raycast function on it.
+		void LogParameters(const char* a_name, RED4ext::CClassFunction* a_func)
+		{
+			g_sdk->logger->InfoF(g_handle, "ground: %s takes %u parameters:", a_name, static_cast<unsigned>(a_func->params.Size()));
+			for (uint32_t i = 0; i < a_func->params.Size(); ++i) {
+				auto* param = a_func->params[i];
+				g_sdk->logger->InfoF(g_handle, "  - %s : %s%s", param->name.ToString(),
+					param->type ? param->type->GetName().ToString() : "?", param->flags.isOut ? " (out)" : "");
+			}
+		}
+
+		// Finds the game's spatial queries system and the functions on it.
 		bool Lookup()
 		{
 			g_triedInit = true;
@@ -147,12 +193,14 @@ namespace cybercraft::ground
 			}
 			g_spatial = system.instance;
 
-			// What the game says the function takes, in case a guess here is wrong.
-			g_sdk->logger->InfoF(g_handle, "ground: raycast takes %u parameters:", static_cast<unsigned>(g_raycast->params.Size()));
-			for (uint32_t i = 0; i < g_raycast->params.Size(); ++i) {
-				auto* param = g_raycast->params[i];
-				g_sdk->logger->InfoF(g_handle, "  - %s : %s%s", param->name.ToString(),
-					param->type ? param->type->GetName().ToString() : "?", param->flags.isOut ? " (out)" : "");
+			// What the game says the functions take, in case a guess here is wrong.
+			LogParameters("raycast", g_raycast);
+
+			g_overlap = type->GetFunction("Overlap");
+			if (g_overlap) {
+				LogParameters("overlap", g_overlap);
+			} else {
+				g_sdk->logger->Warn(g_handle, "ground: no Overlap function; walls, trees and poles won't be solid");
 			}
 
 			g_sdk->logger->Info(g_handle, "ground: ready");
@@ -202,10 +250,81 @@ namespace cybercraft::ground
 				const float height = Cast(kGroups[i], a_x, a_y, a_zTop, a_zBottom);
 				if (!std::isnan(height)) {
 					++g_groupHits[i];
+					g_lastGroundGroup = kGroups[i];
 					return height;
 				}
 			}
 			return std::nanf("");
+		}
+
+		// Does a box (half-widths a_hx, a_hy, a_hz, centred at a_x, a_y, a_z) touch anything in this group?
+		bool Overlap(const char* a_group, double a_x, double a_y, double a_z, double a_hx, double a_hy, double a_hz)
+		{
+			RED4ext::Vector4 size(float(a_hx * g_boxScale), float(a_hy * g_boxScale), float(a_hz * g_boxScale), 0.0f);
+			RED4ext::Vector4 position(float(a_x), float(a_y), float(a_z), 1.0f);
+			RED4ext::EulerAngles rotation{ 0.0f, 0.0f, 0.0f };
+			RED4ext::CName group(a_group);
+
+			RED4ext::StackArgs_t args;
+			args.emplace_back(nullptr, &size);
+			args.emplace_back(nullptr, &position);
+			args.emplace_back(nullptr, &rotation);
+			args.emplace_back(nullptr, &group);
+			std::memset(&g_trace, 0, sizeof(g_trace));
+			args.emplace_back(nullptr, &g_trace);
+
+			bool hit = false;
+			return RED4ext::ExecuteFunction(g_spatial, g_overlap, &hit, args) && hit;
+		}
+
+		// Checks the game's Overlap function against two cases whose answers we know, once, using a spot
+		// where a ray just found ground: a box that dips into the ground must touch it, and a box high in the
+		// air must not. Using a thin box that is only 0.5 tall, centred 0.4 above the ground, also tells whether
+		// the size is taken as half-widths (reaches down to 0.1 below the ground: touches) or full widths
+		// (only reaches down to 0.15 above it: doesn't).
+		void Calibrate(double a_x, double a_y, double a_ground)
+		{
+			g_calibrated = true;
+			g_obstaclesOn = false;
+			if (!g_overlap || !g_lastGroundGroup) {
+				return;
+			}
+
+			g_boxScale = 1.0;
+			const bool dipsIn = Overlap(g_lastGroundGroup, a_x, a_y, a_ground + 0.4, 0.05, 0.05, 0.5);
+			const bool airHit = Overlap(g_lastGroundGroup, a_x, a_y, a_ground + 5.0, 0.05, 0.05, 0.05);
+			g_sdk->logger->InfoF(g_handle, "ground: overlap check: box dipping into the ground = %d, box in the air = %d",
+				dipsIn ? 1 : 0, airHit ? 1 : 0);
+			if (airHit) {
+				g_sdk->logger->Warn(g_handle, "ground: Overlap says a box in empty air is touching something, so it can't be trusted; obstacles are off");
+				return;
+			}
+
+			if (dipsIn) {
+				g_boxScale = 1.0;  // sizes are half-widths
+			} else {
+				g_boxScale = 2.0;  // sizes are full widths: pass twice as much
+				if (!Overlap(g_lastGroundGroup, a_x, a_y, a_ground + 0.4, 0.05, 0.05, 0.5)) {
+					g_sdk->logger->Warn(g_handle, "ground: Overlap never touches the ground, so it can't be trusted; obstacles are off");
+					return;
+				}
+				g_sdk->logger->Info(g_handle, "ground: Overlap takes full widths");
+			}
+			g_obstaclesOn = true;
+			g_sdk->logger->Info(g_handle, "ground: obstacles on");
+		}
+
+		bool CellBlocked(double a_cx, double a_cy, double a_ground)
+		{
+			const double halfHeight = kObstacleBoxHeight * 0.5;
+			const double centreZ = a_ground + kObstacleBottom + halfHeight;
+			for (int i = 0; i < kObstacleGroupCount; ++i) {
+				if (Overlap(kObstacleGroups[i], a_cx, a_cy, centreZ, kObstacleHalfWidth, kObstacleHalfWidth, halfHeight)) {
+					++g_obstacleHits[i];
+					return true;
+				}
+			}
+			return false;
 		}
 
 		void ScanCell(int a_bx, int a_bz, int a_dx, int a_dz, double a_vz)
@@ -238,11 +357,26 @@ namespace cybercraft::ground
 				height = CastAllGroups(cx, cy, expected + kRetryRange, expected - kRetryRange);
 			}
 
-			++g_rays;
-			if (!std::isnan(height)) {
-				++g_hits;
+			++g_cells;
+			if (std::isnan(height)) {
+				StoreHeight(a_bx, a_bz, proto::kNoGround);
+				StoreObstacle(a_bx, a_bz, proto::kNoGround);
+				return;
 			}
-			StoreHeight(a_bx, a_bz, std::isnan(height) ? proto::kNoGround : height);
+			++g_hits;
+			StoreHeight(a_bx, a_bz, height);
+
+			if (g_overlap && !g_calibrated) {
+				Calibrate(cx, cy, height);
+			}
+
+			// Anything in the way? (Not in V's own cell: V is standing in it.)
+			float obstacleTop = proto::kNoGround;
+			if (g_obstaclesOn && !(a_dx == 0 && a_dz == 0) && CellBlocked(cx, cy, height)) {
+				obstacleTop = height + float(kObstacleSolidHeight);
+				++g_blocked;
+			}
+			StoreObstacle(a_bx, a_bz, obstacleTop);
 		}
 	}
 
@@ -257,8 +391,11 @@ namespace cybercraft::ground
 		// Cached game objects are only valid inside one loaded world.
 		g_spatial = nullptr;
 		g_raycast = nullptr;
+		g_overlap = nullptr;
 		g_triedInit = false;
 		g_failed = false;
+		g_calibrated = false;
+		g_obstaclesOn = false;
 	}
 
 	void Update(double a_vx, double a_vy, double a_vz)
@@ -277,26 +414,38 @@ namespace cybercraft::ground
 		const int centreBz = int(std::floor(-a_vy));
 
 		const auto start = std::chrono::steady_clock::now();
-		for (int i = 0; i < kCellsPerFrame; ++i) {
+		int done = 0;
+		while (done < kMaxCells) {
 			const CellOffset& o = g_order[g_next];
 			g_next = (g_next + 1) % g_order.size();
 			ScanCell(centreBx + o.dx, centreBz + o.dz, o.dx, o.dz, a_vz);
+			++done;
+			if (done >= kMinCells && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > kBudgetMs) {
+				break;
+			}
 		}
-		g_rayMicros += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+		const auto end = std::chrono::steady_clock::now();
+		g_scanMicros += std::chrono::duration<double, std::micro>(end - start).count();
+		++g_frames;
 
-		const auto now = std::chrono::steady_clock::now();
-		if (now - g_lastReport >= std::chrono::seconds(5)) {
-			g_lastReport = now;
-			if (g_rays > 0) {
-				g_sdk->logger->InfoF(g_handle, "ground: %llu cells in 5 s, %.0f%% found ground, %.1f us per cell",
-					static_cast<unsigned long long>(g_rays), 100.0 * double(g_hits) / double(g_rays), g_rayMicros / double(g_rays));
+		if (end - g_lastReport >= std::chrono::seconds(5)) {
+			g_lastReport = end;
+			if (g_cells > 0) {
+				g_sdk->logger->InfoF(g_handle, "ground: %llu cells in 5 s (%llu per frame), %.0f%% found ground, %.0f%% blocked, %.0f us per frame, %.1f us per cell",
+					static_cast<unsigned long long>(g_cells), static_cast<unsigned long long>(g_cells / std::max<std::uint64_t>(1, g_frames)),
+					100.0 * double(g_hits) / double(g_cells), 100.0 * double(g_blocked) / double(std::max<std::uint64_t>(1, g_hits)),
+					g_scanMicros / double(std::max<std::uint64_t>(1, g_frames)), g_scanMicros / double(g_cells));
 				for (int i = 0; i < kGroupCount; ++i) {
-					g_sdk->logger->InfoF(g_handle, "  hits in group \"%s\": %llu", kGroups[i], static_cast<unsigned long long>(g_groupHits[i]));
+					g_sdk->logger->InfoF(g_handle, "  ground hits in group \"%s\": %llu", kGroups[i], static_cast<unsigned long long>(g_groupHits[i]));
+				}
+				for (int i = 0; i < kObstacleGroupCount; ++i) {
+					g_sdk->logger->InfoF(g_handle, "  obstacles found in group \"%s\": %llu", kObstacleGroups[i], static_cast<unsigned long long>(g_obstacleHits[i]));
 				}
 			}
-			g_rays = g_hits = 0;
+			g_cells = g_hits = g_blocked = g_frames = 0;
 			std::fill(std::begin(g_groupHits), std::end(g_groupHits), 0ull);
-			g_rayMicros = 0.0;
+			std::fill(std::begin(g_obstacleHits), std::end(g_obstacleHits), 0ull);
+			g_scanMicros = 0.0;
 		}
 	}
 }
