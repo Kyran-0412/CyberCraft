@@ -5,6 +5,7 @@ import dev.cybercraft.CyberCraft;
 import dev.cybercraft.link.CyberLink;
 import dev.cybercraft.link.Proto;
 import dev.cybercraft.world.GroundCollision;
+import dev.cybercraft.world.TerrainPick;
 import dev.cybercraft.world.SmoothCollider;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -202,6 +203,14 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: aiming the blocks at the camera %.0f ms behind the newest.", warpDelayMs)));
 					return 1;
 				})));
+			// /ccterrain  turns aiming at Night City itself (to build on its streets and walls) off and on.
+			dispatcher.register(ClientCommands.literal("ccterrain").executes(c -> {
+				TerrainPick.setEnabled(!TerrainPick.enabled());
+				c.getSource().sendFeedback(Component.literal(TerrainPick.enabled()
+					? "CyberCraft: you can aim at, and build on, Night City's streets and walls."
+					: "CyberCraft: Night City can't be aimed at (only blocks)."));
+				return 1;
+			}));
 			// /ccocclude  hides Minecraft's blocks behind the game's world (uses the game's depth). On by default; off = blocks are drawn over everything.
 			dispatcher.register(ClientCommands.literal("ccocclude").executes(c -> {
 				occlude = !occlude;

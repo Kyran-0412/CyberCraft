@@ -52,6 +52,7 @@ struct FollowState
     double lastSentX = 0.0, lastSentY = 0.0, lastSentZ = 0.0;
     float lastSentYaw = 0.0f;
     bool haveSent = false;
+    bool wasInAir = false; // for the log
     int failures = 0;
     std::chrono::steady_clock::time_point last{};
 } g_follow;
@@ -412,8 +413,22 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
     // Looking up and down is separate from the position; do it every frame.
     ApplyCameraPitch(aPlayer, g_follow.pitch);
 
-    // Standing still: don't keep re-teleporting to the same spot.
-    if (g_follow.haveSent)
+    // Is V resting on Night City's ground? Minecraft's player stands on a surface that follows the street, so on the street the target height
+    // is the ground's. Anywhere else (flying, hovering, standing on blocks that were built in the air) Cyberpunk has nothing under V, and he
+    // would start to fall the moment he stopped being moved.
+    const double cpX = g_follow.x;
+    const double cpY = -g_follow.z;
+    const double cpZ = g_follow.y + cybercraft::mapping::Offset();
+    const double groundUnder = cybercraft::ground::HeightAt(cpX, cpY);
+    const bool onGround = !std::isnan(groundUnder) && std::fabs(cpZ - groundUnder) < 0.15;
+    if (onGround == g_follow.wasInAir)
+    {
+        g_follow.wasInAir = !onGround;
+        g_sdk->logger->Info(g_handle, onGround ? "follow: V is back on the ground" : "follow: V is in the air or on blocks: he is moved every frame so he cannot fall");
+    }
+
+    // Standing still on the ground: don't keep re-teleporting to the same spot. In the air, always move him.
+    if (onGround && g_follow.haveSent)
     {
         const double mx = g_follow.x - g_follow.lastSentX;
         const double my = g_follow.y - g_follow.lastSentY;
@@ -647,7 +662,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 15, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 16, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

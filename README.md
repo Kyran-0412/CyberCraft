@@ -85,6 +85,12 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   world is, first from the change in view direction, then correcting for the camera having moved using the picture's depth. The hand, hotbar and
   screens are a separate layer and are not moved. `/ccdelay <ms>` sets how far behind the newest published camera the game's own picture is (what the
   blocks are aimed at): if the blocks swing ahead of the world when you turn, raise it; if they trail, lower it. Needs prediction (`/ccpredict`) at 0.
+* **Building on Night City** (`/ccterrain`, on by default). Night City isn't made of blocks, so Minecraft can't aim at it. `TerrainPick` marches the
+  camera's ray over the same smooth ground surface and obstacle squares that the player collides with, and answers with the hit Minecraft would
+  get from a real block: a point, a face, and the empty cell just outside the surface, which Minecraft then fills when you place a block. Nothing
+  is added to the world. A real block closer than the street or wall still wins. Limits: there is no block outline on a street or wall, blocks that
+  need something to stand on (torches, flowers) won't place on bare ground, and the street can't be broken. The new block goes in the cell whose
+  bottom is at the whole-number height at or just below the street (`/ccalign` makes that exact on level road).
 * **Aiming.** What you break, place and use is now worked out along the picture's own camera ray, through the middle of the screen where the
   crosshair is, instead of from the Minecraft player's eyes (`EntityPickMixin`). Every few seconds Minecraft's console also prints an `aim:` line saying
   how far the picture's camera is from the player's view, which shows where a mismatch came from.

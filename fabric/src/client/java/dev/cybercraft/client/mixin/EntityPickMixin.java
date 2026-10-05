@@ -1,11 +1,13 @@
 package dev.cybercraft.client.mixin;
 
 import dev.cybercraft.client.CyberCraftClient;
+import dev.cybercraft.world.TerrainPick;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.spongepowered.asm.mixin.Mixin;
@@ -32,6 +34,14 @@ abstract class EntityPickMixin {
 		Vec3 direction = new Vec3(camera.forwardVector()).normalize();
 		Vec3 to = from.add(direction.scale(range));
 		ClipContext.Fluid fluid = withLiquids ? ClipContext.Fluid.ANY : ClipContext.Fluid.NONE;
-		cir.setReturnValue(self.level().clip(new ClipContext(from, to, ClipContext.Block.OUTLINE, fluid, self)));
+		BlockHitResult blocks = self.level().clip(new ClipContext(from, to, ClipContext.Block.OUTLINE, fluid, self));
+		// Night City itself (its streets and the walls the plugin found) isn't made of blocks, so Minecraft's own ray can't see it. If the
+		// ray meets the city before it meets a real block, aim at the city: that is what lets you build on the street and against walls.
+		BlockHitResult city = TerrainPick.hit(from, direction, range);
+		if (city != null && (blocks.getType() == HitResult.Type.MISS || from.distanceToSqr(city.getLocation()) < from.distanceToSqr(blocks.getLocation()) - 1.0e-4)) {
+			cir.setReturnValue(city);
+		} else {
+			cir.setReturnValue(blocks);
+		}
 	}
 }
