@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 18;
+	inline constexpr std::uint32_t kVersion = 19;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -88,6 +88,7 @@ namespace cybercraft::proto
 		kMcDepthProbe = 1u << 5,    // watch the game's depth textures and log what is seen (/ccdepthprobe)
 		kMcDepthCapture = 1u << 6,  // copy the game's main depth texture and check it against the game's rays (/ccdepthcapture)
 		// bits 7-8: depth debug view (see kMcDebugShift): 0 off, 1 the game's depth, 2 the blocks' distance, 3 hidden (red) / shown (green)
+		kMcNoWarp = 1u << 9,  // don't re-aim the blocks at the game's current camera when drawing (/ccwarp)
 	};
 	inline constexpr std::uint32_t kMcDebugShift = 7;
 	inline constexpr std::uint32_t kMcCamSourceShift = 3;
@@ -108,7 +109,7 @@ namespace cybercraft::proto
 		float         yaw, pitch;                 // Minecraft's look direction, Minecraft degrees
 		std::uint64_t frameCounter;
 		float         sensitivity;                // Minecraft's mouse sensitivity option, 0 to 1
-		float         pad;
+		float         warpDelayMs;                // how far behind the newest camera the game's picture is, for re-aiming the blocks (see kMcNoWarp)
 	};
 	static_assert(sizeof(McState) == 0x38);
 

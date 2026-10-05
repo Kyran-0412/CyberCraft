@@ -15,6 +15,10 @@ namespace cybercraft::overlay
 	// blocks' distance as grey, 3 colours block pixels red where the game's world hides them and green where they show.
 	void SetDebugView(int a_view);
 
+	// Re-aiming of the blocks at the game's current camera when they are drawn, to hide the time the picture takes to arrive. a_delayMs is
+	// how far behind the newest published camera the game's own picture is (what to aim at).
+	void SetWarp(bool a_enabled, float a_delayMs);
+
 	// The game's window, once the swapchain has been found (else null).
 	void* GameWindow();
 

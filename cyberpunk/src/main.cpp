@@ -559,6 +559,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     {
         cybercraft::camera::SetSource(static_cast<int>((mc.flags >> cybercraft::proto::kMcCamSourceShift) & 3u));
     }
+    cybercraft::overlay::SetWarp(!mcAlive || (mc.flags & cybercraft::proto::kMcNoWarp) == 0, mcAlive ? mc.warpDelayMs : 10.0f);
     cybercraft::overlay::SetDebugView(mcAlive ? static_cast<int>((mc.flags >> cybercraft::proto::kMcDebugShift) & 3u) : 0);
     cybercraft::depth::SetModes(mcAlive && (mc.flags & cybercraft::proto::kMcDepthProbe) != 0, mcAlive && (mc.flags & cybercraft::proto::kMcDepthCapture) != 0);
     cybercraft::input::Update(mcFollow && !g_follow.gaveUp, true, mc);
@@ -646,7 +647,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 14, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 15, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

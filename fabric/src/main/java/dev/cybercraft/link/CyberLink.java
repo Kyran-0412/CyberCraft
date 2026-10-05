@@ -286,7 +286,7 @@ public final class CyberLink {
 	 * Tells Cyberpunk what Minecraft wants. With {@code follow} set, Cyberpunk keeps moving V to (x, y, z)
 	 * (the same coordinate space as the game state position) and turns V to face {@code yaw}.
 	 */
-	public static void publishMcState(boolean inWorld, boolean follow, boolean screenOpen, int camSource, boolean depthProbe, boolean depthCapture, int debugView, float sensitivity, double x, double y, double z, float yaw, float pitch) {
+	public static void publishMcState(boolean inWorld, boolean follow, boolean screenOpen, int camSource, boolean depthProbe, boolean depthCapture, int debugView, boolean noWarp, float warpDelayMs, float sensitivity, double x, double y, double z, float yaw, float pitch) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return;
@@ -294,7 +294,7 @@ public final class CyberLink {
 		int base = s.get(JAVA_INT, OFF_MC_STATE + M_SEQ) & ~1;
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 1); // odd: write in progress
 		VarHandle.releaseFence();
-		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0) | (screenOpen ? MC_SCREEN_OPEN : 0) | ((camSource & 3) << MC_CAM_SOURCE_SHIFT) | (depthProbe ? MC_DEPTH_PROBE : 0) | (depthCapture ? MC_DEPTH_CAPTURE : 0) | ((debugView & 3) << MC_DEBUG_SHIFT));
+		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0) | (screenOpen ? MC_SCREEN_OPEN : 0) | ((camSource & 3) << MC_CAM_SOURCE_SHIFT) | (depthProbe ? MC_DEPTH_PROBE : 0) | (depthCapture ? MC_DEPTH_CAPTURE : 0) | ((debugView & 3) << MC_DEBUG_SHIFT) | (noWarp ? MC_NO_WARP : 0));
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_X, x);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Y, y);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Z, z);
@@ -302,6 +302,7 @@ public final class CyberLink {
 		s.set(JAVA_FLOAT, OFF_MC_STATE + M_PITCH, pitch);
 		s.set(JAVA_LONG, OFF_MC_STATE + M_FRAME, ++mcFrame);
 		s.set(JAVA_FLOAT, OFF_MC_STATE + M_SENSITIVITY, sensitivity);
+		s.set(JAVA_FLOAT, OFF_MC_STATE + M_WARP_DELAY, warpDelayMs);
 		VarHandle.releaseFence();
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 2); // even: done
 	}

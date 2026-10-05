@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 18;
+	public static final int VERSION = 19;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -46,12 +46,14 @@ public final class Proto {
 	public static final long M_PITCH = 36; // float
 	public static final long M_FRAME = 40; // u64
 	public static final long M_SENSITIVITY = 48; // float, Minecraft's mouse sensitivity option, 0 to 1
+	public static final long M_WARP_DELAY = 52; // float, ms: how far behind the newest camera the game's picture is (what the blocks are re-aimed at)
 
 	public static final int MC_IN_WORLD = 1;
 	public static final int MC_FOLLOW = 2;
 	public static final int MC_SCREEN_OPEN = 4; // a Minecraft screen (inventory, chat, ...) is open
 	public static final int MC_DEPTH_PROBE = 1 << 5; // watch the game's depth textures and log what is seen
 	public static final int MC_DEBUG_SHIFT = 7; // bits 7-8: depth debug view
+	public static final int MC_NO_WARP = 1 << 9; // don't re-aim the blocks at the game's current camera
 	public static final int MC_DEPTH_CAPTURE = 1 << 6; // copy the game's main depth texture and check it against the game's rays
 	public static final int MC_CAM_SOURCE_SHIFT = 3; // bits 3-4: which camera the plugin should publish: 0 transform, 1 data, 2 projected
 

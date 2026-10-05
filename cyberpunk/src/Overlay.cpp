@@ -68,6 +68,9 @@ namespace cybercraft::overlay
 		std::uint64_t g_hudDraws = 0;
 		std::uint64_t g_badgeDraws = 0;
 		int g_debugView = 0;
+		bool g_warpEnabled = true;
+		float g_warpDelayMs = 10.0f;
+		std::uint64_t g_warpDraws = 0;
 		std::uint64_t g_framesUploaded = 0;
 		std::uint64_t g_layeredDraws = 0;
 		std::uint64_t g_plainDraws = 0;
@@ -85,6 +88,9 @@ cbuffer P : register(b0)
 	float2 cursor; float zeroToOne; float haveGameDepth;
 	float mcA; float mcB; float gameNear; float biasAbs;
 	float biasRel; float debugView; float2 pad;
+	float4 warpR0; float4 warpR1; float4 warpR2;   // rows of the matrix from Minecraft's camera space to the current camera space
+	float4 warpT;                                  // xyz: where Minecraft's camera is, in the current camera space; w: 1 = re-aim
+	float4 tans;                                   // tan(half field of view): current x, y; Minecraft's x, y
 };
 Texture2D tex : register(t0);          // the whole frame (plain mode), or the world's colour (layered)
 Texture2D mcDepthTex : register(t1);   // layered: the world's depth, as Minecraft wrote it
@@ -109,7 +115,49 @@ float4 PS(VSOut i) : SV_Target
 	if (flipY > 0.5) { uv.y = 1.0 - uv.y; }
 	float4 c;
 	if (layered > 0.5) {
-		float4 w = tex.Sample(samp, uv);       // the world, premultiplied alpha
+		float4 w;
+		float zm = 1e9;
+		bool hidden = false;
+		uint mw, mh;
+		mcDepthTex.GetDimensions(mw, mh);
+		if (warpT.w > 0.5) {
+			// Re-aim: for this place on the screen, where in Minecraft's (older) picture is the same point of the world? Start from the
+			// view direction, then correct for the camera having moved using the picture's own depth (a few rounds are enough).
+			float2 ndc = float2(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
+			float3 dc = float3(ndc * tans.xy, 1.0);
+			float3 dm = warpR0.xyz * dc.x + warpR1.xyz * dc.y + warpR2.xyz * dc.z;
+			bool ok = dm.z > 0.01;
+			float2 nm = ok ? dm.xy / dm.z / tans.zw : float2(2.0, 2.0);
+			float3 pc = float3(0, 0, 1);
+			[unroll] for (int k = 0; k < 4; ++k) {
+				float2 tuv = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
+				float2 tex2 = flipY > 0.5 ? float2(tuv.x, 1.0 - tuv.y) : tuv;
+				float s = mcDepthTex.Load(int3(clamp(uint2(tex2 * float2(mw, mh)), uint2(0, 0), uint2(mw - 1, mh - 1)), 0)).r;
+				float ndcz = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
+				float den = ndcz + mcA;
+				float zk = abs(den) > 1e-9 ? mcB / den : 1e9;
+				if (zk <= 0.0) { zk = 1e9; }
+				float3 pm = float3(nm * tans.zw, 1.0) * zk;
+				pc = float3(dot(warpR0.xyz, pm), dot(warpR1.xyz, pm), dot(warpR2.xyz, pm)) + warpT.xyz;
+				float2 npc = pc.z > 0.01 ? pc.xy / pc.z / tans.xy : ndc;
+				nm += (ndc - npc) * tans.xy / tans.zw;
+			}
+			ok = ok && all(abs(nm) <= 1.0);
+			float2 tuv = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
+			float2 tex2 = flipY > 0.5 ? float2(tuv.x, 1.0 - tuv.y) : tuv;
+			w = ok ? tex.Sample(samp, tex2) : float4(0, 0, 0, 0);
+			zm = pc.z > 0.0 ? pc.z : 1e9;      // how far the block is along the current camera's view
+		} else {
+			w = tex.Sample(samp, uv);       // the world, premultiplied alpha
+			if (w.a > 0.0) {
+				// How far is this block pixel from the camera? Minecraft's depth is the matrix's: ndc = -A + B / distance.
+				float s = mcDepthTex.Load(int3(min(uint2(uv * float2(mw, mh)), uint2(mw - 1, mh - 1)), 0)).r;
+				float ndc = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
+				float den = ndc + mcA;
+				zm = abs(den) > 1e-9 ? mcB / den : 1e9;
+				if (zm <= 0.0) { zm = 1e9; }
+			}
+		}
 		float zg = 1e9;
 		if (haveGameDepth > 0.5) {
 			// The game's world at this place on the screen: its depth is gameNear / distance (reversed, no far plane).
@@ -117,20 +165,8 @@ float4 PS(VSOut i) : SV_Target
 			gameDepthTex.GetDimensions(gw, gh);
 			float sg = gameDepthTex.Load(int3(min(uint2(i.uv * float2(gw, gh)), uint2(gw - 1, gh - 1)), 0)).r;
 			zg = sg > 1e-8 ? gameNear / sg : 1e9;
-		}
-		float zm = 1e9;
-		bool hidden = false;
-		if (w.a > 0.0) {
-			// How far is this block pixel from the camera? Minecraft's depth is the matrix's: ndc = -A + B / distance.
-			uint mw, mh;
-			mcDepthTex.GetDimensions(mw, mh);
-			float s = mcDepthTex.Load(int3(min(uint2(uv * float2(mw, mh)), uint2(mw - 1, mh - 1)), 0)).r;
-			float ndc = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
-			float den = ndc + mcA;
-			zm = abs(den) > 1e-9 ? mcB / den : 1e9;
-			if (zm <= 0.0) { zm = 1e9; }
 			// Hidden if it is behind what the game drew there (with a little room for rounding, and for the game's jittered depth).
-			hidden = haveGameDepth > 0.5 && zm > zg + biasAbs + biasRel * zg;
+			hidden = w.a > 0.0 && zm > zg + biasAbs + biasRel * zg;
 		}
 		if (debugView > 2.5) {
 			if (w.a <= 0.0) { return float4(0, 0, 0, 0); }
@@ -193,6 +229,7 @@ float4 PS(VSOut i) : SV_Target
 			ComPtr<ID3D12Resource> texOverlay;
 			UINT layerW = 0, layerH = 0;
 			bool layered = false;      // the newest frame has layers
+			std::uint64_t cameraFrame = 0;  // the camera the newest frame was drawn through (Link's frame counter)
 			float mcA = 0.0f, mcB = 0.0f;
 			bool zeroToOne = true;
 			UINT srvInc = 0;
@@ -374,7 +411,7 @@ float4 PS(VSOut i) : SV_Target
 			params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 			params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 			params[1].Constants.ShaderRegister = 0;
-			params[1].Constants.Num32BitValues = 16;
+			params[1].Constants.Num32BitValues = 36;
 			params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 			D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -591,6 +628,70 @@ float4 PS(VSOut i) : SV_Target
 			return b;
 		}
 
+		// A camera's axes in Minecraft's world: right, up and forward, from its yaw, pitch and roll (degrees; yaw 0 faces south, positive pitch looks down).
+		struct Axes
+		{
+			double v[3][3];  // v[0] right, v[1] up, v[2] forward
+		};
+
+		Axes AxesOf(const Link::CameraPose& a_pose)
+		{
+			constexpr double kRad = 3.14159265358979323846 / 180.0;
+			const double yaw = a_pose.yaw * kRad;
+			const double pitch = a_pose.pitch * kRad;
+			const double roll = a_pose.roll * kRad;
+			const double sy = std::sin(yaw), cy = std::cos(yaw), sp = std::sin(pitch), cp = std::cos(pitch);
+			const double f[3] = { -sy * cp, -sp, cy * cp };
+			const double r0[3] = { -cy, 0.0, -sy };
+			const double u0[3] = { r0[1] * f[2] - r0[2] * f[1], r0[2] * f[0] - r0[0] * f[2], r0[0] * f[1] - r0[1] * f[0] };
+			Axes axes{};
+			for (int i = 0; i < 3; ++i) {
+				axes.v[0][i] = r0[i] * std::cos(roll) + u0[i] * std::sin(roll);
+				axes.v[1][i] = u0[i] * std::cos(roll) - r0[i] * std::sin(roll);
+				axes.v[2][i] = f[i];
+			}
+			return axes;
+		}
+
+		double Dot3(const double* a, const double* b)
+		{
+			return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+		}
+
+		// Fills the shader's warp constants (20 floats) for re-aiming a picture drawn through a_mc at the camera a_now. Returns false if the
+		// two cameras are too far apart for that to make sense (a teleport, a cut): the picture is then drawn as it is.
+		bool BuildWarp(const Link::CameraPose& a_mc, const Link::CameraPose& a_now, float* a_out)
+		{
+			const double dx = a_mc.x - a_now.x, dy = a_mc.y - a_now.y, dz = a_mc.z - a_now.z;
+			if (dx * dx + dy * dy + dz * dz > 16.0) {
+				return false;
+			}
+			const Axes m = AxesOf(a_mc);
+			const Axes c = AxesOf(a_now);
+			if (Dot3(m.v[2], c.v[2]) < 0.9) {
+				return false;  // looking more than about 25 degrees apart
+			}
+			const double delta[3] = { dx, dy, dz };
+			constexpr double kRad = 3.14159265358979323846 / 180.0;
+			for (int i = 0; i < 3; ++i) {
+				// Row i of the matrix from Minecraft's camera space to the current camera space: dot(current axis i, Minecraft axis j).
+				for (int j = 0; j < 3; ++j) {
+					a_out[i * 4 + j] = static_cast<float>(Dot3(c.v[i], m.v[j]));
+				}
+				a_out[i * 4 + 3] = 0.0f;
+				// Where Minecraft's camera is, in the current camera's space.
+				a_out[12 + i] = static_cast<float>(Dot3(c.v[i], delta));
+			}
+			a_out[15] = 1.0f;
+			const double tanHalfC = std::tan(a_now.vfov * 0.5 * kRad);
+			const double tanHalfM = std::tan(a_mc.vfov * 0.5 * kRad);
+			a_out[16] = static_cast<float>(tanHalfC * a_now.aspect);
+			a_out[17] = static_cast<float>(tanHalfC);
+			a_out[18] = static_cast<float>(tanHalfM * a_mc.aspect);
+			a_out[19] = static_cast<float>(tanHalfM);
+			return true;
+		}
+
 		void Draw(IDXGISwapChain* a_swapChain)
 		{
 			auto& link = Link::Get();
@@ -722,6 +823,7 @@ float4 PS(VSOut i) : SV_Target
 
 							g.flipY = (hdr->flags & proto::kOverlayBottomUp) != 0;
 							g.layered = layered;
+							g.cameraFrame = hdr->cameraFrame;
 							g.mcA = hdr->mcA;
 							g.mcB = hdr->mcB;
 							g.zeroToOne = (hdr->flags & proto::kOverlayZeroToOne) != 0;
@@ -810,8 +912,19 @@ float4 PS(VSOut i) : SV_Target
 				if (useGameDepth) {
 					++g_depthDraws;
 				}
-				float constants[16] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
+				float constants[36] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
 					g.mcA, g.mcB, 0.02f /* the game's near plane: its depth is 0.02 / distance */, 0.06f, 0.004f, float(g_debugView), 0.0f, 0.0f };
+				// Re-aim the blocks (the world layer) at the game's camera as it is now, so the time the picture took to arrive isn't seen.
+				if (g.layered && g_warpEnabled) {
+					Link::CameraPose drawn;
+					Link::CameraPose target;
+					const auto aim = now - std::chrono::microseconds(static_cast<long long>(g_warpDelayMs * 1000.0f));
+					if (link.CameraPoseForFrame(g.cameraFrame, drawn) && link.CameraPoseAt(aim, target) && BuildWarp(drawn, target, &constants[16])) {
+						++g_warpDraws;
+					} else {
+						constants[31] = 0.0f;
+					}
+				}
 				if (input::CursorVisible()) {
 					// The cursor lives in the HUD's pixels; the HUD is stretched over the screen.
 					float cx = 0.0f;
@@ -821,14 +934,15 @@ float4 PS(VSOut i) : SV_Target
 					constants[4] = g.texW ? cx * float(bb.Width) / float(g.texW) : cx;
 					constants[5] = g.texH ? cy * float(bb.Height) / float(g.texH) : cy;
 				}
-				g.list->SetGraphicsRoot32BitConstants(1, 16, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 36, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			} else if (badge) {
 				++g_badgeDraws;
 				D3D12_RECT scissor{ 8, 8, 72, 72 };  // the test square
 				g.list->RSSetScissorRects(1, &scissor);
-				const float constants[16] = { 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-				g.list->SetGraphicsRoot32BitConstants(1, 16, constants, 0);
+				float constants[36] = {};
+				constants[1] = 1.0f;
+				g.list->SetGraphicsRoot32BitConstants(1, 36, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			}
 
@@ -866,8 +980,9 @@ float4 PS(VSOut i) : SV_Target
 				static_cast<unsigned long long>(g_presents), link.InGame() ? 1 : 0, mcAlive ? 1 : 0,
 				static_cast<unsigned long long>(mcAlive ? link.OverlayFramesPublished() : 0), static_cast<unsigned long long>(g_framesUploaded),
 				static_cast<unsigned long long>(g_hudDraws), static_cast<unsigned long long>(g_badgeDraws), g.ready ? 1 : 0, g.failed ? 1 : 0);
-			g_sdk->logger->InfoF(g_handle, "overlay: draws so far: %llu plain, %llu layered, %llu of those hidden against the game's depth",
-				static_cast<unsigned long long>(g_plainDraws), static_cast<unsigned long long>(g_layeredDraws), static_cast<unsigned long long>(g_depthDraws));
+			g_sdk->logger->InfoF(g_handle, "overlay: draws so far: %llu plain, %llu layered, %llu of those hidden against the game's depth, %llu re-aimed at the current camera (aiming %.0f ms behind the newest)",
+				static_cast<unsigned long long>(g_plainDraws), static_cast<unsigned long long>(g_layeredDraws), static_cast<unsigned long long>(g_depthDraws),
+				static_cast<unsigned long long>(g_warpDraws), g_warpDelayMs);
 			if (g_ageCount > 0) {
 				g_sdk->logger->InfoF(g_handle, "overlay: delay: the picture Minecraft sends was drawn through a camera published %.0f ms earlier on average (up to %.0f ms), over %llu frames; the game presented about %.0f frames a second, Minecraft sent about %.0f",
 					g_ageSum / double(g_ageCount), g_ageMax, static_cast<unsigned long long>(g_ageCount), double(g_presents) / 5.0, double(g_ageCount) / 5.0);
@@ -982,6 +1097,12 @@ float4 PS(VSOut i) : SV_Target
 	void* GameWindow()
 	{
 		return g_installed ? g_window : nullptr;
+	}
+
+	void SetWarp(bool a_enabled, float a_delayMs)
+	{
+		g_warpEnabled = a_enabled;
+		g_warpDelayMs = std::clamp(a_delayMs, 0.0f, 150.0f);
 	}
 
 	void SetDebugView(int a_view)

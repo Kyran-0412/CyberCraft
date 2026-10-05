@@ -79,6 +79,12 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   0.02 / distance). Underground parts of blocks, blocks behind walls and cars, and blocks behind lamp posts are hidden. Turn it off
   with `/ccocclude` if anything goes wrong, and blocks are drawn over everything again. Needs a Minecraft window no bigger than
   3840 x 2160; a smaller window means fewer pixels to copy and a faster frame.
+* **Re-aiming the blocks** (`/ccwarp`, on by default). The picture of the blocks takes a few tens of milliseconds to get from Minecraft to the
+  screen, so it is drawn through a camera that is a little out of date. Because the world is its own layer with its own depth, the plugin can
+  re-aim it at the game's camera as it is when the blocks are drawn: for each pixel it finds where in Minecraft's picture the same point of the
+  world is, first from the change in view direction, then correcting for the camera having moved using the picture's depth. The hand, hotbar and
+  screens are a separate layer and are not moved. `/ccdelay <ms>` sets how far behind the newest published camera the game's own picture is (what the
+  blocks are aimed at): if the blocks swing ahead of the world when you turn, raise it; if they trail, lower it. Needs prediction (`/ccpredict`) at 0.
 * **`/ccdepthdebug`** cycles a debug view of the depth test: 1 shows the game's depth over the whole screen (near dark, far light), 2 shows
   the blocks' distance as grey, 3 colours block pixels red where the game's world hides them and green where they show. The capture also
   checks its copy of the game's depth against the game's own rays and switches to another depth texture if the values don't fit.

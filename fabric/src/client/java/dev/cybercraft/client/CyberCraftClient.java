@@ -182,6 +182,26 @@ public final class CyberCraftClient implements ClientModInitializer {
 				c.getSource().sendFeedback(Component.literal("CyberCraft: depth debug view " + depthDebug + ": " + names[depthDebug]));
 				return 1;
 			}));
+			// /ccwarp  turns the re-aiming of the blocks at the game's current camera off and on (it hides the time the picture takes to arrive).
+			dispatcher.register(ClientCommands.literal("ccwarp").executes(c -> {
+				warp = !warp;
+				c.getSource().sendFeedback(Component.literal(warp
+					? "CyberCraft: blocks are re-aimed at the game's camera as it is when they are drawn."
+					: "CyberCraft: blocks are drawn as they were rendered (no re-aiming)."));
+				return 1;
+			}));
+			// /ccdelay          shows how far behind the newest camera the blocks are aimed (the game's own picture is a little behind its newest camera).
+			// /ccdelay <ms>     sets it. If the blocks swing AHEAD of the world when you turn, raise it; if they trail behind, lower it (0 = the newest camera).
+			dispatcher.register(ClientCommands.literal("ccdelay")
+				.executes(c -> {
+					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: aiming the blocks at the camera %.0f ms behind the newest.", warpDelayMs)));
+					return 1;
+				})
+				.then(ClientCommands.argument("ms", DoubleArgumentType.doubleArg(0, 150)).executes(c -> {
+					warpDelayMs = DoubleArgumentType.getDouble(c, "ms");
+					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: aiming the blocks at the camera %.0f ms behind the newest.", warpDelayMs)));
+					return 1;
+				})));
 			// /ccocclude  hides Minecraft's blocks behind the game's world (uses the game's depth). On by default; off = blocks are drawn over everything.
 			dispatcher.register(ClientCommands.literal("ccocclude").executes(c -> {
 				occlude = !occlude;
@@ -353,6 +373,8 @@ public final class CyberCraftClient implements ClientModInitializer {
 	private static volatile boolean depthProbe;
 	private static volatile boolean depthCapture;
 	private static volatile int depthDebug;
+	private static volatile boolean warp = true; // /ccwarp
+	private static volatile double warpDelayMs = 10; // /ccdelay
 	private static boolean activeBefore;
 	private static boolean savedBobView;
 	private static Object savedDamageTilt;
@@ -653,12 +675,12 @@ public final class CyberCraftClient implements ClientModInitializer {
 		boolean screenOpen = client.gui.screen() != null;
 		float sensitivity = client.options.sensitivity().get().floatValue();
 		if (player == null) {
-			CyberLink.publishMcState(false, false, false, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, sensitivity, 0, 0, 0, 0, 0);
+			CyberLink.publishMcState(false, false, false, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, !warp, (float) warpDelayMs, sensitivity, 0, 0, 0, 0, 0);
 		} else if (following) {
 			// The ground Minecraft walks on is Night City's own, so the player's position is V's position.
-			CyberLink.publishMcState(true, true, screenOpen, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, true, screenOpen, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, !warp, (float) warpDelayMs, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
 		} else {
-			CyberLink.publishMcState(true, false, screenOpen, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, false, screenOpen, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, !warp, (float) warpDelayMs, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
 		}
 
 		if (!haveState) {

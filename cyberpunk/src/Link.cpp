@@ -134,7 +134,7 @@ namespace cybercraft
 			}
 
 			const McSnapshot copy{ state->flags, state->targetX, state->targetY, state->targetZ, state->yaw, state->pitch,
-				state->frameCounter, state->sensitivity };
+				state->frameCounter, state->sensitivity, state->warpDelayMs };
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (Atomic(state->seq).load(std::memory_order_relaxed) == seq1) {
 				a_out = copy;
@@ -203,19 +203,121 @@ namespace cybercraft
 		state->yawRate = a_yawRate;
 		state->pitchRate = a_pitchRate;
 		state->roll = a_roll;
-		++cameraFrame_;
-		state->frameCounter = cameraFrame_;
-		cameraTimes_[cameraFrame_ & 1023] = std::chrono::steady_clock::now();
+		const std::uint64_t frame = cameraFrame_.load(std::memory_order_relaxed) + 1;
+		state->frameCounter = frame;
+		if (a_valid) {
+			HistoryEntry& entry = cameraHistory_[frame & 1023];
+			const auto entrySeq = entry.seq.load(std::memory_order_relaxed);
+			entry.seq.store(entrySeq + 1, std::memory_order_relaxed);  // odd: being written
+			std::atomic_thread_fence(std::memory_order_release);
+			entry.frame = frame;
+			entry.time = std::chrono::steady_clock::now();
+			entry.pose = CameraPose{ a_x, a_y, a_z, a_yaw, a_pitch, a_roll, a_vfov, a_aspect };
+			entry.seq.store(entrySeq + 2, std::memory_order_release);
+		}
+		cameraFrame_.store(frame, std::memory_order_release);
 
 		seq.store(start + 2, std::memory_order_release);  // even: done
 	}
 
+	namespace
+	{
+		// Reads one history entry without being torn by the game's thread writing it.
+		bool ReadEntry(const auto& a_entry, std::uint64_t a_frame, std::chrono::steady_clock::time_point& a_time, Link::CameraPose& a_pose)
+		{
+			for (int attempt = 0; attempt < 4; ++attempt) {
+				const auto seq1 = a_entry.seq.load(std::memory_order_acquire);
+				if ((seq1 & 1) != 0) {
+					continue;
+				}
+				const auto frame = a_entry.frame;
+				const auto time = a_entry.time;
+				const auto pose = a_entry.pose;
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if (a_entry.seq.load(std::memory_order_relaxed) == seq1) {
+					if (frame != a_frame) {
+						return false;  // the slot holds another frame now (or none yet)
+					}
+					a_time = time;
+					a_pose = pose;
+					return true;
+				}
+			}
+			return false;
+		}
+	}
+
+	bool Link::CameraPoseForFrame(std::uint64_t a_cameraFrame, CameraPose& a_out) const
+	{
+		const auto newest = cameraFrame_.load(std::memory_order_acquire);
+		if (a_cameraFrame == 0 || a_cameraFrame > newest || newest - a_cameraFrame >= 1000) {
+			return false;
+		}
+		std::chrono::steady_clock::time_point time;
+		return ReadEntry(cameraHistory_[a_cameraFrame & 1023], a_cameraFrame, time, a_out);
+	}
+
+	bool Link::CameraPoseAt(std::chrono::steady_clock::time_point a_time, CameraPose& a_out) const
+	{
+		const auto newest = cameraFrame_.load(std::memory_order_acquire);
+		if (newest == 0) {
+			return false;
+		}
+		// Walk back from the newest until we pass the moment.
+		CameraPose later{};
+		std::chrono::steady_clock::time_point laterTime{};
+		bool haveLater = false;
+		for (std::uint64_t k = newest; k > 0 && newest - k < 1000; --k) {
+			CameraPose pose;
+			std::chrono::steady_clock::time_point time;
+			if (!ReadEntry(cameraHistory_[k & 1023], k, time, pose)) {
+				continue;
+			}
+			if (time <= a_time) {
+				if (!haveLater || laterTime <= time) {
+					a_out = pose;
+					return true;
+				}
+				// Between this entry and the one after it: interpolate.
+				const double span = std::chrono::duration<double>(laterTime - time).count();
+				const double t = span > 1.0e-6 ? std::chrono::duration<double>(a_time - time).count() / span : 1.0;
+				auto lerp = [&](double a, double b) { return a + (b - a) * t; };
+				auto lerpAngle = [&](float a, float b) {
+					float d = b - a;
+					while (d > 180.0f) d -= 360.0f;
+					while (d < -180.0f) d += 360.0f;
+					return static_cast<float>(a + d * t);
+				};
+				a_out.x = lerp(pose.x, later.x);
+				a_out.y = lerp(pose.y, later.y);
+				a_out.z = lerp(pose.z, later.z);
+				a_out.yaw = lerpAngle(pose.yaw, later.yaw);
+				a_out.pitch = lerpAngle(pose.pitch, later.pitch);
+				a_out.roll = lerpAngle(pose.roll, later.roll);
+				a_out.vfov = static_cast<float>(lerp(pose.vfov, later.vfov));
+				a_out.aspect = later.aspect;
+				return true;
+			}
+			later = pose;
+			laterTime = time;
+			haveLater = true;
+		}
+		if (haveLater) {
+			a_out = later;  // the moment is older than everything kept: the oldest we have
+			return true;
+		}
+		return false;
+	}
+
 	double Link::CameraAgeMs(std::uint64_t a_cameraFrame) const
 	{
-		if (a_cameraFrame == 0 || a_cameraFrame > cameraFrame_ || cameraFrame_ - a_cameraFrame >= 1024) {
+		CameraPose pose;
+		std::chrono::steady_clock::time_point time;
+		const auto newest = cameraFrame_.load(std::memory_order_acquire);
+		if (a_cameraFrame == 0 || a_cameraFrame > newest || newest - a_cameraFrame >= 1000 || !ReadEntry(cameraHistory_[a_cameraFrame & 1023], a_cameraFrame, time, pose)) {
 			return -1.0;
 		}
-		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cameraTimes_[a_cameraFrame & 1023]).count();
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - time).count();
 	}
 
 	void Link::PushInput(std::uint16_t a_type, std::uint16_t a_code, std::int32_t a_a, std::int32_t a_b, std::int32_t a_c)

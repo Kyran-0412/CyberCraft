@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
@@ -15,6 +16,13 @@ namespace cybercraft
 	class Link
 	{
 	public:
+		// A published camera, as Minecraft coordinates and degrees.
+		struct CameraPose
+		{
+			double x = 0, y = 0, z = 0;
+			float yaw = 0, pitch = 0, roll = 0, vfov = 60.0f, aspect = 1.778f;
+		};
+
 		static Link& Get();
 
 		bool Create();  // idempotent
@@ -39,6 +47,11 @@ namespace cybercraft
 		void PublishCamera(bool a_valid, double a_x, double a_y, double a_z, float a_yaw, float a_pitch, float a_vfov, float a_aspect,
 			float a_velX = 0.0f, float a_velY = 0.0f, float a_velZ = 0.0f, float a_yawRate = 0.0f, float a_pitchRate = 0.0f, float a_roll = 0.0f);
 
+		// The camera with this frame counter (the one a Minecraft picture was drawn through), if it is still in the history.
+		bool CameraPoseForFrame(std::uint64_t a_cameraFrame, CameraPose& a_out) const;
+		// The camera as it was at a moment (interpolated between the two published around it; the newest if the moment is later).
+		bool CameraPoseAt(std::chrono::steady_clock::time_point a_time, CameraPose& a_out) const;
+
 		// How long ago the camera with this frame counter was published (milliseconds), or a negative number if too long ago.
 		double CameraAgeMs(std::uint64_t a_cameraFrame) const;
 
@@ -53,6 +66,7 @@ namespace cybercraft
 			float         yaw, pitch;  // Minecraft degrees
 			std::uint64_t frame;
 			float         sensitivity;
+			float         warpDelayMs;
 		};
 
 		// True when a consistent copy was read.
@@ -95,8 +109,17 @@ namespace cybercraft
 		std::uint32_t cmdResult_{ 0 };
 		std::uint32_t overlayFront_{ 2 };
 		bool inGame_{ false };
-		std::uint64_t cameraFrame_{ 0 };
-		std::array<std::chrono::steady_clock::time_point, 1024> cameraTimes_{};
+		std::atomic<std::uint64_t> cameraFrame_{ 0 };
+		// The last 1024 cameras published, with when: to find the one a Minecraft picture was drawn through, and the one the
+		// game's own picture was drawn through. Written by the game's thread, read by the render thread: each entry has its own seqlock.
+		struct HistoryEntry
+		{
+			std::atomic<std::uint32_t> seq{ 0 };
+			std::uint64_t frame = 0;
+			std::chrono::steady_clock::time_point time{};
+			CameraPose pose{};
+		};
+		std::array<HistoryEntry, 1024> cameraHistory_{};
 		bool routing_{ false };
 		float lookYaw_{ 0.0f };
 		float lookPitch_{ 0.0f };
