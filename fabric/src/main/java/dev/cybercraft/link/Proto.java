@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 15;
+	public static final int VERSION = 18;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -51,6 +51,8 @@ public final class Proto {
 	public static final int MC_FOLLOW = 2;
 	public static final int MC_SCREEN_OPEN = 4; // a Minecraft screen (inventory, chat, ...) is open
 	public static final int MC_DEPTH_PROBE = 1 << 5; // watch the game's depth textures and log what is seen
+	public static final int MC_DEBUG_SHIFT = 7; // bits 7-8: depth debug view
+	public static final int MC_DEPTH_CAPTURE = 1 << 6; // copy the game's main depth texture and check it against the game's rays
 	public static final int MC_CAM_SOURCE_SHIFT = 3; // bits 3-4: which camera the plugin should publish: 0 transform, 1 data, 2 projected
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock) ----
@@ -95,10 +97,18 @@ public final class Proto {
 	public static final long SH_FLAGS = 8; // u32, bit 0: rows are bottom-up
 	public static final long SH_FRAME_ID = 16; // u64
 	public static final long SH_CAMERA_FRAME = 24; // u64, the camera frame this picture was drawn through
+	public static final long SH_MC_A = 32; // float: Minecraft's projection matrix m22 (layered frames): distance = B / (ndcDepth + A)
+	public static final long SH_MC_B = 36; // float: m32
+	public static final long SH_MC_NEAR = 40; // float
+	public static final long SH_MC_FAR = 44; // float
+	public static final int SHF_BOTTOM_UP = 1; // the rows of every layer are bottom-up
+	public static final int SHF_LAYERED = 2; // three layers: world colour, world depth, overlay
+	public static final int SHF_ZERO_TO_ONE = 4; // depth values are normalised device depth
 	public static final long OFF_OVERLAY_PIXELS = 0x20000;
 	public static final int MAX_OVERLAY_W = 3840;
 	public static final int MAX_OVERLAY_H = 2160;
-	public static final long OVERLAY_SLOT_BYTES = (long) MAX_OVERLAY_W * MAX_OVERLAY_H * 4;
+	public static final long OVERLAY_LAYER_BYTES = (long) MAX_OVERLAY_W * MAX_OVERLAY_H * 4;
+	public static final long OVERLAY_SLOT_BYTES = OVERLAY_LAYER_BYTES * 3;
 	public static final int OVERLAY_SLOTS = 3;
 	public static final int OVERLAY_DIRTY = 1 << 2;
 

@@ -175,6 +175,30 @@ public final class CyberCraftClient implements ClientModInitializer {
 					: "CyberCraft: depth probe off."));
 				return 1;
 			}));
+			// /ccdepthdebug  cycles a debug view of the depth test: 1 the game's depth, 2 the blocks' distance, 3 hidden (red) / shown (green), 0 off.
+			dispatcher.register(ClientCommands.literal("ccdepthdebug").executes(c -> {
+				depthDebug = (depthDebug + 1) % 4;
+				String[] names = { "off", "the game's depth over the whole screen (grey: near dark, far light)", "the blocks' distance (grey)", "blocks hidden by the game's world in red, shown in green" };
+				c.getSource().sendFeedback(Component.literal("CyberCraft: depth debug view " + depthDebug + ": " + names[depthDebug]));
+				return 1;
+			}));
+			// /ccocclude  hides Minecraft's blocks behind the game's world (uses the game's depth). On by default; off = blocks are drawn over everything.
+			dispatcher.register(ClientCommands.literal("ccocclude").executes(c -> {
+				occlude = !occlude;
+				c.getSource().sendFeedback(Component.literal(occlude
+					? "CyberCraft: blocks are hidden behind the game's world."
+					: "CyberCraft: blocks are drawn over everything (no depth)."));
+				return 1;
+			}));
+			// /ccdepthcapture  turns the depth capture on or off: it copies the game's main depth texture once a frame and compares a few of its
+			// texels with the game's own rays (look at Cyberpunk's CyberCraft.log). Stand still, looking at a street or a wall.
+			dispatcher.register(ClientCommands.literal("ccdepthcapture").executes(c -> {
+				depthCapture = !depthCapture;
+				c.getSource().sendFeedback(Component.literal(depthCapture
+					? "CyberCraft: depth capture on. Stand still, looking at a street or a wall, and look at Cyberpunk's CyberCraft.log in about 15 seconds; type /ccdepthcapture again to switch it off."
+					: "CyberCraft: depth capture off."));
+				return 1;
+			}));
 			// /ccalign  lines up the street where you stand with Minecraft's whole-number heights, so blocks built there sit exactly on it.
 			dispatcher.register(ClientCommands.literal("ccalign").executes(c -> {
 				c.getSource().sendFeedback(Component.literal(requestAlign()));
@@ -327,6 +351,8 @@ public final class CyberCraftClient implements ClientModInitializer {
 	private static volatile int camSource = 0;
 	private static volatile int rollMode = 1;
 	private static volatile boolean depthProbe;
+	private static volatile boolean depthCapture;
+	private static volatile int depthDebug;
 	private static boolean activeBefore;
 	private static boolean savedBobView;
 	private static Object savedDamageTilt;
@@ -349,7 +375,29 @@ public final class CyberCraftClient implements ClientModInitializer {
 	private static long reportAt;
 	private static int framesSinceReport;
 
-	public static void noteRenderCamera(double x, double y, double z, float yaw, float pitch, float projX, float projY) {
+	private static volatile float usedM22, usedM32;
+	private static volatile boolean occlude = true; // /ccocclude
+
+	/** Is Minecraft's world being drawn over Cyberpunk with depth, so that the game's world can hide it? */
+	public static boolean occludeActive() {
+		return occlude && drawWorld() && !FrameExporter.depthUnsupported();
+	}
+
+	public static boolean occludeEnabled() {
+		return occlude;
+	}
+
+	public static float projectionM22() {
+		return usedM22;
+	}
+
+	public static float projectionM32() {
+		return usedM32;
+	}
+
+	public static void noteRenderCamera(double x, double y, double z, float yaw, float pitch, float projX, float projY, float m22, float m32) {
+		usedM22 = m22;
+		usedM32 = m32;
 		usedX = x;
 		usedY = y;
 		usedZ = z;
@@ -605,12 +653,12 @@ public final class CyberCraftClient implements ClientModInitializer {
 		boolean screenOpen = client.gui.screen() != null;
 		float sensitivity = client.options.sensitivity().get().floatValue();
 		if (player == null) {
-			CyberLink.publishMcState(false, false, false, camSource, depthProbe, sensitivity, 0, 0, 0, 0, 0);
+			CyberLink.publishMcState(false, false, false, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, sensitivity, 0, 0, 0, 0, 0);
 		} else if (following) {
 			// The ground Minecraft walks on is Night City's own, so the player's position is V's position.
-			CyberLink.publishMcState(true, true, screenOpen, camSource, depthProbe, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, true, screenOpen, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
 		} else {
-			CyberLink.publishMcState(true, false, screenOpen, camSource, depthProbe, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, false, screenOpen, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
 		}
 
 		if (!haveState) {

@@ -11,6 +11,10 @@ namespace cybercraft::overlay
 	// time, finds the game's swapchain and hooks its Present, so Minecraft's HUD can be drawn over each frame.
 	void Install();
 
+	// A debug view of the depth test (0 off): 1 shows the game's depth as grey (near dark, far light) over the whole screen, 2 shows the
+	// blocks' distance as grey, 3 colours block pixels red where the game's world hides them and green where they show.
+	void SetDebugView(int a_view);
+
 	// The game's window, once the swapchain has been found (else null).
 	void* GameWindow();
 

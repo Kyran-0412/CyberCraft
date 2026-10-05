@@ -258,6 +258,11 @@ public final class CyberLink {
 
 	/** Hands the frame just written at {@link #overlayBackSlotOffset()} to Cyberpunk. */
 	public static void publishOverlay(int width, int height, boolean bottomUp, long frameId, long cameraFrame) {
+		publishOverlay(width, height, bottomUp ? SHF_BOTTOM_UP : 0, frameId, cameraFrame, 0.0f, 0.0f, 0.0f, 0.0f);
+	}
+
+	/** As above, with the slot's flag bits (SHF_*) and Minecraft's projection numbers, for a layered frame. */
+	public static void publishOverlay(int width, int height, int flags, long frameId, long cameraFrame, float mcA, float mcB, float mcNear, float mcFar) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return;
@@ -265,9 +270,13 @@ public final class CyberLink {
 		long hdr = OFF_OVERLAY_SLOT_HDR + overlayBack * SLOT_HDR_SIZE;
 		s.set(JAVA_INT, hdr + SH_WIDTH, width);
 		s.set(JAVA_INT, hdr + SH_HEIGHT, height);
-		s.set(JAVA_INT, hdr + SH_FLAGS, bottomUp ? 1 : 0);
+		s.set(JAVA_INT, hdr + SH_FLAGS, flags);
 		s.set(JAVA_LONG, hdr + SH_FRAME_ID, frameId);
 		s.set(JAVA_LONG, hdr + SH_CAMERA_FRAME, cameraFrame);
+		s.set(JAVA_FLOAT, hdr + SH_MC_A, mcA);
+		s.set(JAVA_FLOAT, hdr + SH_MC_B, mcB);
+		s.set(JAVA_FLOAT, hdr + SH_MC_NEAR, mcNear);
+		s.set(JAVA_FLOAT, hdr + SH_MC_FAR, mcFar);
 		int old = (int) INT_VH.getAndSet(s, OFF_OVERLAY_CTL + OC_STATE, overlayBack | OVERLAY_DIRTY);
 		overlayBack = old & 3;
 		LONG_VH.getAndAdd(s, OFF_OVERLAY_CTL + OC_FRAMES_PUBLISHED, 1L);
@@ -277,7 +286,7 @@ public final class CyberLink {
 	 * Tells Cyberpunk what Minecraft wants. With {@code follow} set, Cyberpunk keeps moving V to (x, y, z)
 	 * (the same coordinate space as the game state position) and turns V to face {@code yaw}.
 	 */
-	public static void publishMcState(boolean inWorld, boolean follow, boolean screenOpen, int camSource, boolean depthProbe, float sensitivity, double x, double y, double z, float yaw, float pitch) {
+	public static void publishMcState(boolean inWorld, boolean follow, boolean screenOpen, int camSource, boolean depthProbe, boolean depthCapture, int debugView, float sensitivity, double x, double y, double z, float yaw, float pitch) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return;
@@ -285,7 +294,7 @@ public final class CyberLink {
 		int base = s.get(JAVA_INT, OFF_MC_STATE + M_SEQ) & ~1;
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 1); // odd: write in progress
 		VarHandle.releaseFence();
-		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0) | (screenOpen ? MC_SCREEN_OPEN : 0) | ((camSource & 3) << MC_CAM_SOURCE_SHIFT) | (depthProbe ? MC_DEPTH_PROBE : 0));
+		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0) | (screenOpen ? MC_SCREEN_OPEN : 0) | ((camSource & 3) << MC_CAM_SOURCE_SHIFT) | (depthProbe ? MC_DEPTH_PROBE : 0) | (depthCapture ? MC_DEPTH_CAPTURE : 0) | ((debugView & 3) << MC_DEBUG_SHIFT));
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_X, x);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Y, y);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Z, z);

@@ -487,6 +487,48 @@ namespace cybercraft::ground
 		g_sdk = a_sdk;
 	}
 
+	double RayDistance(double a_ox, double a_oy, double a_oz, double a_dx, double a_dy, double a_dz, double a_maxDistance)
+	{
+		if (!Link::Get().IsOpen() || g_failed || !g_triedInit) {
+			return std::nan("");
+		}
+		const double length = std::sqrt(a_dx * a_dx + a_dy * a_dy + a_dz * a_dz);
+		if (length < 1.0e-9) {
+			return std::nan("");
+		}
+		const double ux = a_dx / length;
+		const double uy = a_dy / length;
+		const double uz = a_dz / length;
+		double best = std::nan("");
+		for (int i = 0; i < kGroupCount; ++i) {
+			RED4ext::Vector4 from(float(a_ox), float(a_oy), float(a_oz), 1.0f);
+			RED4ext::Vector4 to(float(a_ox + ux * a_maxDistance), float(a_oy + uy * a_maxDistance), float(a_oz + uz * a_maxDistance), 1.0f);
+			RED4ext::CName group(kGroups[i]);
+			bool staticOnly = true;
+			bool dynamicOnly = false;
+			RED4ext::StackArgs_t args;
+			args.emplace_back(nullptr, &from);
+			args.emplace_back(nullptr, &to);
+			args.emplace_back(nullptr, &group);
+			std::memset(&g_trace, 0, sizeof(g_trace));
+			args.emplace_back(nullptr, &g_trace);
+			args.emplace_back(nullptr, &staticOnly);
+			args.emplace_back(nullptr, &dynamicOnly);
+			bool hit = false;
+			if (!RED4ext::ExecuteFunction(g_spatial, g_raycast, &hit, args) || !hit) {
+				continue;
+			}
+			const double hx = g_trace.position.X - a_ox;
+			const double hy = g_trace.position.Y - a_oy;
+			const double hz = g_trace.position.Z - a_oz;
+			const double distance = std::sqrt(hx * hx + hy * hy + hz * hz);
+			if (std::isnan(best) || distance < best) {
+				best = distance;
+			}
+		}
+		return best;
+	}
+
 	double HeightAt(double a_x, double a_y)
 	{
 		if (!Link::Get().IsOpen()) {

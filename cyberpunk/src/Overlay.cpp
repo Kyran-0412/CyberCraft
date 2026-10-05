@@ -67,7 +67,11 @@ namespace cybercraft::overlay
 		std::uint64_t g_drawCalls = 0;
 		std::uint64_t g_hudDraws = 0;
 		std::uint64_t g_badgeDraws = 0;
+		int g_debugView = 0;
 		std::uint64_t g_framesUploaded = 0;
+		std::uint64_t g_layeredDraws = 0;
+		std::uint64_t g_plainDraws = 0;
+		std::uint64_t g_depthDraws = 0;
 		double g_ageSum = 0.0;
 		double g_ageMax = 0.0;
 		std::uint64_t g_ageCount = 0;
@@ -75,8 +79,17 @@ namespace cybercraft::overlay
 		std::chrono::steady_clock::time_point g_inGameSince{};
 
 		const char* kShaderSource = R"HLSL(
-cbuffer P : register(b0) { float flipY; float mode; float cursorOn; float pad0; float2 cursor; float2 pad1; };
-Texture2D tex : register(t0);
+cbuffer P : register(b0)
+{
+	float flipY; float mode; float cursorOn; float layered;
+	float2 cursor; float zeroToOne; float haveGameDepth;
+	float mcA; float mcB; float gameNear; float biasAbs;
+	float biasRel; float debugView; float2 pad;
+};
+Texture2D tex : register(t0);          // the whole frame (plain mode), or the world's colour (layered)
+Texture2D mcDepthTex : register(t1);   // layered: the world's depth, as Minecraft wrote it
+Texture2D overlayTex : register(t2);   // layered: the hand, hotbar and screens
+Texture2D gameDepthTex : register(t3); // the game's own depth (a copy), when there is one
 SamplerState samp : register(s0);
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut VS(uint id : SV_VertexID)
@@ -94,7 +107,50 @@ float4 PS(VSOut i) : SV_Target
 	}
 	float2 uv = i.uv;
 	if (flipY > 0.5) { uv.y = 1.0 - uv.y; }
-	float4 c = tex.Sample(samp, uv);         // premultiplied alpha straight from Minecraft
+	float4 c;
+	if (layered > 0.5) {
+		float4 w = tex.Sample(samp, uv);       // the world, premultiplied alpha
+		float zg = 1e9;
+		if (haveGameDepth > 0.5) {
+			// The game's world at this place on the screen: its depth is gameNear / distance (reversed, no far plane).
+			uint gw, gh;
+			gameDepthTex.GetDimensions(gw, gh);
+			float sg = gameDepthTex.Load(int3(min(uint2(i.uv * float2(gw, gh)), uint2(gw - 1, gh - 1)), 0)).r;
+			zg = sg > 1e-8 ? gameNear / sg : 1e9;
+		}
+		float zm = 1e9;
+		bool hidden = false;
+		if (w.a > 0.0) {
+			// How far is this block pixel from the camera? Minecraft's depth is the matrix's: ndc = -A + B / distance.
+			uint mw, mh;
+			mcDepthTex.GetDimensions(mw, mh);
+			float s = mcDepthTex.Load(int3(min(uint2(uv * float2(mw, mh)), uint2(mw - 1, mh - 1)), 0)).r;
+			float ndc = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
+			float den = ndc + mcA;
+			zm = abs(den) > 1e-9 ? mcB / den : 1e9;
+			if (zm <= 0.0) { zm = 1e9; }
+			// Hidden if it is behind what the game drew there (with a little room for rounding, and for the game's jittered depth).
+			hidden = haveGameDepth > 0.5 && zm > zg + biasAbs + biasRel * zg;
+		}
+		if (debugView > 2.5) {
+			if (w.a <= 0.0) { return float4(0, 0, 0, 0); }
+			return hidden ? float4(0.6, 0.0, 0.0, 0.6) : float4(0.0, 0.5, 0.0, 0.6);
+		}
+		if (debugView > 1.5) {
+			if (w.a <= 0.0) { return float4(0, 0, 0, 0); }
+			float g = saturate(zm / 60.0);
+			return float4(g, g, g, 1);
+		}
+		if (debugView > 0.5) {
+			float g = saturate(zg / 60.0);
+			return float4(g, g, g, 1);
+		}
+		if (hidden) { w = float4(0, 0, 0, 0); }
+		float4 o = overlayTex.Sample(samp, uv);
+		c = o + w * (1.0 - o.a);                // the overlay over the world, both premultiplied
+	} else {
+		c = tex.Sample(samp, uv);               // premultiplied alpha straight from Minecraft
+	}
 	if (cursorOn > 0.5) {
 		// The mouse cursor used while a Minecraft screen is open: a small white arrow with a black edge.
 		float2 p = i.pos.xy - cursor;
@@ -129,9 +185,21 @@ float4 PS(VSOut i) : SV_Target
 			UINT64 frameFence[kFrames] = {};
 			UINT frame = 0;
 
-			// The HUD texture and the upload buffers that feed it.
+			// The HUD texture (or, for a layered frame, the world's colour) and the upload buffers that feed it.
 			ComPtr<ID3D12Resource> texture;
 			UINT texW = 0, texH = 0;
+			// Layered frames: the world's depth and the overlay, same size as the colour.
+			ComPtr<ID3D12Resource> texDepth;
+			ComPtr<ID3D12Resource> texOverlay;
+			UINT layerW = 0, layerH = 0;
+			bool layered = false;      // the newest frame has layers
+			float mcA = 0.0f, mcB = 0.0f;
+			bool zeroToOne = true;
+			UINT srvInc = 0;
+			// The game's depth copy, as last bound to descriptor 3.
+			ID3D12Resource* boundGameDepth = nullptr;
+			UINT boundGameW = 0, boundGameH = 0;
+			DXGI_FORMAT boundGameFormat = DXGI_FORMAT_UNKNOWN;
 			ComPtr<ID3D12Resource> upload[kFrames];
 			UINT64 uploadSize[kFrames] = {};
 			bool haveFrame = false;
@@ -251,12 +319,26 @@ float4 PS(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_HEAP_DESC srv{};
 			srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-			srv.NumDescriptors = 1;
+			srv.NumDescriptors = 4;
 			srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 			hr = g.device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&g.srvHeap));
 			if (FAILED(hr)) {
 				LogError("creating the texture heap", hr);
 				return false;
+			}
+			g.srvInc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			{
+				// All four descriptors must be valid for the shader, even the ones a frame doesn't use: make them null ones.
+				D3D12_SHADER_RESOURCE_VIEW_DESC nullView{};
+				nullView.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				nullView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				nullView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				nullView.Texture2D.MipLevels = 1;
+				for (UINT i = 0; i < 4; ++i) {
+					D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+					h.ptr += SIZE_T(i) * g.srvInc;
+					g.device->CreateShaderResourceView(nullptr, &nullView, h);
+				}
 			}
 
 			// Shaders and the root signature.
@@ -281,7 +363,7 @@ float4 PS(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_RANGE range{};
 			range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-			range.NumDescriptors = 1;
+			range.NumDescriptors = 4;
 			range.BaseShaderRegister = 0;
 			range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -292,7 +374,7 @@ float4 PS(VSOut i) : SV_Target
 			params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 			params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 			params[1].Constants.ShaderRegister = 0;
-			params[1].Constants.Num32BitValues = 8;
+			params[1].Constants.Num32BitValues = 16;
 			params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 			D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -431,6 +513,55 @@ float4 PS(VSOut i) : SV_Target
 			return true;
 		}
 
+		// (Re)creates the textures for a layered frame's depth and overlay to fit a_w x a_h pixels. (The colour is g.texture.)
+		bool EnsureLayerTextures(UINT a_w, UINT a_h, DXGI_FORMAT a_colourFormat)
+		{
+			if (g.texDepth && g.texOverlay && g.layerW == a_w && g.layerH == a_h) {
+				return true;
+			}
+			WaitIdle();
+			g.texDepth.Reset();
+			g.texOverlay.Reset();
+
+			D3D12_RESOURCE_DESC desc{};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			desc.Width = a_w;
+			desc.Height = a_h;
+			desc.DepthOrArraySize = 1;
+			desc.MipLevels = 1;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			const auto heap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+
+			desc.Format = DXGI_FORMAT_R32_FLOAT;
+			HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g.texDepth));
+			if (FAILED(hr)) {
+				LogError("creating the world depth texture", hr);
+				return false;
+			}
+			desc.Format = a_colourFormat;
+			hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g.texOverlay));
+			if (FAILED(hr)) {
+				LogError("creating the overlay texture", hr);
+				return false;
+			}
+			g.layerW = a_w;
+			g.layerH = a_h;
+
+			D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+			view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			view.Texture2D.MipLevels = 1;
+			D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+			view.Format = DXGI_FORMAT_R32_FLOAT;
+			h.ptr += SIZE_T(1) * g.srvInc;
+			g.device->CreateShaderResourceView(g.texDepth.Get(), &view, h);
+			view.Format = a_colourFormat;
+			h.ptr += g.srvInc;
+			g.device->CreateShaderResourceView(g.texOverlay.Get(), &view, h);
+			return true;
+		}
+
 		bool EnsureUpload(UINT a_slot, UINT64 a_size)
 		{
 			if (g.upload[a_slot] && g.uploadSize[a_slot] >= a_size) {
@@ -536,48 +667,64 @@ float4 PS(VSOut i) : SV_Target
 				return;
 			}
 
-			// A new HUD frame: copy it up to the GPU.
+			// A new frame from Minecraft: copy it up to the GPU. A plain frame is one picture; a layered one has three (the world's
+			// colour, the world's depth, the overlay), all of the same size.
 			bool uploaded = false;
 			if (newFrame) {
 				const auto* hdr = link.OverlayFrontHeader();
 				const UINT w = hdr->width;
 				const UINT h = hdr->height;
+				const bool layered = (hdr->flags & proto::kOverlayLayered) != 0;
 				if (w > 0 && h > 0 && w <= proto::kMaxOverlayW && h <= proto::kMaxOverlayH) {
 					const DXGI_FORMAT texFormat = IsSrgb(bb.Format) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
 					const UINT rowBytes = w * 4;
 					const UINT rowPitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-					if (EnsureTexture(w, h, texFormat) && EnsureUpload(slot, UINT64(rowPitch) * h)) {
+					// Each layer's rows go in a region of the upload buffer that starts on the copy alignment.
+					const UINT64 region = (UINT64(rowPitch) * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+					const UINT layers = layered ? 3 : 1;
+					if (EnsureTexture(w, h, texFormat) && (!layered || EnsureLayerTextures(w, h, texFormat)) && EnsureUpload(slot, region * layers)) {
 						void* mapped = nullptr;
 						const D3D12_RANGE noRead{ 0, 0 };
 						if (SUCCEEDED(g.upload[slot]->Map(0, &noRead, &mapped))) {
-							const std::uint8_t* src = link.OverlayFrontPixels();
-							auto* dst = static_cast<std::uint8_t*>(mapped);
-							for (UINT y = 0; y < h; ++y) {
-								std::memcpy(dst + UINT64(y) * rowPitch, src + UINT64(y) * rowBytes, rowBytes);
+							ID3D12Resource* targets[3] = { g.texture.Get(), g.texDepth.Get(), g.texOverlay.Get() };
+							const DXGI_FORMAT formats[3] = { texFormat, DXGI_FORMAT_R32_FLOAT, texFormat };
+							const std::uint8_t* pixels = link.OverlayFrontPixels();
+							for (UINT layer = 0; layer < layers; ++layer) {
+								const std::uint8_t* src = pixels + UINT64(layer) * proto::kOverlayLayerBytes;
+								auto* dst = static_cast<std::uint8_t*>(mapped) + UINT64(layer) * region;
+								for (UINT y = 0; y < h; ++y) {
+									std::memcpy(dst + UINT64(y) * rowPitch, src + UINT64(y) * rowBytes, rowBytes);
+								}
 							}
 							g.upload[slot]->Unmap(0, nullptr);
 
-							D3D12_TEXTURE_COPY_LOCATION to{};
-							to.pResource = g.texture.Get();
-							to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-							to.SubresourceIndex = 0;
-							D3D12_TEXTURE_COPY_LOCATION from{};
-							from.pResource = g.upload[slot].Get();
-							from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-							from.PlacedFootprint.Offset = 0;
-							from.PlacedFootprint.Footprint.Format = texFormat;
-							from.PlacedFootprint.Footprint.Width = w;
-							from.PlacedFootprint.Footprint.Height = h;
-							from.PlacedFootprint.Footprint.Depth = 1;
-							from.PlacedFootprint.Footprint.RowPitch = rowPitch;
+							for (UINT layer = 0; layer < layers; ++layer) {
+								D3D12_TEXTURE_COPY_LOCATION to{};
+								to.pResource = targets[layer];
+								to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+								to.SubresourceIndex = 0;
+								D3D12_TEXTURE_COPY_LOCATION from{};
+								from.pResource = g.upload[slot].Get();
+								from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+								from.PlacedFootprint.Offset = UINT64(layer) * region;
+								from.PlacedFootprint.Footprint.Format = formats[layer];
+								from.PlacedFootprint.Footprint.Width = w;
+								from.PlacedFootprint.Footprint.Height = h;
+								from.PlacedFootprint.Footprint.Depth = 1;
+								from.PlacedFootprint.Footprint.RowPitch = rowPitch;
 
-							auto toCopy = Transition(g.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-							g.list->ResourceBarrier(1, &toCopy);
-							g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-							auto toRead = Transition(g.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-							g.list->ResourceBarrier(1, &toRead);
+								auto toCopy = Transition(targets[layer], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+								g.list->ResourceBarrier(1, &toCopy);
+								g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+								auto toRead = Transition(targets[layer], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+								g.list->ResourceBarrier(1, &toRead);
+							}
 
-							g.flipY = (hdr->flags & 1) != 0;
+							g.flipY = (hdr->flags & proto::kOverlayBottomUp) != 0;
+							g.layered = layered;
+							g.mcA = hdr->mcA;
+							g.mcB = hdr->mcB;
+							g.zeroToOne = (hdr->flags & proto::kOverlayZeroToOne) != 0;
 							g.haveFrame = true;
 							uploaded = true;
 							++g_framesUploaded;
@@ -589,7 +736,7 @@ float4 PS(VSOut i) : SV_Target
 							}
 							if (!g.loggedFirstFrame) {
 								g.loggedFirstFrame = true;
-								g_sdk->logger->InfoF(g_handle, "overlay: first HUD frame received (%u x %u)", w, h);
+								g_sdk->logger->InfoF(g_handle, "overlay: first HUD frame received (%u x %u, %s)", w, h, layered ? "layered: world colour, world depth, overlay" : "plain");
 							}
 							// The picture is stretched over the whole screen, so it has to be the same shape as the screen
 							// for Minecraft's blocks to line up with Night City.
@@ -605,7 +752,33 @@ float4 PS(VSOut i) : SV_Target
 					}
 				}
 			}
-			const bool drawHud = (hudFresh || uploaded) && g.haveFrame && g.texture;
+			const bool drawHud = (hudFresh || uploaded) && g.haveFrame && g.texture && (!g.layered || (g.texDepth && g.texOverlay));
+
+			// A layered frame is hidden behind the game's world using the capture's copy of the game's depth, when there is one.
+			depth::GameDepth gameDepth;
+			bool useGameDepth = false;
+			if (drawHud && g.layered && depth::GetGameDepth(gameDepth)) {
+				if (g.boundGameDepth != gameDepth.resource || g.boundGameW != gameDepth.width || g.boundGameH != gameDepth.height || g.boundGameFormat != gameDepth.srvFormat) {
+					WaitIdle();  // the descriptor may be in use by a frame still on the GPU
+					D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+					view.Format = gameDepth.srvFormat;
+					view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+					view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+					view.Texture2D.MipLevels = 1;
+					view.Texture2D.PlaneSlice = 0;
+					D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+					h.ptr += SIZE_T(3) * g.srvInc;
+					g.device->CreateShaderResourceView(gameDepth.resource, &view, h);
+					g.boundGameDepth = gameDepth.resource;
+					g.boundGameW = gameDepth.width;
+					g.boundGameH = gameDepth.height;
+					g.boundGameFormat = gameDepth.srvFormat;
+					g_sdk->logger->InfoF(g_handle, "overlay: hiding blocks behind the game's world, using its depth (%u x %u)", gameDepth.width, gameDepth.height);
+				}
+				useGameDepth = true;
+				auto toRead = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				g.list->ResourceBarrier(1, &toRead);
+			}
 
 			// Draw onto the back buffer.
 			auto toTarget = Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -633,7 +806,12 @@ float4 PS(VSOut i) : SV_Target
 				++g_hudDraws;
 				D3D12_RECT scissor{ 0, 0, LONG(bb.Width), LONG(bb.Height) };
 				g.list->RSSetScissorRects(1, &scissor);
-				float constants[8] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+				++(g.layered ? g_layeredDraws : g_plainDraws);
+				if (useGameDepth) {
+					++g_depthDraws;
+				}
+				float constants[16] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
+					g.mcA, g.mcB, 0.02f /* the game's near plane: its depth is 0.02 / distance */, 0.06f, 0.004f, float(g_debugView), 0.0f, 0.0f };
 				if (input::CursorVisible()) {
 					// The cursor lives in the HUD's pixels; the HUD is stretched over the screen.
 					float cx = 0.0f;
@@ -643,17 +821,22 @@ float4 PS(VSOut i) : SV_Target
 					constants[4] = g.texW ? cx * float(bb.Width) / float(g.texW) : cx;
 					constants[5] = g.texH ? cy * float(bb.Height) / float(g.texH) : cy;
 				}
-				g.list->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 16, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			} else if (badge) {
 				++g_badgeDraws;
 				D3D12_RECT scissor{ 8, 8, 72, 72 };  // the test square
 				g.list->RSSetScissorRects(1, &scissor);
-				const float constants[8] = { 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-				g.list->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
+				const float constants[16] = { 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+				g.list->SetGraphicsRoot32BitConstants(1, 16, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			}
 
+			if (useGameDepth) {
+				// The capture's next copy into this texture assumes it is waiting in the copy-destination state.
+				auto toCopyDest = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+				g.list->ResourceBarrier(1, &toCopyDest);
+			}
 			auto toPresent = Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 			g.list->ResourceBarrier(1, &toPresent);
 
@@ -683,6 +866,8 @@ float4 PS(VSOut i) : SV_Target
 				static_cast<unsigned long long>(g_presents), link.InGame() ? 1 : 0, mcAlive ? 1 : 0,
 				static_cast<unsigned long long>(mcAlive ? link.OverlayFramesPublished() : 0), static_cast<unsigned long long>(g_framesUploaded),
 				static_cast<unsigned long long>(g_hudDraws), static_cast<unsigned long long>(g_badgeDraws), g.ready ? 1 : 0, g.failed ? 1 : 0);
+			g_sdk->logger->InfoF(g_handle, "overlay: draws so far: %llu plain, %llu layered, %llu of those hidden against the game's depth",
+				static_cast<unsigned long long>(g_plainDraws), static_cast<unsigned long long>(g_layeredDraws), static_cast<unsigned long long>(g_depthDraws));
 			if (g_ageCount > 0) {
 				g_sdk->logger->InfoF(g_handle, "overlay: delay: the picture Minecraft sends was drawn through a camera published %.0f ms earlier on average (up to %.0f ms), over %llu frames; the game presented about %.0f frames a second, Minecraft sent about %.0f",
 					g_ageSum / double(g_ageCount), g_ageMax, static_cast<unsigned long long>(g_ageCount), double(g_presents) / 5.0, double(g_ageCount) / 5.0);
@@ -797,6 +982,15 @@ float4 PS(VSOut i) : SV_Target
 	void* GameWindow()
 	{
 		return g_installed ? g_window : nullptr;
+	}
+
+	void SetDebugView(int a_view)
+	{
+		a_view = std::clamp(a_view, 0, 3);
+		if (a_view != g_debugView) {
+			g_debugView = a_view;
+			g_sdk->logger->InfoF(g_handle, "overlay: depth debug view %d", a_view);
+		}
 	}
 
 	void Uninstall()

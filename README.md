@@ -73,9 +73,22 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   streets are at heights like 22.6, so a block built "on" the street really starts 0.6 m under it; since Minecraft's blocks are
   drawn over the game and not hidden by the ground, that sunken part shows through the road and makes the block seem to slide as you
   move. Stand where you want to build, on level ground, and type `/ccalign` once before building (it is remembered between runs).
+* **Hiding blocks behind the game's world** (`/ccocclude`, on by default while blocks are drawn). Minecraft's frame is split into a world
+  layer (colour and depth) and an overlay layer (hand, hotbar, screens); the plugin copies the game's own depth texture once a frame
+  (see `/ccdepthcapture`) and draws a block pixel only where it is nearer than the game's world there (the game stores depth as
+  0.02 / distance). Underground parts of blocks, blocks behind walls and cars, and blocks behind lamp posts are hidden. Turn it off
+  with `/ccocclude` if anything goes wrong, and blocks are drawn over everything again. Needs a Minecraft window no bigger than
+  3840 x 2160; a smaller window means fewer pixels to copy and a faster frame.
+* **`/ccdepthdebug`** cycles a debug view of the depth test: 1 shows the game's depth over the whole screen (near dark, far light), 2 shows
+  the blocks' distance as grey, 3 colours block pixels red where the game's world hides them and green where they show. The capture also
+  checks its copy of the game's depth against the game's own rays and switches to another depth texture if the values don't fit.
 * **`/ccdepthprobe`** (probe, changes nothing visible) watches the game's depth textures and writes what it sees to `CyberCraft.log` every
   4 seconds: which textures are used as depth buffers, how big they are, what happens to them afterwards, and whether their memory is
   reused. This is groundwork for hiding blocks behind buildings and the ground, which needs a copy of the game's depth buffer.
+* **`/ccdepthcapture`** (probe) copies the game's main depth texture right after its last depth pass each frame (it works with DLSS on or off), and compares five
+  texels of it with how far the game's own rays say the world is at the same places on the screen. The log shows whether the numbers
+  agree and how depth values relate to distance. It records commands into the game's own command list, so if the game misbehaves with it
+  on, switch it off and report. Stand still, looking at a street or a wall, for the clearest readings.
 * `/ccfov` shows the vertical field of view in use, `/ccfov <degrees>` overrides it to fine-tune, `/ccfov auto` goes
   back. `/ccworld` hides or shows the blocks. `/ccdump` writes the names of Minecraft's rendering methods to a file.
 

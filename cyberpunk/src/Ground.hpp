@@ -11,6 +11,10 @@ namespace cybercraft::ground
 	// (vx, vy, vz) is V's position in Cyberpunk coordinates (X east, Y north, Z up, metres).
 	void Update(double a_vx, double a_vy, double a_vz);
 
+	// How far the game's static world is along a ray (origin and direction in game coordinates, metres): the nearest hit over the
+	// collision groups the scan uses, or NaN if nothing is hit within a_maxDistance (or the scan isn't ready yet).
+	double RayDistance(double a_ox, double a_oy, double a_oz, double a_dx, double a_dy, double a_dz, double a_maxDistance);
+
 	// The ground height (Cyberpunk's Z) the scan has found for the cell at this game position, or NaN if it hasn't looked there.
 	double HeightAt(double a_x, double a_y);
 

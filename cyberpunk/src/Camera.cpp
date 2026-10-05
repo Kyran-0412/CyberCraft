@@ -16,6 +16,8 @@
 // Every two seconds the log says how much the three disagree.
 
 #include "Camera.hpp"
+#include "Depth.hpp"
+#include "Ground.hpp"
 #include "Link.hpp"
 #include "Mapping.hpp"
 
@@ -28,7 +30,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace cybercraft::camera
 {
@@ -527,6 +531,57 @@ namespace cybercraft::camera
 			}
 		}
 
+		// What does ProjectPoint return in its third and fourth numbers? Points straight ahead at growing distances: if the third is
+		// the depth value, it will follow the distance in a way that shows the near plane and whether depth is reversed.
+		void LogProjectionDepths(const Pose& a_pose)
+		{
+			if (!g_project) {
+				return;
+			}
+			const double distances[] = { 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 300.0, 1000.0 };
+			std::string line = "camera: ProjectPoint (x, y, z, w) for points straight ahead:";
+			char text[160];
+			for (double d : distances) {
+				RED4ext::Vector4 s{};
+				if (Project(a_pose.pos + a_pose.fwd * d, s)) {
+					std::snprintf(text, sizeof(text), " | %gm: %.5f %.5f %.6f %.5f", d, s.X, s.Y, s.Z, s.W);
+				} else {
+					std::snprintf(text, sizeof(text), " | %gm: failed", d);
+				}
+				line += text;
+			}
+			g_sdk->logger->Info(g_handle, line.c_str());
+		}
+
+		// For the depth capture: how far along the view the game's world is at five places on the screen, measured with the game's own
+		// rays. (The capture reads the depth texture at the same places; the two should agree once the right depth is being copied.)
+		void MeasureDepthReferences(const Pose& a_pose)
+		{
+			if (g_measuredHfov <= 0.0f) {
+				return;
+			}
+			const double tanHx = std::tan(g_measuredHfov * 0.5 / kDeg);
+			const double tanHy = std::tan(g_measuredVfov * 0.5 / kDeg);
+			const float places[depth::kReferenceCount][2] = { { 0.5f, 0.5f }, { 0.25f, 0.5f }, { 0.75f, 0.5f }, { 0.5f, 0.25f }, { 0.5f, 0.75f } };
+			depth::Reference refs[depth::kReferenceCount];
+			for (int i = 0; i < depth::kReferenceCount; ++i) {
+				const double ndcX = 2.0 * places[i][0] - 1.0;
+				const double ndcY = 1.0 - 2.0 * places[i][1];
+				const double sx = ndcX * tanHx;
+				const double sy = ndcY * tanHy;
+				const V3 dir = a_pose.fwd + a_pose.right * sx + a_pose.up * sy;
+				const double distance = ground::RayDistance(a_pose.pos.x, a_pose.pos.y, a_pose.pos.z, dir.x, dir.y, dir.z, 300.0);
+				refs[i].u = places[i][0];
+				refs[i].v = places[i][1];
+				if (!std::isnan(distance)) {
+					// Distance along the ray -> distance along the view direction (what a depth buffer holds).
+					refs[i].z = static_cast<float>(distance / std::sqrt(1.0 + sx * sx + sy * sy));
+					refs[i].valid = true;
+				}
+			}
+			depth::SetReferences(refs, depth::kReferenceCount);
+		}
+
 		// Cyberpunk (X east, Y north, Z up) -> Minecraft (X east, Y up, Z south).
 		V3 ToMinecraft(V3 a)
 		{
@@ -608,6 +663,12 @@ namespace cybercraft::camera
 		}
 		if (g_frameCount % 30 == 0) {
 			GridCheck(transformPose);
+		}
+		if (g_frameCount == 120 || g_frameCount == 2400) {
+			LogProjectionDepths(transformPose);
+		}
+		if (depth::CaptureWanted() && g_frameCount % 45 == 0) {
+			MeasureDepthReferences(transformPose);
 		}
 
 		// Statistics for the log.

@@ -30,7 +30,7 @@ public abstract class LevelRendererMixin {
 		} else if (CyberCraftClient.drawWorld()) {
 			// Note what Minecraft is really about to draw through, to compare with what was asked for (see the log).
 			CyberCraftClient.noteRenderCamera(camera.pos.x, camera.pos.y, camera.pos.z, camera.yRot, camera.xRot,
-				camera.projectionMatrix.m00(), camera.projectionMatrix.m11());
+				camera.projectionMatrix.m00(), camera.projectionMatrix.m11(), camera.projectionMatrix.m22(), camera.projectionMatrix.m32());
 		}
 	}
 

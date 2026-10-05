@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 15;
+	inline constexpr std::uint32_t kVersion = 18;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -37,7 +37,11 @@ namespace cybercraft::proto
 	inline constexpr std::uint64_t kOffOverlayPixels = 0x20000;   // 3 slots of RGBA pixels
 	inline constexpr std::uint32_t kMaxOverlayW = 3840;
 	inline constexpr std::uint32_t kMaxOverlayH = 2160;
-	inline constexpr std::uint64_t kOverlaySlotBytes = std::uint64_t(kMaxOverlayW) * kMaxOverlayH * 4;
+	// A slot holds up to three pictures of kMaxOverlayW x kMaxOverlayH x 4 bytes each: layer 0 is the whole frame (or, in a layered
+	// frame, the world: Minecraft's blocks and entities), layer 1 is the world's depth (one 32-bit float per pixel) and layer 2 is the
+	// overlay (hand, hotbar, screens). See OverlaySlotHdr::flags.
+	inline constexpr std::uint64_t kOverlayLayerBytes = std::uint64_t(kMaxOverlayW) * kMaxOverlayH * 4;
+	inline constexpr std::uint64_t kOverlaySlotBytes = kOverlayLayerBytes * 3;
 	inline constexpr std::uint32_t kOverlaySlots = 3;
 	inline constexpr std::uint64_t kMappingBytes = kOffOverlayPixels + kOverlaySlotBytes * kOverlaySlots;
 
@@ -81,8 +85,11 @@ namespace cybercraft::proto
 		kMcFollow = 1u << 1,   // Cyberpunk should keep moving V to (targetX, targetY, targetZ)
 		kMcScreenOpen = 1u << 2,  // a Minecraft screen (inventory, chat, ...) is open: the mouse moves a cursor instead of looking
 		// bits 3-4: which camera source the plugin should publish (see CamSource)
-		kMcDepthProbe = 1u << 5,  // watch the game's depth textures and log what is seen (/ccdepthprobe)
+		kMcDepthProbe = 1u << 5,    // watch the game's depth textures and log what is seen (/ccdepthprobe)
+		kMcDepthCapture = 1u << 6,  // copy the game's main depth texture and check it against the game's rays (/ccdepthcapture)
+		// bits 7-8: depth debug view (see kMcDebugShift): 0 off, 1 the game's depth, 2 the blocks' distance, 3 hidden (red) / shown (green)
 	};
+	inline constexpr std::uint32_t kMcDebugShift = 7;
 	inline constexpr std::uint32_t kMcCamSourceShift = 3;
 
 	enum CamSource : std::uint32_t
@@ -178,13 +185,24 @@ namespace cybercraft::proto
 	{
 		std::uint32_t width;
 		std::uint32_t height;
-		std::uint32_t flags;  // bit 0: the rows are bottom-up (OpenGL order)
+		std::uint32_t flags;  // see OverlayFlags
 		std::uint32_t pad;
 		std::uint64_t frameId;
 		std::uint64_t cameraFrame;  // CameraState::frameCounter of the camera Minecraft drew this frame through
-		std::uint8_t  reserved[0x40 - 0x20];
+		float         mcA;          // Minecraft's projection matrix m22 (layered frames): distance = mcB / (ndcDepth + mcA)
+		float         mcB;          // ... and m32
+		float         mcNear;
+		float         mcFar;
+		std::uint8_t  reserved[0x40 - 0x30];
 	};
 	static_assert(sizeof(OverlaySlotHdr) == 0x40);
+
+	enum OverlayFlags : std::uint32_t
+	{
+		kOverlayBottomUp = 1u << 0,    // the rows of every layer are bottom-up (OpenGL order)
+		kOverlayLayered = 1u << 1,     // three layers: world colour, world depth, overlay (otherwise layer 0 is the whole frame)
+		kOverlayZeroToOne = 1u << 2,   // the depth values are normalised device depth (otherwise they are (depth + 1) / 2)
+	};
 
 	// ---- input ring @0x1A000 (Cyberpunk produces, Minecraft consumes) --------------------------
 	// While input is routed, the plugin captures the keyboard and mouse from Cyberpunk's window and sends them
