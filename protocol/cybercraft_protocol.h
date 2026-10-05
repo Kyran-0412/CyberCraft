@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 8;
+	inline constexpr std::uint32_t kVersion = 9;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -55,7 +55,8 @@ namespace cybercraft::proto
 	// ---- Cyberpunk -> Minecraft state @0x100 (seqlock: seq is odd while being written) ------
 	enum GameFlags : std::uint32_t
 	{
-		kGameInGame = 1u << 0,  // a save is loaded and the player exists
+		kGameInGame = 1u << 0,   // a save is loaded and the player exists
+		kGameRouting = 1u << 1,  // Cyberpunk is sending the keyboard and mouse to Minecraft (see the input ring)
 	};
 
 	struct GameState
@@ -66,14 +67,16 @@ namespace cybercraft::proto
 		std::uint64_t frameCounter;
 		std::uint32_t cmdAck;     // seq of the last McCommand Cyberpunk has dealt with
 		std::uint32_t cmdResult;  // CommandResult for that command
+		float         lookYaw, lookPitch;  // where the player is looking while input is routed, Minecraft degrees
 	};
-	static_assert(sizeof(GameState) == 0x30);
+	static_assert(sizeof(GameState) == 0x38);
 
 	// ---- Minecraft -> Cyberpunk state @0x200 (seqlock: seq is odd while being written) ------
 	enum McFlags : std::uint32_t
 	{
 		kMcInWorld = 1u << 0,  // Minecraft has a world open and a player in it
 		kMcFollow = 1u << 1,   // Cyberpunk should keep moving V to (targetX, targetY, targetZ)
+		kMcScreenOpen = 1u << 2,  // a Minecraft screen (inventory, chat, ...) is open: the mouse moves a cursor instead of looking
 	};
 
 	struct McState
@@ -83,8 +86,10 @@ namespace cybercraft::proto
 		double        targetX, targetY, targetZ;  // where Minecraft wants V's feet (same space as GameState::pos)
 		float         yaw, pitch;                 // Minecraft's look direction, Minecraft degrees
 		std::uint64_t frameCounter;
+		float         sensitivity;                // Minecraft's mouse sensitivity option, 0 to 1
+		float         pad;
 	};
-	static_assert(sizeof(McState) == 0x30);
+	static_assert(sizeof(McState) == 0x38);
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock: seq is odd while being written) -----
 	// A latest-value slot. Minecraft writes the fields and bumps seq by 2 (even); Cyberpunk acts on a
@@ -164,4 +169,32 @@ namespace cybercraft::proto
 		std::uint8_t  reserved[0x40 - 0x18];
 	};
 	static_assert(sizeof(OverlaySlotHdr) == 0x40);
+
+	// ---- input ring @0x1A000 (Cyberpunk produces, Minecraft consumes) --------------------------
+	// While input is routed, the plugin captures the keyboard and mouse from Cyberpunk's window and sends them
+	// here; Minecraft replays them as if its own window had focus. head is written by Cyberpunk, tail by Minecraft.
+	inline constexpr std::uint64_t kOffInputRing = 0x1A000;
+	inline constexpr std::uint32_t kInputRingEntries = 1024;  // power of two
+	inline constexpr std::uint64_t kInputRingHeadOff = 0x00;  // u64
+	inline constexpr std::uint64_t kInputRingTailOff = 0x40;  // u64
+	inline constexpr std::uint64_t kInputRingDataOff = 0x80;
+	static_assert(kOffInputRing + kInputRingDataOff + std::uint64_t(kInputRingEntries) * 16 <= kOffOverlayPixels, "the input ring must end before the overlay pixels");
+
+	enum InputType : std::uint16_t
+	{
+		kInKey = 1,          // code = SDL scancode, a = 1 press / 0 release
+		kInMouseButton = 2,  // code = SDL button (1 left, 2 middle, 3 right, 4 and 5 the side buttons), a = 1 press / 0 release
+		kInScroll = 3,       // a = wheel notches * 120 (positive = up)
+		kInCursor = 4,       // a, b = the cursor's position in overlay pixels (used while a screen is open)
+		kInText = 5,         // a = a Unicode code point typed
+		kInReleaseAll = 6,   // let go of every key and button (input stopped being routed)
+	};
+
+	struct InputEvent
+	{
+		std::uint16_t type;  // InputType
+		std::uint16_t code;
+		std::int32_t  a, b, c;
+	};
+	static_assert(sizeof(InputEvent) == 16);
 }

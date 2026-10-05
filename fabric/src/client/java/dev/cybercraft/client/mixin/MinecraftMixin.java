@@ -10,6 +10,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Minecraft.class)
 public abstract class MinecraftMixin {
+	/** Start of every Minecraft frame: pull the keyboard, mouse and look direction from Cyberpunk before anything else runs. */
+	@Inject(method = "runTick", at = @At("HEAD"))
+	private void cybercraft$beginFrame(boolean advanceGameTime, CallbackInfo ci) {
+		CyberCraftClient.beginFrame();
+	}
+
 	/** After Minecraft has drawn a frame (hand, HUD, screens): ship it to Cyberpunk. Same hook SkyCraft uses. */
 	@Inject(
 		method = "renderFrame",

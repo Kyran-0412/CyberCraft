@@ -13,7 +13,7 @@ Tested against Cyberpunk 2077 **game version 2.31** (Steam), RED4ext and Cyber E
 0. **Hello world**: a RED4ext plugin that logs V's position once a second. (done)
 1. **Link**: shared memory between the plugin and a Fabric mod. 1a: V's position reaches Minecraft (done). 1b-i: a Minecraft command teleports V (done). 1b-ii: Minecraft's player position drives V (done).
 2. **Walk**: Night City collision fed into Minecraft physics. 2a: the ground around V built as blocks from raycasts (done). 2b-i: the ground as smooth invisible collision instead of blocks (done). 2b-ii: walls, trees, lamp posts and other obstacles (current). 2b-iii: bridges and other layers.
-3. **Input and display**: 3b: the Minecraft hotbar, hearts, held item and screens drawn over the game (current). 3a: keyboard and mouse forwarded to Minecraft so you play in the Cyberpunk window.
+3. **Input and display**: 3b: the Minecraft hotbar, hearts, held item and screens drawn over the game (done). 3a: keyboard and mouse forwarded to Minecraft so you play in the Cyberpunk window (current).
 4. **Combat**: invisible Minecraft proxies for NPCs, damage both ways.
 5. **Blocks**: place and break blocks in Night City, depth-composited.
 
@@ -48,6 +48,18 @@ console prints "linked to Cyberpunk" and V's position once a second. Minecraft's
 Start Cyberpunk and the development Minecraft, load a save in Cyberpunk, and in Minecraft open any world.
 Press `T` and type `/cctp` (V moves 5 m up), or `/cctp <east> <north> <up>` for an offset in metres.
 The result is in Minecraft's console and in `red4ext\logs\CyberCraft.log`.
+
+### Playing in the Cyberpunk window (Phase 3a)
+
+With `/ccfollow` on, the keyboard and mouse of the **Cyberpunk window** go to Minecraft: WASD, space, shift, the mouse
+to look, clicks to attack and place, the wheel and number keys for the hotbar, `E` for the inventory, `T` to chat.
+The game doesn't get them, so V doesn't also run or shoot. With a Minecraft screen open the mouse moves a cursor
+that is drawn over the game, and typing goes to Minecraft.
+
+* **Esc** opens Cyberpunk's own pause menu (or closes an open Minecraft screen). Routing pauses by itself while the
+  game is paused and comes back when you leave the menu.
+* **F9** switches routing off and on by hand, e.g. to use CET's window or a cutscene.
+* Alt+F4 still closes the game.
 
 ### Seeing Minecraft's HUD over Cyberpunk (Phase 3b)
 

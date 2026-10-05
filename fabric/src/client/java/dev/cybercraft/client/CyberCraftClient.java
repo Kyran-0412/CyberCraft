@@ -154,6 +154,10 @@ public final class CyberCraftClient implements ClientModInitializer {
 		GroundCollision.setEnabled(false);
 		GroundMirror.stop();
 		CyberCraft.LOG.info("CyberCraft: follow off");
+		if (routedFlag) {
+			routedFlag = false;
+			InputBridge.releaseAll();
+		}
 		return "CyberCraft: V stopped following.";
 	}
 
@@ -177,6 +181,47 @@ public final class CyberCraftClient implements ClientModInitializer {
 	}
 
 	private static int pushCount;
+	private static volatile boolean routedFlag;
+
+	/** True while Cyberpunk is sending its keyboard and mouse to Minecraft: Minecraft then ignores its own window's. */
+	public static boolean inputRouted() {
+		return routedFlag;
+	}
+
+	/**
+	 * Start of every Minecraft frame (see MinecraftMixin): replay the keyboard and mouse Cyberpunk captured since
+	 * last frame, and take the look direction from it, so looking around has no tick-rate delay.
+	 */
+	public static void beginFrame() {
+		CyberLink.poll();
+		Minecraft client = Minecraft.getInstance();
+		if (!CyberLink.active() || !CyberLink.readGameState(STATE)) {
+			if (routedFlag) {
+				routedFlag = false;
+				InputBridge.releaseAll();
+			}
+			return;
+		}
+		boolean routing = STATE.routing() && (following || syncing);
+		if (routing != routedFlag) {
+			routedFlag = routing;
+			if (!routing) {
+				InputBridge.releaseAll();
+			}
+			CyberCraft.LOG.info(routing ? "CyberCraft: Cyberpunk's keyboard and mouse now control Minecraft" : "CyberCraft: Minecraft's keyboard and mouse are back to normal");
+		}
+		if (!routing) {
+			return;
+		}
+		InputBridge.drain(client);
+		LocalPlayer player = client.player;
+		if (player != null && client.gui.screen() == null) {
+			player.setYRot(STATE.lookYaw);
+			player.setXRot(STATE.lookPitch);
+			player.yRotO = STATE.lookYaw;
+			player.xRotO = STATE.lookPitch;
+		}
+	}
 
 	/**
 	 * True while Cyberpunk is the one showing the world (following, or about to): Minecraft then draws only its
@@ -287,13 +332,15 @@ public final class CyberCraftClient implements ClientModInitializer {
 		}
 
 		// Tell Cyberpunk where Minecraft's player is (every tick). With follow off it just says "don't move V".
+		boolean screenOpen = client.gui.screen() != null;
+		float sensitivity = client.options.sensitivity().get().floatValue();
 		if (player == null) {
-			CyberLink.publishMcState(false, false, 0, 0, 0, 0, 0);
+			CyberLink.publishMcState(false, false, false, sensitivity, 0, 0, 0, 0, 0);
 		} else if (following) {
 			// The ground Minecraft walks on is Night City's own, so the player's position is V's position.
-			CyberLink.publishMcState(true, true, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, true, screenOpen, sensitivity, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
 		} else {
-			CyberLink.publishMcState(true, false, 0, 0, 0, player.getYRot(), player.getXRot());
+			CyberLink.publishMcState(true, false, screenOpen, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
 		}
 
 		if (!haveState) {

@@ -14,6 +14,7 @@
 // can see it, the drawing itself works. Every 5 seconds a status line goes to the log.
 
 #include "Overlay.hpp"
+#include "Input.hpp"
 #include "Link.hpp"
 
 #include <cybercraft_protocol.h>
@@ -54,6 +55,7 @@ namespace cybercraft::overlay
 		PresentFn g_origPresent = nullptr;
 		Present1Fn g_origPresent1 = nullptr;
 		IDXGISwapChain* g_gameSwapChain = nullptr;  // not owned
+		HWND g_window = nullptr;
 		std::chrono::steady_clock::time_point g_installTime{};
 
 		// Counters for the status line.
@@ -67,7 +69,7 @@ namespace cybercraft::overlay
 		std::chrono::steady_clock::time_point g_inGameSince{};
 
 		const char* kShaderSource = R"HLSL(
-cbuffer P : register(b0) { float flipY; float mode; };
+cbuffer P : register(b0) { float flipY; float mode; float cursorOn; float pad0; float2 cursor; float2 pad1; };
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -86,7 +88,16 @@ float4 PS(VSOut i) : SV_Target
 	}
 	float2 uv = i.uv;
 	if (flipY > 0.5) { uv.y = 1.0 - uv.y; }
-	return tex.Sample(samp, uv);             // premultiplied alpha straight from Minecraft
+	float4 c = tex.Sample(samp, uv);         // premultiplied alpha straight from Minecraft
+	if (cursorOn > 0.5) {
+		// The mouse cursor used while a Minecraft screen is open: a small white arrow with a black edge.
+		float2 p = i.pos.xy - cursor;
+		if (p.x >= 0 && p.y >= 0 && p.y < 18 && p.x <= p.y * 0.6) {
+			bool edge = p.x < 1.5 || p.x > p.y * 0.6 - 1.5 || p.y > 16.5;
+			c = float4(edge ? float3(0, 0, 0) : float3(1, 1, 1), 1);
+		}
+	}
+	return c;
 }
 )HLSL";
 
@@ -274,7 +285,7 @@ float4 PS(VSOut i) : SV_Target
 			params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 			params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 			params[1].Constants.ShaderRegister = 0;
-			params[1].Constants.Num32BitValues = 2;
+			params[1].Constants.Num32BitValues = 8;
 			params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 			D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -599,15 +610,24 @@ float4 PS(VSOut i) : SV_Target
 				++g_hudDraws;
 				D3D12_RECT scissor{ 0, 0, LONG(bb.Width), LONG(bb.Height) };
 				g.list->RSSetScissorRects(1, &scissor);
-				const float constants[2] = { g.flipY ? 1.0f : 0.0f, 0.0f };
-				g.list->SetGraphicsRoot32BitConstants(1, 2, constants, 0);
+				float constants[8] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+				if (input::CursorVisible()) {
+					// The cursor lives in the HUD's pixels; the HUD is stretched over the screen.
+					float cx = 0.0f;
+					float cy = 0.0f;
+					input::CursorPosition(cx, cy);
+					constants[2] = 1.0f;
+					constants[4] = g.texW ? cx * float(bb.Width) / float(g.texW) : cx;
+					constants[5] = g.texH ? cy * float(bb.Height) / float(g.texH) : cy;
+				}
+				g.list->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			} else if (badge) {
 				++g_badgeDraws;
 				D3D12_RECT scissor{ 8, 8, 72, 72 };  // the test square
 				g.list->RSSetScissorRects(1, &scissor);
-				const float constants[2] = { 0.0f, 1.0f };
-				g.list->SetGraphicsRoot32BitConstants(1, 2, constants, 0);
+				const float constants[8] = { 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+				g.list->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			}
 
@@ -678,6 +698,7 @@ float4 PS(VSOut i) : SV_Target
 			for (std::size_t i = 0; i < 32; ++i) {
 				auto& entry = chains.resources[i];
 				if (entry.refCount >= 0 && entry.instance.swapChain.Get() != nullptr) {
+					g_window = entry.instance.windowHandle;
 					return entry.instance.swapChain.Get();
 				}
 			}
@@ -741,6 +762,11 @@ float4 PS(VSOut i) : SV_Target
 		g_installed = g_origPresent != nullptr && g_origPresent1 != nullptr;
 		g_sdk->logger->InfoF(g_handle, "overlay: hooked the game's swapchain %p (Present %p, Present1 %p)", static_cast<void*>(swapChain),
 			reinterpret_cast<void*>(g_origPresent), reinterpret_cast<void*>(g_origPresent1));
+	}
+
+	void* GameWindow()
+	{
+		return g_installed ? g_window : nullptr;
 	}
 
 	void Uninstall()

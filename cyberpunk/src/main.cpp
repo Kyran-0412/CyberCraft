@@ -7,6 +7,7 @@
 // log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
 #include "Ground.hpp"
+#include "Input.hpp"
 #include "Overlay.hpp"
 #include "Link.hpp"
 
@@ -322,8 +323,14 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
     using Clock = std::chrono::steady_clock;
     const auto now = Clock::now();
 
+    // While the keyboard and mouse are routed, the plugin itself turns the mouse into a look direction: use that
+    // straight away (no 20-updates-a-second delay). Otherwise follow Minecraft's player.
+    const bool lookFromMouse = cybercraft::input::Routing();
+    const float mcYaw = lookFromMouse ? cybercraft::input::LookYaw() : aMc.yaw;
+    const float mcPitch = lookFromMouse ? cybercraft::input::LookPitch() : aMc.pitch;
+
     // Minecraft yaw: 0 = south, increasing clockwise from above. Cyberpunk yaw: 0 = north, increasing counter-clockwise.
-    const float targetYaw = WrapDegrees(180.0f - aMc.yaw);
+    const float targetYaw = WrapDegrees(180.0f - mcYaw);
 
     if (!g_follow.active)
     {
@@ -335,7 +342,7 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
         g_follow.y = aMc.y;
         g_follow.z = aMc.z;
         g_follow.yaw = targetYaw;
-        g_follow.pitch = aMc.pitch;
+        g_follow.pitch = mcPitch;
         g_sdk->logger->Info(g_handle, "follow: engaged, V now follows Minecraft's player");
         (void)aCurrent;
     }
@@ -367,7 +374,12 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
 
         const float yawAlpha = static_cast<float>(1.0 - std::exp(-dt * 25.0));
         g_follow.yaw = WrapDegrees(g_follow.yaw + WrapDegrees(targetYaw - g_follow.yaw) * yawAlpha);
-        g_follow.pitch += (aMc.pitch - g_follow.pitch) * yawAlpha; // Minecraft only sends 20 updates a second: ease between them
+        g_follow.pitch += (mcPitch - g_follow.pitch) * yawAlpha; // Minecraft only sends 20 updates a second: ease between them
+    }
+    if (lookFromMouse)
+    {
+        g_follow.yaw = targetYaw; // the mouse is read every frame: no easing needed
+        g_follow.pitch = mcPitch;
     }
 
     // Looking up and down is separate from the position; do it every frame.
@@ -379,7 +391,7 @@ void StepFollow(const cybercraft::Link::McSnapshot& aMc, RED4ext::Handle<RED4ext
         const double mx = g_follow.x - g_follow.lastSentX;
         const double my = g_follow.y - g_follow.lastSentY;
         const double mz = g_follow.z - g_follow.lastSentZ;
-        if (mx * mx + my * my + mz * mz < 0.005 * 0.005 && std::fabs(WrapDegrees(g_follow.yaw - g_follow.lastSentYaw)) < 0.2f)
+        if (mx * mx + my * my + mz * mz < 0.005 * 0.005 && std::fabs(WrapDegrees(g_follow.yaw - g_follow.lastSentYaw)) < 0.02f)
         {
             return;
         }
@@ -420,6 +432,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     auto& link = cybercraft::Link::Get();
     link.Beat();
     cybercraft::overlay::Install(); // finds the swapchain and hooks Present (once; does nothing after that)
+    cybercraft::input::Install(static_cast<HWND>(cybercraft::overlay::GameWindow())); // and the window's messages, once its handle is known
 
     const auto now = Clock::now();
     const bool logNow = (now - g_lastLog) >= std::chrono::seconds(1);
@@ -459,6 +472,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
             HandleCommand(command, player);
         }
         StopFollow("no player right now");
+        cybercraft::input::Update(false, false, cybercraft::Link::McSnapshot{});
         cybercraft::ground::Reset();
         link.PublishPlayer(false, 0.0, 0.0, 0.0);
         if (g_hadPlayer)
@@ -511,6 +525,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     const bool mcAlive = link.McPid() != 0 && (GetTickCount64() - link.McHeartbeatMs()) < 3000;
     const bool mcFollow = mcAlive && link.ReadMcState(mc) && (mc.flags & cybercraft::proto::kMcInWorld) != 0 &&
                           (mc.flags & cybercraft::proto::kMcFollow) != 0;
+    cybercraft::input::Update(mcFollow && !g_follow.gaveUp, true, mc);
     if (mcFollow)
     {
         if (!g_follow.gaveUp)
@@ -552,6 +567,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         g_sdk = aSdk;
         cybercraft::ground::Init(aHandle, aSdk);
         cybercraft::overlay::Init(aHandle, aSdk);
+        cybercraft::input::Init(aHandle, aSdk);
 
         aSdk->logger->InfoF(aHandle, "CyberCraft loaded (game version %u.%u.%u)", static_cast<unsigned>(aSdk->runtime->major),
                             static_cast<unsigned>(aSdk->runtime->minor), static_cast<unsigned>(aSdk->runtime->patch));
@@ -575,6 +591,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
     }
     case RED4ext::v1::EMainReason::Unload:
     {
+        cybercraft::input::Uninstall();
         cybercraft::overlay::Uninstall();
         cybercraft::Link::Get().Close();
         break;
@@ -588,7 +605,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 7, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 8, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

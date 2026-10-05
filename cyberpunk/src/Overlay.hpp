@@ -11,6 +11,9 @@ namespace cybercraft::overlay
 	// time, finds the game's swapchain and hooks its Present, so Minecraft's HUD can be drawn over each frame.
 	void Install();
 
+	// The game's window, once the swapchain has been found (else null).
+	void* GameWindow();
+
 	// Puts Present back as it was (game exit).
 	void Uninstall();
 }

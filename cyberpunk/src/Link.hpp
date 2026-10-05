@@ -29,6 +29,13 @@ namespace cybercraft
 		// Publish V's position (Minecraft coordinates) with a seqlock so Minecraft never reads a torn value.
 		void PublishPlayer(bool inGame, double mcX, double mcY, double mcZ);
 
+		// What goes out with the next PublishPlayer: where the player is looking (while routing), and whether input is routed.
+		void SetLook(float a_yaw, float a_pitch) { lookYaw_ = a_yaw; lookPitch_ = a_pitch; }
+		void SetRouting(bool a_routing) { routing_ = a_routing; }
+
+		// Queues one keyboard/mouse event for Minecraft (see InputEvent in the protocol).
+		void PushInput(std::uint16_t a_type, std::uint16_t a_code, std::int32_t a_a = 0, std::int32_t a_b = 0, std::int32_t a_c = 0);
+
 		// What Minecraft currently wants (see McState in the protocol).
 		struct McSnapshot
 		{
@@ -36,6 +43,7 @@ namespace cybercraft
 			double        x, y, z;  // where V should be, protocol coordinates (Minecraft axes)
 			float         yaw, pitch;  // Minecraft degrees
 			std::uint64_t frame;
+			float         sensitivity;
 		};
 
 		// True when a consistent copy was read.
@@ -61,6 +69,8 @@ namespace cybercraft
 		const proto::OverlaySlotHdr* OverlayFrontHeader() const;
 		const std::uint8_t* OverlayFrontPixels() const;
 		std::uint64_t OverlayFramesPublished() const;
+		// The size, in pixels, of the HUD frame currently in front (0 if there has been none).
+		void OverlaySize(std::uint32_t& a_w, std::uint32_t& a_h) const;
 
 		std::uint32_t McPid() const;
 		std::uint64_t McHeartbeatMs() const;
@@ -76,5 +86,8 @@ namespace cybercraft
 		std::uint32_t cmdResult_{ 0 };
 		std::uint32_t overlayFront_{ 2 };
 		bool inGame_{ false };
+		bool routing_{ false };
+		float lookYaw_{ 0.0f };
+		float lookPitch_{ 0.0f };
 	};
 }

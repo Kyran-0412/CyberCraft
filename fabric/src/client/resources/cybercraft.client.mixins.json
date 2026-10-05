@@ -5,8 +5,11 @@
   "client": [
     "EntityCollideMixin",
     "FramerateLimitTrackerMixin",
+    "InputConstantsMixin",
     "LevelRendererMixin",
-    "MinecraftMixin"
+    "MinecraftMixin",
+    "ScreenMixin",
+    "WindowMixin"
   ],
   "injectors": { "defaultRequire": 1 }
 }

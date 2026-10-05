@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 8;
+	public static final int VERSION = 9;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -28,8 +28,11 @@ public final class Proto {
 	public static final long G_FRAME = 32; // u64
 	public static final long G_CMD_ACK = 40; // u32, seq of the last command Cyberpunk dealt with
 	public static final long G_CMD_RESULT = 44; // u32, RESULT_*
+	public static final long G_LOOK_YAW = 48; // float, where the player looks while input is routed, Minecraft degrees
+	public static final long G_LOOK_PITCH = 52; // float
 
 	public static final int GAME_IN_GAME = 1;
+	public static final int GAME_ROUTING = 2; // Cyberpunk is sending the keyboard and mouse to Minecraft (the input ring)
 
 	// ---- Minecraft -> Cyberpunk state @0x200 (seqlock): where Minecraft wants V ----
 	public static final long OFF_MC_STATE = 0x200;
@@ -41,9 +44,11 @@ public final class Proto {
 	public static final long M_YAW = 32; // float, Minecraft degrees
 	public static final long M_PITCH = 36; // float
 	public static final long M_FRAME = 40; // u64
+	public static final long M_SENSITIVITY = 48; // float, Minecraft's mouse sensitivity option, 0 to 1
 
 	public static final int MC_IN_WORLD = 1;
 	public static final int MC_FOLLOW = 2;
+	public static final int MC_SCREEN_OPEN = 4; // a Minecraft screen (inventory, chat, ...) is open
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock) ----
 	public static final long OFF_MC_COMMAND = 0x300;
@@ -93,6 +98,20 @@ public final class Proto {
 	public static final int OVERLAY_DIRTY = 1 << 2;
 
 	public static final long MAPPING_BYTES = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * OVERLAY_SLOTS;
+
+	// ---- input ring @0x1A000 (Cyberpunk produces, Minecraft consumes) ----
+	// Entries are 16 bytes: u16 type, u16 code, i32 a, i32 b, i32 c.
+	public static final long OFF_INPUT_RING = 0x1A000;
+	public static final int INPUT_RING_ENTRIES = 1024;
+	public static final long IR_HEAD = 0x00; // u64, written by Cyberpunk
+	public static final long IR_TAIL = 0x40; // u64, written by Minecraft
+	public static final long IR_DATA = 0x80;
+	public static final int IN_KEY = 1; // code = SDL scancode, a = 1 press / 0 release
+	public static final int IN_MOUSE_BUTTON = 2; // code = SDL button (1 left, 2 middle, 3 right, 4/5 side), a = 1 press / 0 release
+	public static final int IN_SCROLL = 3; // a = wheel notches * 120 (positive = up)
+	public static final int IN_CURSOR = 4; // a, b = cursor position in overlay pixels (while a screen is open)
+	public static final int IN_TEXT = 5; // a = Unicode code point typed
+	public static final int IN_RELEASE_ALL = 6; // let go of every key and button
 
 	private Proto() {
 	}

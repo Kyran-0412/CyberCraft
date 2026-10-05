@@ -105,7 +105,9 @@ namespace cybercraft
 		std::atomic_thread_fence(std::memory_order_release);
 
 		inGame_ = a_inGame;
-		state->flags = a_inGame ? proto::kGameInGame : 0;
+		state->flags = (a_inGame ? proto::kGameInGame : 0) | (routing_ ? proto::kGameRouting : 0);
+		state->lookYaw = lookYaw_;
+		state->lookPitch = lookPitch_;
 		state->posX = a_x;
 		state->posY = a_y;
 		state->posZ = a_z;
@@ -130,7 +132,7 @@ namespace cybercraft
 			}
 
 			const McSnapshot copy{ state->flags, state->targetX, state->targetY, state->targetZ, state->yaw, state->pitch,
-				state->frameCounter };
+				state->frameCounter, state->sensitivity };
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (Atomic(state->seq).load(std::memory_order_relaxed) == seq1) {
 				a_out = copy;
@@ -173,6 +175,23 @@ namespace cybercraft
 		cmdResult_ = a_ok ? proto::kResultOk : proto::kResultFailed;
 	}
 
+	void Link::PushInput(std::uint16_t a_type, std::uint16_t a_code, std::int32_t a_a, std::int32_t a_b, std::int32_t a_c)
+	{
+		if (!base_) {
+			return;
+		}
+		auto* ring = base_ + proto::kOffInputRing;
+		auto  head = Atomic(*reinterpret_cast<std::uint64_t*>(ring + proto::kInputRingHeadOff));
+		const std::uint64_t h = head.load(std::memory_order_relaxed);
+		auto* entry = reinterpret_cast<proto::InputEvent*>(ring + proto::kInputRingDataOff) + (h & (proto::kInputRingEntries - 1));
+		entry->type = a_type;
+		entry->code = a_code;
+		entry->a = a_a;
+		entry->b = a_b;
+		entry->c = a_c;
+		head.store(h + 1, std::memory_order_release);
+	}
+
 	bool Link::AcquireOverlayFrame()
 	{
 		if (!base_) {
@@ -200,6 +219,17 @@ namespace cybercraft
 	const std::uint8_t* Link::OverlayFrontPixels() const
 	{
 		return base_ + proto::kOffOverlayPixels + std::uint64_t(overlayFront_) * proto::kOverlaySlotBytes;
+	}
+
+	void Link::OverlaySize(std::uint32_t& a_w, std::uint32_t& a_h) const
+	{
+		a_w = a_h = 0;
+		if (!base_) {
+			return;
+		}
+		const auto* hdr = reinterpret_cast<const proto::OverlaySlotHdr*>(base_ + proto::kOffOverlaySlotHdr) + overlayFront_;
+		a_w = hdr->width;
+		a_h = hdr->height;
 	}
 
 	std::uint64_t Link::OverlayFramesPublished() const

@@ -69,9 +69,15 @@ public final class CyberLink {
 		public long frame;
 		public int cmdAck; // seq of the last command Cyberpunk dealt with
 		public int cmdResult; // Proto.RESULT_*
+		public float lookYaw, lookPitch; // where the player looks while input is routed (Minecraft degrees)
 
 		public boolean inGame() {
 			return (this.flags & GAME_IN_GAME) != 0;
+		}
+
+		/** Cyberpunk is sending the keyboard and mouse to Minecraft right now. */
+		public boolean routing() {
+			return (this.flags & GAME_ROUTING) != 0;
 		}
 	}
 
@@ -152,12 +158,43 @@ public final class CyberLink {
 			int front = seg.get(JAVA_INT, OFF_OVERLAY_CTL + OC_FRONT);
 			int back = 3 - middle - front;
 			overlayBack = front >= 0 && front <= 2 && middle <= 2 && front != middle && back >= 0 && back <= 2 ? back : 1;
+			// Skip anything Cyberpunk queued before we got here.
+			seg.set(JAVA_LONG, OFF_INPUT_RING + IR_TAIL, seg.get(JAVA_LONG, OFF_INPUT_RING + IR_HEAD));
 			shm = seg;
 			lastOpenError = -1;
 			CyberCraft.LOG.info("CyberCraft: linked to Cyberpunk (pid {})", gamePid);
 		} catch (Throwable t) {
 			CyberCraft.LOG.error("CyberCraft: failed to open shared memory", t);
 		}
+	}
+
+	/** Receives one keyboard or mouse event from Cyberpunk. */
+	public interface InputSink {
+		void accept(int type, int code, int a, int b, int c);
+	}
+
+	/** Hands every input event Cyberpunk has queued since last time to {@code sink}. */
+	public static void drainInput(InputSink sink) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return;
+		}
+		long head = (long) LONG_VH.getAcquire(s, OFF_INPUT_RING + IR_HEAD);
+		long tail = s.get(JAVA_LONG, OFF_INPUT_RING + IR_TAIL);
+		if (head - tail > INPUT_RING_ENTRIES) {
+			tail = head - INPUT_RING_ENTRIES; // Cyberpunk lapped us: drop the oldest
+		}
+		while (tail < head) {
+			long e = OFF_INPUT_RING + IR_DATA + (tail & (INPUT_RING_ENTRIES - 1)) * 16L;
+			int type = Short.toUnsignedInt(s.get(JAVA_SHORT, e));
+			int code = Short.toUnsignedInt(s.get(JAVA_SHORT, e + 2));
+			int a = s.get(JAVA_INT, e + 4);
+			int b = s.get(JAVA_INT, e + 8);
+			int c = s.get(JAVA_INT, e + 12);
+			tail++;
+			sink.accept(type, code, a, b, c);
+		}
+		LONG_VH.setRelease(s, OFF_INPUT_RING + IR_TAIL, tail);
 	}
 
 	/** The shared memory, once opened (whether or not Cyberpunk is still alive). */
@@ -190,7 +227,7 @@ public final class CyberLink {
 	 * Tells Cyberpunk what Minecraft wants. With {@code follow} set, Cyberpunk keeps moving V to (x, y, z)
 	 * (the same coordinate space as the game state position) and turns V to face {@code yaw}.
 	 */
-	public static void publishMcState(boolean inWorld, boolean follow, double x, double y, double z, float yaw, float pitch) {
+	public static void publishMcState(boolean inWorld, boolean follow, boolean screenOpen, float sensitivity, double x, double y, double z, float yaw, float pitch) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return;
@@ -198,13 +235,14 @@ public final class CyberLink {
 		int base = s.get(JAVA_INT, OFF_MC_STATE + M_SEQ) & ~1;
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 1); // odd: write in progress
 		VarHandle.releaseFence();
-		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0));
+		s.set(JAVA_INT, OFF_MC_STATE + M_FLAGS, (inWorld ? MC_IN_WORLD : 0) | (follow ? MC_FOLLOW : 0) | (screenOpen ? MC_SCREEN_OPEN : 0));
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_X, x);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Y, y);
 		s.set(JAVA_DOUBLE, OFF_MC_STATE + M_Z, z);
 		s.set(JAVA_FLOAT, OFF_MC_STATE + M_YAW, yaw);
 		s.set(JAVA_FLOAT, OFF_MC_STATE + M_PITCH, pitch);
 		s.set(JAVA_LONG, OFF_MC_STATE + M_FRAME, ++mcFrame);
+		s.set(JAVA_FLOAT, OFF_MC_STATE + M_SENSITIVITY, sensitivity);
 		VarHandle.releaseFence();
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 2); // even: done
 	}
@@ -302,6 +340,8 @@ public final class CyberLink {
 			out.frame = s.get(JAVA_LONG, OFF_GAME_STATE + G_FRAME);
 			out.cmdAck = s.get(JAVA_INT, OFF_GAME_STATE + G_CMD_ACK);
 			out.cmdResult = s.get(JAVA_INT, OFF_GAME_STATE + G_CMD_RESULT);
+			out.lookYaw = s.get(JAVA_FLOAT, OFF_GAME_STATE + G_LOOK_YAW);
+			out.lookPitch = s.get(JAVA_FLOAT, OFF_GAME_STATE + G_LOOK_PITCH);
 			VarHandle.acquireFence();
 			int seq2 = s.get(JAVA_INT, OFF_GAME_STATE + G_SEQ);
 			if (seq1 == seq2) {
