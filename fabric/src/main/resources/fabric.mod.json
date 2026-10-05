@@ -14,7 +14,8 @@
     "client": ["dev.cybercraft.client.CyberCraftClient"]
   },
   "mixins": [
-    "cybercraft.mixins.json"
+    "cybercraft.mixins.json",
+    { "config": "cybercraft.client.mixins.json", "environment": "client" }
   ],
   "depends": {
     "fabricloader": ">=0.19.5",

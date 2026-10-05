@@ -7,9 +7,11 @@
 //     It starts a little above where the ground is expected to be (from the neighbouring cell nearer to V),
 //     so it finds the street under V rather than the roof above it.
 //   * A box about 1.4 m tall, sitting 0.7 m above that ground (higher than Minecraft's 0.6 m step height),
-//     is tested for overlap with the world. If it touches anything, the cell is marked as an obstacle:
-//     Minecraft makes it solid up to head height. This catches walls, trees, lamp posts and the like,
-//     which vertical rays slip past.
+//     is tested for overlap with the world. If it touches anything, the cell is looked at again in 16
+//     squares of 0.25 m, and each of those that touches something in 4 squares of 0.125 m. The small
+//     squares that touch something are marked as obstacles: Minecraft makes them solid up to head height.
+//     This catches walls, trees, lamp posts and the like, which vertical rays slip past, and the small
+//     squares keep diagonal walls and thin poles from becoming big blocks.
 //
 // Everything goes into the shared ground grid for the Minecraft mod to read.
 
@@ -43,22 +45,25 @@ namespace cybercraft::ground
 		constexpr int kMinCells = 16;
 		constexpr int kMaxCells = 800;
 
-		// Collision groups to try for the ground, in order. Roads, paths and buildings are in "Static"; the
-		// ground itself (grass, dirt, sand) is in "Terrain". A ray only moves on to the next group if the last
-		// found nothing.
+		// Collision groups to shoot the ground ray at. Roads, paths and buildings are in "Static"; the ground
+		// itself (grass, dirt, sand) is in "Terrain". Every group is tried and the HIGHEST hit wins: a ray at
+		// "Static" alone passes straight through the terrain and can land on something buried under it
+		// (foundations, tunnels, pipes), which would put the ground below the real surface.
 		constexpr const char* kGroups[] = { "Static", "Terrain" };
 		constexpr int kGroupCount = sizeof(kGroups) / sizeof(kGroups[0]);
-		constexpr double kRayUp = 2.5;        // start this far above the expected ground
+		constexpr double kRayUp = 1.6;        // start this far above the expected ground (below head height, so an awning doesn't count)
 		constexpr double kRayDown = 4.0;      // and end this far below it
 		constexpr double kRetryRange = 12.0;  // second try, if the first ray found nothing
 
 		// Obstacles: groups tested, and the box tested in each cell (all relative to the ground at the cell's centre).
 		constexpr const char* kObstacleGroups[] = { "Static" };
 		constexpr int kObstacleGroupCount = sizeof(kObstacleGroups) / sizeof(kObstacleGroups[0]);
-		constexpr double kObstacleBottom = 0.7;   // the box starts this far above the ground
-		constexpr double kObstacleBoxHeight = 1.4;
+		constexpr double kObstacleBottom = 0.7;   // the box starts this far above the ground (Minecraft steps up 0.6)
+		constexpr double kObstacleBoxHeight = 1.05;  // and ends 1.75 m above it: a ceiling above that doesn't stop you
+		constexpr double kBodyRadius = 0.45;      // small squares this close to V's feet are never marked, so V is never walled in
 		constexpr double kObstacleHalfWidth = 0.5;
-		constexpr double kObstacleSolidHeight = 2.5;  // a blocked cell is solid up to this far above the ground
+		constexpr int kSub = proto::kObstacleSub;  // a blocked cell is looked at again in kSub x kSub small squares
+		static_assert(kSub == 8, "BlockedSquares is written for 8 x 8");
 
 		RED4ext::v1::PluginHandle g_handle = nullptr;
 		const RED4ext::v1::Sdk* g_sdk = nullptr;
@@ -88,8 +93,9 @@ namespace cybercraft::ground
 
 		// Timings, reported every few seconds.
 		std::chrono::steady_clock::time_point g_lastReport{};
-		std::uint64_t g_cells = 0, g_hits = 0, g_blocked = 0, g_frames = 0;
+		std::uint64_t g_cells = 0, g_hits = 0, g_blocked = 0, g_frames = 0, g_subTests = 0;
 		std::uint64_t g_groupHits[kGroupCount] = {};
+		std::uint64_t g_lowerHits[kGroupCount] = {};  // times a group found something 0.3 m or more below the winner
 		std::uint64_t g_obstacleHits[kObstacleGroupCount] = {};
 		double g_scanMicros = 0.0;
 
@@ -100,14 +106,14 @@ namespace cybercraft::ground
 			return std::uint64_t(bits) | (std::uint64_t(std::uint16_t(a_bx)) << 32) | (std::uint64_t(std::uint16_t(a_bz)) << 48);
 		}
 
-		// Word 0 of a cell's slot is the ground, word 1 the obstacle.
+		// Word 0 of a cell's slot is the ground, word 1 says which cell the obstacle mask in word 2 is for.
 		std::uint64_t* SlotWord(int a_bx, int a_bz, int a_word)
 		{
 			const int n = int(proto::kGroundN);
 			const int ix = ((a_bx % n) + n) % n;
 			const int iz = ((a_bz % n) + n) % n;
 			auto* base = Link::Get().Base();
-			return reinterpret_cast<std::uint64_t*>(base + proto::kOffGround) + (iz * n + ix) * 2 + a_word;
+			return reinterpret_cast<std::uint64_t*>(base + proto::kOffGround) + (iz * n + ix) * 3 + a_word;
 		}
 
 		// The height stored for a cell, or NaN if the slot holds some other cell (or nothing).
@@ -131,10 +137,14 @@ namespace cybercraft::ground
 				.store(PackWord(a_height, std::int16_t(a_bx), std::int16_t(a_bz)), std::memory_order_release);
 		}
 
-		void StoreObstacle(int a_bx, int a_bz, float a_top)
+		// The mask of blocked sub-squares (0: nothing in the way) goes in word 2, then word 1 says which cell it
+		// is for, with a check value so a reader can tell if it caught the two half-way through an update.
+		void StoreObstacle(int a_bx, int a_bz, std::uint64_t a_mask)
 		{
-			std::atomic_ref<std::uint64_t>(*SlotWord(a_bx, a_bz, 1))
-				.store(PackWord(a_top, std::int16_t(a_bx), std::int16_t(a_bz)), std::memory_order_release);
+			const std::uint64_t check = (a_mask ^ (a_mask >> 16) ^ (a_mask >> 32) ^ (a_mask >> 48)) & 0xFFFFu;
+			const std::uint64_t id = check | (std::uint64_t(std::uint16_t(a_bx)) << 32) | (std::uint64_t(std::uint16_t(a_bz)) << 48);
+			std::atomic_ref<std::uint64_t>(*SlotWord(a_bx, a_bz, 2)).store(a_mask, std::memory_order_release);
+			std::atomic_ref<std::uint64_t>(*SlotWord(a_bx, a_bz, 1)).store(id, std::memory_order_release);
 		}
 
 		void BuildOrder()
@@ -243,18 +253,29 @@ namespace cybercraft::ground
 			return g_trace.position.Z;
 		}
 
-		// Tries each collision group in turn; returns the first hit's height, or NaN.
+		// Shoots at every collision group and returns the highest hit's height, or NaN if none hit.
 		float CastAllGroups(double a_x, double a_y, double a_zTop, double a_zBottom)
 		{
+			float hits[kGroupCount];
+			float best = std::nanf("");
+			int bestGroup = -1;
 			for (int i = 0; i < kGroupCount; ++i) {
-				const float height = Cast(kGroups[i], a_x, a_y, a_zTop, a_zBottom);
-				if (!std::isnan(height)) {
-					++g_groupHits[i];
-					g_lastGroundGroup = kGroups[i];
-					return height;
+				hits[i] = Cast(kGroups[i], a_x, a_y, a_zTop, a_zBottom);
+				if (!std::isnan(hits[i]) && (std::isnan(best) || hits[i] > best)) {
+					best = hits[i];
+					bestGroup = i;
 				}
 			}
-			return std::nanf("");
+			if (bestGroup >= 0) {
+				++g_groupHits[bestGroup];
+				g_lastGroundGroup = kGroups[bestGroup];
+				for (int i = 0; i < kGroupCount; ++i) {
+					if (!std::isnan(hits[i]) && best - hits[i] >= 0.3f) {
+						++g_lowerHits[i];
+					}
+				}
+			}
+			return best;
 		}
 
 		// Does a box (half-widths a_hx, a_hy, a_hz, centred at a_x, a_y, a_z) touch anything in this group?
@@ -314,20 +335,83 @@ namespace cybercraft::ground
 			g_sdk->logger->Info(g_handle, "ground: obstacles on");
 		}
 
-		bool CellBlocked(double a_cx, double a_cy, double a_ground)
+		// Does the box of the given half-width, standing on the ground at (a_cx, a_cy), touch anything?
+		bool BoxBlocked(double a_cx, double a_cy, double a_ground, double a_halfWidth, bool a_count)
 		{
 			const double halfHeight = kObstacleBoxHeight * 0.5;
 			const double centreZ = a_ground + kObstacleBottom + halfHeight;
 			for (int i = 0; i < kObstacleGroupCount; ++i) {
-				if (Overlap(kObstacleGroups[i], a_cx, a_cy, centreZ, kObstacleHalfWidth, kObstacleHalfWidth, halfHeight)) {
-					++g_obstacleHits[i];
+				if (Overlap(kObstacleGroups[i], a_cx, a_cy, centreZ, a_halfWidth, a_halfWidth, halfHeight)) {
+					if (a_count) {
+						++g_obstacleHits[i];
+					}
 					return true;
 				}
 			}
 			return false;
 		}
 
-		void ScanCell(int a_bx, int a_bz, int a_dx, int a_dz, double a_vz)
+		// For a cell whose whole box is blocked: which of its small squares are? Bit (sx + 8 * sz), with sx counted
+		// along Minecraft's X and sz along its Z from the low corner of the cell. First the 16 quarter-metre
+		// squares are tested; only the blocked ones are split into 4 squares of 0.125 m and tested again. Squares
+		// within kBodyRadius of V's feet are never marked, so V can never be walled in.
+		std::uint64_t BlockedSquares(int a_bx, int a_bz, double a_ground, double a_vx, double a_vy)
+		{
+			constexpr double kQuad = 1.0 / 4.0;
+			constexpr double kFine = 1.0 / double(kSub);
+			std::uint64_t mask = 0;
+			bool skippedForBody = false;
+
+			for (int qz = 0; qz < 4; ++qz) {
+				for (int qx = 0; qx < 4; ++qx) {
+					const double qxc = a_bx + (qx + 0.5) * kQuad;
+					const double qyc = -(a_bz + (qz + 0.5) * kQuad);  // Cyberpunk Y is -Z
+					++g_subTests;
+					if (!BoxBlocked(qxc, qyc, a_ground, kQuad * 0.5, false)) {
+						continue;
+					}
+
+					std::uint64_t quadMask = 0;
+					std::uint64_t quadAll = 0;
+					for (int cz = 0; cz < 2; ++cz) {
+						for (int cx = 0; cx < 2; ++cx) {
+							const int sx = qx * 2 + cx;
+							const int sz = qz * 2 + cz;
+							const double x = a_bx + (sx + 0.5) * kFine;
+							const double y = -(a_bz + (sz + 0.5) * kFine);
+							if (std::hypot(x - a_vx, y - a_vy) < kBodyRadius) {
+								skippedForBody = true;
+								continue;
+							}
+							const std::uint64_t bit = 1ull << (sx + kSub * sz);
+							quadAll |= bit;
+							++g_subTests;
+							if (BoxBlocked(x, y, a_ground, kFine * 0.5, false)) {
+								quadMask |= bit;
+							}
+						}
+					}
+					// The quarter-metre square touched something but none of its halves did (a thin edge between
+					// them): stay safe and block the whole quarter.
+					mask |= quadMask != 0 ? quadMask : quadAll;
+				}
+			}
+			// The whole cell touched something but no quarter did: block everything except next to V.
+			if (mask == 0 && !skippedForBody) {
+				for (int sz = 0; sz < kSub; ++sz) {
+					for (int sx = 0; sx < kSub; ++sx) {
+						const double x = a_bx + (sx + 0.5) * kFine;
+						const double y = -(a_bz + (sz + 0.5) * kFine);
+						if (std::hypot(x - a_vx, y - a_vy) >= kBodyRadius) {
+							mask |= 1ull << (sx + kSub * sz);
+						}
+					}
+				}
+			}
+			return mask;
+		}
+
+		void ScanCell(int a_bx, int a_bz, int a_dx, int a_dz, double a_vx, double a_vy, double a_vz)
 		{
 			// Where do we expect the ground to be? Best guess first: the cell one step nearer to V (it is looked at
 			// more often, and is on the same level as V), then this cell's own last height, then V's feet.
@@ -341,6 +425,7 @@ namespace cybercraft::ground
 				const int sz = (a_dz > 0) - (a_dz < 0);
 				expected = StoredHeight(a_bx - sx, a_bz - sz);
 			}
+			const bool neighbourHadGround = !std::isnan(expected);
 			if (std::isnan(expected)) {
 				expected = StoredHeight(a_bx, a_bz);
 			}
@@ -356,11 +441,22 @@ namespace cybercraft::ground
 			if (std::isnan(height)) {
 				height = CastAllGroups(cx, cy, expected + kRetryRange, expected - kRetryRange);
 			}
+			// Next to ground but found none: a ray can slip through a seam between two collision triangles. Try
+			// again a little off-centre before calling the cell empty.
+			if (std::isnan(height) && neighbourHadGround) {
+				static const double kOffsets[4][2] = { { 0.3, 0.3 }, { -0.3, 0.3 }, { 0.3, -0.3 }, { -0.3, -0.3 } };
+				for (const auto& o : kOffsets) {
+					height = CastAllGroups(cx + o[0], cy + o[1], expected + kRayUp, expected - kRayDown);
+					if (!std::isnan(height)) {
+						break;
+					}
+				}
+			}
 
 			++g_cells;
 			if (std::isnan(height)) {
 				StoreHeight(a_bx, a_bz, proto::kNoGround);
-				StoreObstacle(a_bx, a_bz, proto::kNoGround);
+				StoreObstacle(a_bx, a_bz, 0);
 				return;
 			}
 			++g_hits;
@@ -370,13 +466,14 @@ namespace cybercraft::ground
 				Calibrate(cx, cy, height);
 			}
 
-			// Anything in the way? (Not in V's own cell: V is standing in it.)
-			float obstacleTop = proto::kNoGround;
-			if (g_obstaclesOn && !(a_dx == 0 && a_dz == 0) && CellBlocked(cx, cy, height)) {
-				obstacleTop = height + float(kObstacleSolidHeight);
+			// Anything in the way? (Including in V's own cell: a wall can be inside it. The small squares right
+			// next to V's feet are left out in BlockedSquares.)
+			std::uint64_t mask = 0;
+			if (g_obstaclesOn && BoxBlocked(cx, cy, height, kObstacleHalfWidth, true)) {
+				mask = BlockedSquares(a_bx, a_bz, height, a_vx, a_vy);
 				++g_blocked;
 			}
-			StoreObstacle(a_bx, a_bz, obstacleTop);
+			StoreObstacle(a_bx, a_bz, mask);
 		}
 	}
 
@@ -418,7 +515,7 @@ namespace cybercraft::ground
 		while (done < kMaxCells) {
 			const CellOffset& o = g_order[g_next];
 			g_next = (g_next + 1) % g_order.size();
-			ScanCell(centreBx + o.dx, centreBz + o.dz, o.dx, o.dz, a_vz);
+			ScanCell(centreBx + o.dx, centreBz + o.dz, o.dx, o.dz, a_vx, a_vy, a_vz);
 			++done;
 			if (done >= kMinCells && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > kBudgetMs) {
 				break;
@@ -435,15 +532,18 @@ namespace cybercraft::ground
 					static_cast<unsigned long long>(g_cells), static_cast<unsigned long long>(g_cells / std::max<std::uint64_t>(1, g_frames)),
 					100.0 * double(g_hits) / double(g_cells), 100.0 * double(g_blocked) / double(std::max<std::uint64_t>(1, g_hits)),
 					g_scanMicros / double(std::max<std::uint64_t>(1, g_frames)), g_scanMicros / double(g_cells));
+				g_sdk->logger->InfoF(g_handle, "  small-square tests: %llu", static_cast<unsigned long long>(g_subTests));
 				for (int i = 0; i < kGroupCount; ++i) {
-					g_sdk->logger->InfoF(g_handle, "  ground hits in group \"%s\": %llu", kGroups[i], static_cast<unsigned long long>(g_groupHits[i]));
+					g_sdk->logger->InfoF(g_handle, "  group \"%s\": was the highest hit %llu times; also found something 0.3 m or more BELOW the ground %llu times",
+						kGroups[i], static_cast<unsigned long long>(g_groupHits[i]), static_cast<unsigned long long>(g_lowerHits[i]));
 				}
 				for (int i = 0; i < kObstacleGroupCount; ++i) {
 					g_sdk->logger->InfoF(g_handle, "  obstacles found in group \"%s\": %llu", kObstacleGroups[i], static_cast<unsigned long long>(g_obstacleHits[i]));
 				}
 			}
-			g_cells = g_hits = g_blocked = g_frames = 0;
+			g_cells = g_hits = g_blocked = g_frames = g_subTests = 0;
 			std::fill(std::begin(g_groupHits), std::end(g_groupHits), 0ull);
+			std::fill(std::begin(g_lowerHits), std::end(g_lowerHits), 0ull);
 			std::fill(std::begin(g_obstacleHits), std::end(g_obstacleHits), 0ull);
 			g_scanMicros = 0.0;
 		}

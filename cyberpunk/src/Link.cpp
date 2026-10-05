@@ -54,7 +54,7 @@ namespace cybercraft
 			std::memcpy(&bits, &noGround, sizeof(bits));
 			const std::uint64_t empty = std::uint64_t(bits) | (std::uint64_t(0x8000) << 32) | (std::uint64_t(0x8000) << 48);
 			auto* slots = reinterpret_cast<std::uint64_t*>(base_ + proto::kOffGround);
-			for (std::uint32_t i = 0; i < proto::kGroundN * proto::kGroundN * 2; ++i) {
+			for (std::uint32_t i = 0; i < proto::kGroundN * proto::kGroundN * 3; ++i) {
 				slots[i] = empty;
 			}
 		}

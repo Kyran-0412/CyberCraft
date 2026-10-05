@@ -205,11 +205,32 @@ public final class CyberLink {
 	}
 
 	/**
-	 * The Y of the top of whatever is standing in the way in the Minecraft block column (bx, bz) (a wall, tree
-	 * or post), or {@code Float.NEGATIVE_INFINITY} if nothing is, or {@code NaN} if that cell hasn't been looked at.
+	 * Which 0.125 m sub-squares of the Minecraft block column (bx, bz) have something standing in the way (a
+	 * wall, tree or post): bit {@code sx + 8 * sz}, counted from the cell's low corner. 0 if nothing is in the
+	 * way or the cell hasn't been looked at.
 	 */
-	public static float obstacleTop(int bx, int bz) {
-		return slotValue(bx, bz, 1, Float.NaN);
+	public static long obstacleMask(int bx, int bz) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return 0;
+		}
+		int ix = Math.floorMod(bx, GROUND_N);
+		int iz = Math.floorMod(bz, GROUND_N);
+		long slot = OFF_GROUND + ((long) iz * GROUND_N + ix) * 3 * 8L;
+		for (int attempt = 0; attempt < 4; attempt++) {
+			long id = s.get(JAVA_LONG, slot + 8);
+			if ((short) (id >>> 32) != (short) bx || (short) (id >>> 48) != (short) bz) {
+				return 0; // the slot holds some other cell
+			}
+			VarHandle.acquireFence();
+			long mask = s.get(JAVA_LONG, slot + 16);
+			long check = (mask ^ (mask >>> 16) ^ (mask >>> 32) ^ (mask >>> 48)) & 0xFFFFL;
+			if (check == (id & 0xFFFFL)) {
+				return mask;
+			}
+			// The plugin was in the middle of updating this cell: look again.
+		}
+		return 0;
 	}
 
 	private static float slotValue(int bx, int bz, int word, float unknown) {
@@ -219,7 +240,7 @@ public final class CyberLink {
 		}
 		int ix = Math.floorMod(bx, GROUND_N);
 		int iz = Math.floorMod(bz, GROUND_N);
-		long v = s.get(JAVA_LONG, OFF_GROUND + (((long) iz * GROUND_N + ix) * 2 + word) * 8L);
+		long v = s.get(JAVA_LONG, OFF_GROUND + (((long) iz * GROUND_N + ix) * 3 + word) * 8L);
 		if ((short) (v >>> 32) != (short) bx || (short) (v >>> 48) != (short) bz) {
 			return unknown; // the slot holds some other cell
 		}

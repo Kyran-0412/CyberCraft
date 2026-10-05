@@ -6,9 +6,9 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 5;
+	public static final int VERSION = 7;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
-	public static final long MAPPING_BYTES = 0x11000;
+	public static final long MAPPING_BYTES = 0x19000;
 
 	// ---- header @0x0 ----
 	public static final long OFF_HEADER = 0x0;
@@ -61,12 +61,16 @@ public final class Proto {
 	public static final int RESULT_FAILED = 2;
 
 	// ---- ground heights and obstacles @0x1000 (Cyberpunk -> Minecraft) ----
-	// A GROUND_N x GROUND_N torus of 16-byte slots, one per 1 m cell (= Minecraft block column), each two 64-bit words:
+	// A GROUND_N x GROUND_N torus of 24-byte slots, one per 1 m cell (= Minecraft block column), each three 64-bit words:
 	//   word 0 (ground):   bits 0..31 float height (Minecraft Y), bits 32..47 int16 bx, bits 48..63 int16 bz.
-	//   word 1 (obstacle): bits 0..31 float Y of the obstacle's top (or "none"), then bx and bz as above.
+	//   word 1 (id):       bits 0..15 check (the mask's four 16-bit quarters XORed), then bx and bz as above.
+	//   word 2 (obstacle): a 64-bit mask of blocked 0.125 m sub-squares (bit sx + 8 * sz, from the cell's low corner;
+	//                      0 = nothing in the way).
 	public static final long OFF_GROUND = 0x1000;
 	public static final int GROUND_N = 64;
 	public static final int GROUND_RADIUS = 28; // cells scanned around V
+	public static final int OBSTACLE_SUB = 8; // sub-squares per cell side
+	public static final double OBSTACLE_HEIGHT = 2.5; // how tall a blocked sub-square is
 
 	private Proto() {
 	}

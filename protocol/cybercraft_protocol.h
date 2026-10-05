@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 5;
+	inline constexpr std::uint32_t kVersion = 7;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -29,7 +29,7 @@ namespace cybercraft::proto
 	inline constexpr std::uint64_t kOffGround = 0x1000;   // Cyberpunk -> Minecraft: ground heights, see GroundSlot
 	inline constexpr std::uint32_t kGroundN = 64;         // the ground grid is kGroundN x kGroundN cells (a torus)
 	inline constexpr std::int32_t  kGroundRadius = 28;    // cells scanned around V (must be < kGroundN / 2)
-	inline constexpr std::uint64_t kGroundSlotBytes = 16; // two 64-bit words per cell
+	inline constexpr std::uint64_t kGroundSlotBytes = 24; // three 64-bit words per cell
 	inline constexpr std::uint64_t kMappingBytes = kOffGround + std::uint64_t(kGroundN) * kGroundN * kGroundSlotBytes;
 
 	// ---- header @0x0 ------------------------------------------------------------------------
@@ -106,18 +106,26 @@ namespace cybercraft::proto
 	// Cyberpunk looks at the street around V and stores what it finds, one 1 m x 1 m cell (= one Minecraft
 	// block column) per slot. The grid wraps around (a torus): the cell (bx, bz) lives in slot
 	// ((bz mod N) * N + (bx mod N)), and each word says which cell it currently holds, so Minecraft can tell
-	// fresh data from old data left over from another place. Each slot is two 64-bit words, each written
+	// fresh data from old data left over from another place. Each slot is three 64-bit words, each written
 	// atomically, so no lock is needed.
 	//
 	//   word 0  (the ground)
 	//     bits  0..31  float  height of the ground surface (Minecraft Y = Cyberpunk Z), or kNoGround
 	//     bits 32..47  int16  bx   Minecraft block X of the cell
 	//     bits 48..63  int16  bz   Minecraft block Z of the cell
-	//   word 1  (anything standing on it that is in the way)
-	//     bits  0..31  float  Y of the top of the obstacle, or kNoGround for "nothing in the way"
+	//   word 1  (says which cell the obstacle mask in word 2 belongs to)
+	//     bits  0..15  check  the mask's four 16-bit quarters XORed together (to catch a half-written pair)
+	//     bits 16..31  unused
 	//     bits 32..47  int16  bx
 	//     bits 48..63  int16  bz
+	//   word 2  (anything standing on the ground that is in the way)
+	//     a 64-bit mask of the cell's 8 x 8 sub-squares (0.125 m each): bit (sx + 8 * sz), sx along X and sz along
+	//     Z, both counted from the cell's low corner. 0: nothing in the way.
+	// A blocked sub-square is solid from the ground up to kObstacleHeight above the cell's ground height.
+	// Writers store word 2 first, then word 1; readers read word 1, then word 2, and retry if the check is wrong.
 	//
 	// Cell (bx, bz) is the square X in [bx, bx+1), Z in [bz, bz+1) in Minecraft coordinates.
 	inline constexpr float kNoGround = -1.0e30f;
+	inline constexpr int   kObstacleSub = 8;            // sub-squares per cell side
+	inline constexpr float kObstacleHeight = 2.5f;      // how tall a blocked sub-square is
 }

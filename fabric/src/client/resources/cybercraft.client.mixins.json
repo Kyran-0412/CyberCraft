@@ -1,0 +1,9 @@
+{
+  "required": true,
+  "package": "dev.cybercraft.client.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "EntityCollideMixin"
+  ],
+  "injectors": { "defaultRequire": 1 }
+}

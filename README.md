@@ -58,8 +58,12 @@ City's real roads and terrain with smooth slopes and are stopped by obstacles. Y
 V copies your movement and the way you look; click the Minecraft window and use WASD and the mouse.
 `/ccstop` ends it. `/ccblocks` also shows the ground as real blocks, a debugging view of what the scan found.
 
-Obstacles are blocky: a thin pole is a 1 m x 1 m pillar, a blocked cell is solid up to 2.5 m, and tree leaves
-(which have no collision in the game) are not solid. Bridges and other levels are only seen at V's own height.
+Obstacles are found in 0.125 m squares, so a thin pole is a thin pillar and diagonal walls are fine staircases;
+anything blocked is solid up to 2.5 m, and tree leaves (which have no collision in the game) are not solid. If the
+player ever ends up inside the ground or an obstacle, they are moved back out.
+
+Players collide with the ground through a smooth collider (a port of the idea in SkyCraft's TriCollider), so slopes
+are followed exactly and walls are slid along. `/cccollider` switches to the older block-style collision and back. Bridges and other levels are only seen at V's own height.
 
 ## Credits
 

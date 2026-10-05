@@ -5,6 +5,7 @@ import dev.cybercraft.CyberCraft;
 import dev.cybercraft.link.CyberLink;
 import dev.cybercraft.link.Proto;
 import dev.cybercraft.world.GroundCollision;
+import dev.cybercraft.world.SmoothCollider;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
@@ -14,6 +15,7 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 public final class CyberCraftClient implements ClientModInitializer {
@@ -66,6 +68,15 @@ public final class CyberCraftClient implements ClientModInitializer {
 			}));
 			dispatcher.register(ClientCommands.literal("ccstop").executes(c -> {
 				c.getSource().sendFeedback(Component.literal(stopFollowing()));
+				return 1;
+			}));
+			// /cccollider  switches between smooth collision (the default) and block-style collision (the old way).
+			dispatcher.register(ClientCommands.literal("cccollider").executes(c -> {
+				boolean smooth = !GroundCollision.smoothPlayers();
+				GroundCollision.setSmoothPlayers(smooth);
+				c.getSource().sendFeedback(Component.literal(smooth
+					? "CyberCraft: smooth collision on (the default)."
+					: "CyberCraft: block-style collision on (the old way)."));
 				return 1;
 			}));
 			// /ccblocks  shows the ground as real blocks too (a debugging view of what Cyberpunk found).
@@ -165,6 +176,45 @@ public final class CyberCraftClient implements ClientModInitializer {
 		}
 	}
 
+	private static int pushCount;
+
+	private static void keepOutOfGround(Minecraft client, LocalPlayer player) {
+		double x = player.getX();
+		double y = player.getY();
+		double z = player.getZ();
+		if (GroundCollision.smoothPlayers()) {
+			AABB box = player.getBoundingBox();
+			double[] fix = SmoothCollider.depenetrate(
+				(box.minX + box.maxX) * 0.5, box.minY, (box.minZ + box.maxZ) * 0.5, box.getXsize() * 0.5, box.getYsize(), player.maxUpStep()
+			);
+			if (fix == null) {
+				return;
+			}
+			x += fix[0];
+			y += fix[1];
+			z += fix[2];
+		} else {
+			Vec3 push = GroundCollision.pushOut(player.getBoundingBox());
+			if (push != null) {
+				x += push.x;
+				y += push.y;
+				z += push.z;
+			} else {
+				// Fell through the ground without touching anything (no ground shape deep enough)? Lift back onto it.
+				// Only a modest distance below: further down is a different level (under a bridge, say), not a clip.
+				float ground = CyberLink.groundHeight((int) Math.floor(x), (int) Math.floor(z));
+				if (Float.isNaN(ground) || Float.isInfinite(ground) || y > ground - 0.6 || y < ground - 3.0) {
+					return;
+				}
+				y = ground + 0.05;
+			}
+		}
+		if (pushCount++ % 40 == 0) {
+			CyberCraft.LOG.info("CyberCraft: moved the player out of the ground or an obstacle ({} times so far)", pushCount);
+		}
+		teleportPlayer(client, x, y, z);
+	}
+
 	private static void tick(Minecraft client) {
 		CyberLink.poll();
 
@@ -219,6 +269,13 @@ public final class CyberCraftClient implements ClientModInitializer {
 				GroundCollision.setEnabled(false);
 				CyberCraft.LOG.warn("CyberCraft: gave up waiting for the ground under V. Is V standing on ground, and is the plugin's log showing ground rays?");
 			}
+		}
+
+		// Safety net: Minecraft only stops the player moving *into* the ground and obstacles. If the player ends up
+		// inside one anyway (an obstacle found after they walked into it, a gap in the scan), they would walk
+		// through everything, so move them back out.
+		if (following && player != null) {
+			keepOutOfGround(client, player);
 		}
 
 		// Tell Cyberpunk where Minecraft's player is (every tick). With follow off it just says "don't move V".

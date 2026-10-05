@@ -6,7 +6,9 @@ import dev.cybercraft.world.GroundCollision;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.BlockCollisions;
 import net.minecraft.world.level.CollisionGetter;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.EntityCollisionContext;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
@@ -30,6 +32,9 @@ public abstract class BlockCollisionsMixin {
 		CollisionContext context, BlockState state, CollisionGetter level, BlockPos pos, Operation<VoxelShape> original
 	) {
 		VoxelShape blockShape = original.call(context, state, level, pos);
+		if (GroundCollision.smoothPlayers() && context instanceof EntityCollisionContext entityContext && entityContext.getEntity() instanceof Player) {
+			return blockShape; // players collide with the ground through SmoothCollider instead
+		}
 		VoxelShape ground = GroundCollision.shapeAt(pos);
 		if (ground == null) {
 			return blockShape;
