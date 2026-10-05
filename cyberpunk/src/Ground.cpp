@@ -210,12 +210,20 @@ namespace cybercraft::ground
 
 		void ScanCell(int a_bx, int a_bz, int a_dx, int a_dz, double a_vz)
 		{
-			// Where do we expect the ground to be? Last scan of this cell, else the cell one step nearer to V, else V's feet.
-			float expected = StoredHeight(a_bx, a_bz);
-			if (std::isnan(expected)) {
+			// Where do we expect the ground to be? Best guess first: the cell one step nearer to V (it is looked at
+			// more often, and is on the same level as V), then this cell's own last height, then V's feet.
+			// (This cell's old height can be stale: a bridge deck found earlier would otherwise keep being found
+			// again after V has gone down to the road under it.)
+			float expected = std::nanf("");
+			if (a_dx == 0 && a_dz == 0) {
+				expected = float(a_vz);
+			} else {
 				const int sx = (a_dx > 0) - (a_dx < 0);
 				const int sz = (a_dz > 0) - (a_dz < 0);
 				expected = StoredHeight(a_bx - sx, a_bz - sz);
+			}
+			if (std::isnan(expected)) {
+				expected = StoredHeight(a_bx, a_bz);
 			}
 			if (std::isnan(expected)) {
 				expected = float(a_vz);

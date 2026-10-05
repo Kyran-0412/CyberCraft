@@ -3,6 +3,7 @@ package dev.cybercraft.client;
 import static dev.cybercraft.link.Proto.GROUND_RADIUS;
 
 import dev.cybercraft.CyberCraft;
+import dev.cybercraft.link.CyberLink;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
