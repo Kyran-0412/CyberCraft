@@ -34,6 +34,12 @@ namespace cybercraft::mapping
 		}
 	}
 
+	std::filesystem::path PluginFolder()
+	{
+		const std::wstring file = FilePath();
+		return file.empty() ? std::filesystem::path{} : std::filesystem::path(file).parent_path();
+	}
+
 	double Offset()
 	{
 		return g_offset;

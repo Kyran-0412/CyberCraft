@@ -7,6 +7,7 @@
 // log for this plugin:   <game folder>\red4ext\logs\CyberCraft.log
 
 #include "Camera.hpp"
+#include "Collision.hpp"
 #include "Depth.hpp"
 #include "Ground.hpp"
 #include "Input.hpp"
@@ -175,6 +176,13 @@ bool TeleportPlayer(RED4ext::Handle<RED4ext::IScriptable>& aPlayer, double aX, d
 void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RED4ext::IScriptable>& aPlayer)
 {
     auto& link = cybercraft::Link::Get();
+
+    if (aCommand.kind == cybercraft::proto::kCmdTestBox)
+    {
+        cybercraft::collision::Command(static_cast<int>(aCommand.x), static_cast<int>(aCommand.y));
+        link.AckCommand(aCommand.seq, true);
+        return;
+    }
 
     if (aCommand.kind == cybercraft::proto::kCmdAlignGround)
     {
@@ -532,7 +540,8 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
         g_hadPlayer = true;
     }
 
-    cybercraft::camera::Update(player); // publishes the game's camera for Minecraft to draw its blocks through
+    cybercraft::camera::Update(player);
+    cybercraft::collision::Update(); // publishes the game's camera for Minecraft to draw its blocks through
 
     if (!g_lookedUpFunction)
     {
@@ -622,6 +631,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         cybercraft::input::Init(aHandle, aSdk);
         cybercraft::camera::Init(aHandle, aSdk);
         cybercraft::depth::Init(aHandle, aSdk);
+        cybercraft::collision::Init(aHandle, aSdk);
         cybercraft::mapping::Load();
         aSdk->logger->InfoF(aHandle, "vertical offset between the game and Minecraft: %.3f", cybercraft::mapping::Offset());
 
@@ -662,7 +672,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"CyberCraft";
     aInfo->author = L"Kyran";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 16, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 17, 0);
     aInfo->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

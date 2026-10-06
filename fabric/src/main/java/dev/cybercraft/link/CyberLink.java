@@ -381,6 +381,24 @@ public final class CyberLink {
 		return value < -1.0e29f ? Float.NEGATIVE_INFINITY : value;
 	}
 
+	/** Asks Cyberpunk to run the collision experiment (action 0: dump what is on offer, 1: spawn a test object, 2: remove them, 3: give it a collider (variant picks how it is filled in), 4: attach it). Returns the command's number (0: link down). */
+	public static int sendTestBox(int action, int variant) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return 0;
+		}
+		int base = s.get(JAVA_INT, OFF_MC_COMMAND + C_SEQ) & ~1;
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 1);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_KIND, CMD_TEST_BOX);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_X, (double) action);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Y, (double) variant);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Z, 0.0);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 2);
+		return base + 2;
+	}
+
 	/** Asks Cyberpunk to set the vertical offset so the street under V lands on a whole-number height. Returns the command's number (0: link down). */
 	public static int sendAlignGround() {
 		MemorySegment s = shm;

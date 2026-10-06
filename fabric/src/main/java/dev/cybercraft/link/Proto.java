@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 19;
+	public static final int VERSION = 20;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -67,6 +67,7 @@ public final class Proto {
 
 	public static final int CMD_TELEPORT = 1;
 	public static final int CMD_ALIGN_GROUND = 2;
+	public static final int CMD_TEST_BOX = 3; // the collision experiment: x = 0 dump what is on offer, 1 spawn a test object, 2 remove them
 
 	public static final int RESULT_NONE = 0;
 	public static final int RESULT_OK = 1;

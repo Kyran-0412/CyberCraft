@@ -54,3 +54,6 @@ The way Minecraft's picture is split into a world layer (colour and depth, copie
 > DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 > OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
 > OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Codeware (MIT, psiberx)
+The collider script (cyberpunk/scripts/Colliders.reds) uses Codeware's callback, static entity and reflection scripting API, and follows its documentation on adding components while an entity is assembled. https://github.com/psiberx/cp2077-codeware

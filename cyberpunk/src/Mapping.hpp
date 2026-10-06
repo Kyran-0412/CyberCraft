@@ -1,5 +1,7 @@
 #pragma once
 
+#include <filesystem>
+
 namespace cybercraft::mapping
 {
 	// Cyberpunk's height (Z) and Minecraft's height (Y) differ by this much: Minecraft Y = Cyberpunk Z - Offset().
@@ -13,6 +15,9 @@ namespace cybercraft::mapping
 
 	// Sets it (and remembers it).
 	void SetOffset(double a_offset);
+
+	// The folder the plugin's DLL is in (red4ext\\plugins\\CyberCraft), where its small settings files live.
+	std::filesystem::path PluginFolder();
 
 	// Reads the remembered offset from the plugin's folder (call once at start).
 	void Load();

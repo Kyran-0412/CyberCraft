@@ -1,6 +1,7 @@
 package dev.cybercraft.client;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import dev.cybercraft.CyberCraft;
 import dev.cybercraft.link.CyberLink;
 import dev.cybercraft.link.Proto;
@@ -203,6 +204,21 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: aiming the blocks at the camera %.0f ms behind the newest.", warpDelayMs)));
 					return 1;
 				})));
+			// /cctestbox [dump|clear]  the collision experiment: no argument spawns one invisible 2 x 2 x 2 m collision box three metres ahead (made by the script
+			// Colliders.reds in the game's r6\\scripts\\CyberCraft folder); "dump" writes what the game and Codeware offer to CyberCraft.log; "clear" removes the boxes.
+			dispatcher.register(ClientCommands.literal("cctestbox")
+				.executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendTestBox(1, 0, "Asking Cyberpunk for a 2 x 2 x 2 m invisible collision box three metres ahead, on the block grid. CyberCraft.log says which blocks it fills: build a 2 x 2 x 2 of blocks there to see it, then drive a car into it.")));
+					return 1;
+				})
+				.then(ClientCommands.literal("dump").executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendTestBox(0, 0, "Asking Cyberpunk to write what it offers for spawning objects and colliders to CyberCraft.log.")));
+					return 1;
+				}))
+				.then(ClientCommands.literal("clear").executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendTestBox(2, 0, "Removing the test objects.")));
+					return 1;
+				})));
 			// /ccterrain  turns aiming at Night City itself (to build on its streets and walls) off and on.
 			dispatcher.register(ClientCommands.literal("ccterrain").executes(c -> {
 				TerrainPick.setEnabled(!TerrainPick.enabled());
@@ -271,6 +287,19 @@ public final class CyberCraftClient implements ClientModInitializer {
 		pendingSeq = seq;
 		CyberCraft.LOG.info("CyberCraft: asked Cyberpunk to teleport V by east={} north={} up={} (command {})", east, north, up, seq);
 		return String.format("CyberCraft: asked Cyberpunk to move V by east %.1f, north %.1f, up %.1f m. Check the log for the result.", east, north, up);
+	}
+
+	private static String sendTestBox(int action, int variant, String message) {
+		if (!CyberLink.active()) {
+			return "CyberCraft: Cyberpunk isn't linked. Start the game with the plugin installed.";
+		}
+		if (!CyberLink.readGameState(STATE) || !STATE.inGame()) {
+			return "CyberCraft: Cyberpunk is linked, but no save is loaded.";
+		}
+		if (CyberLink.sendTestBox(action, variant) == 0) {
+			return "CyberCraft: couldn't send the command.";
+		}
+		return "CyberCraft: " + message;
 	}
 
 	/** Asks Cyberpunk to line the street under V up with a whole-number height. */

@@ -1,4 +1,4 @@
-add_library(CyberCraft SHARED src/main.cpp src/Link.cpp src/Link.hpp src/Ground.cpp src/Ground.hpp src/Overlay.cpp src/Overlay.hpp src/Input.cpp src/Input.hpp src/Camera.cpp src/Camera.hpp src/Mapping.cpp src/Mapping.hpp src/Depth.cpp src/Depth.hpp)
+add_library(CyberCraft SHARED src/main.cpp src/Link.cpp src/Link.hpp src/Ground.cpp src/Ground.hpp src/Overlay.cpp src/Overlay.hpp src/Input.cpp src/Input.hpp src/Camera.cpp src/Camera.hpp src/Mapping.cpp src/Mapping.hpp src/Depth.cpp src/Depth.hpp src/Collision.cpp src/Collision.hpp)
 
 target_include_directories(CyberCraft PRIVATE "${CMAKE_SOURCE_DIR}/protocol")
 target_link_libraries(CyberCraft PRIVATE RED4ext::SDK d3d12 dxgi d3dcompiler)
@@ -13,6 +13,8 @@ if(CYBERCRAFT_GAME_DIR)
     TARGET CyberCraft POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CYBERCRAFT_PLUGIN_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:CyberCraft>" "${CYBERCRAFT_PLUGIN_DIR}/"
-    COMMENT "Copying CyberCraft.dll to ${CYBERCRAFT_PLUGIN_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CYBERCRAFT_GAME_DIR}/r6/scripts/CyberCraft"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Colliders.reds" "${CYBERCRAFT_GAME_DIR}/r6/scripts/CyberCraft/"
+    COMMENT "Copying CyberCraft.dll to ${CYBERCRAFT_PLUGIN_DIR} and Colliders.reds to ${CYBERCRAFT_GAME_DIR}/r6/scripts/CyberCraft"
   )
 endif()

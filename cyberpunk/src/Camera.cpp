@@ -133,6 +133,7 @@ namespace cybercraft::camera
 			int shiftSamples = 0;
 		} g_stats;
 
+		struct { bool valid = false; double x = 0, y = 0, z = 0, fx = 0, fy = 1, fz = 0; } g_lastPose;
 		int g_frameCount = 0;
 		bool g_loggedPublish = false;
 
@@ -605,6 +606,17 @@ namespace cybercraft::camera
 		}
 	}
 
+	bool LastPose(double& a_x, double& a_y, double& a_z, double& a_fx, double& a_fy, double& a_fz)
+	{
+		a_x = g_lastPose.x;
+		a_y = g_lastPose.y;
+		a_z = g_lastPose.z;
+		a_fx = g_lastPose.fx;
+		a_fy = g_lastPose.fy;
+		a_fz = g_lastPose.fz;
+		return g_lastPose.valid;
+	}
+
 	void Reset()
 	{
 		g_system = nullptr;
@@ -633,6 +645,7 @@ namespace cybercraft::camera
 			return;
 		}
 		++g_frameCount;
+		g_lastPose = { true, transformPose.pos.x, transformPose.pos.y, transformPose.pos.z, transformPose.fwd.x, transformPose.fwd.y, transformPose.fwd.z };
 		const auto now = std::chrono::steady_clock::now();
 		const bool logNow = now - g_stats.since >= std::chrono::seconds(2);
 

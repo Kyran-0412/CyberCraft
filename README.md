@@ -85,6 +85,12 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   world is, first from the change in view direction, then correcting for the camera having moved using the picture's depth. The hand, hotbar and
   screens are a separate layer and are not moved. `/ccdelay <ms>` sets how far behind the newest published camera the game's own picture is (what the
   blocks are aimed at): if the blocks swing ahead of the world when you turn, raise it; if they trail, lower it. Needs prediction (`/ccpredict`) at 0.
+* **The collision experiment** (`/cctestbox`). Blocks are only a picture; for cars and people to be stopped by them the game needs a physical object where
+  they are. A small script, `cyberpunk\scripts\Colliders.reds` (the build copies it to `<game>\r6\scripts\CyberCraft\`; needs Codeware and redscript), spawns an empty
+  entity and gives it a box collider at the one moment the game allows it, while the entity is being set up. `/cctestbox` asks for a 2 x 2 x 2 m invisible box three
+  metres ahead, on the block grid (`CyberCraft.log` says which blocks it fills); `/cctestbox clear` removes it; `/cctestbox dump` writes what the game offers to the log.
+  Each step is also written to `collision-trace.txt` next to the plugin and flushed at once, so after a crash its last line says where. The empty entity template is
+  `base\spawner\empty_entity.ent`, which comes with World Builder (to be replaced by our own, or by permission from its author).
 * **Building on Night City** (`/ccterrain`, on by default). Night City isn't made of blocks, so Minecraft can't aim at it. `TerrainPick` marches the
   camera's ray over the same smooth ground surface and obstacle squares that the player collides with, and answers with the hit Minecraft would
   get from a real block: a point, a face, and the empty cell just outside the surface, which Minecraft then fills when you place a block. Nothing

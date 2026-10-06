@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 19;
+	inline constexpr std::uint32_t kVersion = 20;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -121,6 +121,7 @@ namespace cybercraft::proto
 		kCmdNone = 0,
 		kCmdTeleport = 1,  // move V to (x, y, z), Minecraft coordinates
 		kCmdAlignGround = 2,  // set the vertical offset so that the street under V lands on a whole-number height
+		kCmdTestBox = 3,      // the collision experiment (x: 0 dump what is on offer, 1 spawn a test object, 2 remove them)
 	};
 
 	enum CommandResult : std::uint32_t

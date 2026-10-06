@@ -15,6 +15,9 @@ namespace cybercraft::camera
 	// Which camera source to publish (CamSource in the protocol). Set from what Minecraft asks for.
 	void SetSource(int a_source);
 
+	// The camera as last read, in the game's own coordinates (X east, Y north, Z up): position and forward direction. False if none yet.
+	bool LastPose(double& a_x, double& a_y, double& a_z, double& a_fx, double& a_fy, double& a_fz);
+
 	// Forget everything cached from the old world (loading screen, main menu).
 	void Reset();
 }
