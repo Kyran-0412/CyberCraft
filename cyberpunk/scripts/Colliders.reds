@@ -1,16 +1,17 @@
-// CyberCraft: invisible physics boxes in Night City, so that cars and people are stopped by what you build.
+// CyberCraft: invisible physics boxes in Night City, so that cars are stopped by what you build in Minecraft.
 //
-// The plugin asks for a box by calling CyberCraftSpawnBox. This script spawns an empty entity, and gives it its collider at the one moment the game
-// allows it: while the entity is being set up (Codeware's "Entity/Initialize" event). A component added to an entity that is already finished
-// is never initialised, and the game crashes when the entity is attached.
+// The plugin asks for each box by calling CyberCraftColliders.SpawnBox. This script spawns an empty entity and gives it its collider at the one
+// moment the game allows it: while the entity is being set up (Codeware's "Entity/Initialize" event). A component added to an entity that is
+// already finished is never initialised, and the game crashes when the entity is attached. (The plugin removes boxes again by itself.)
 //
-// Install: copy this file to <game>\r6\scripts\CyberCraft\Colliders.reds (needs Codeware, which needs redscript).
-// How a collider is made follows the game's own structure (and what Codeware's documentation says about adding components); the filter
-// numbers are those of the game's "World Static" collision preset.
+// Install: <game>\r6\scripts\CyberCraft\Colliders.reds (the build copies it). Needs Codeware, which needs redscript.
+//
+// The empty entity is base\spawner\empty_entity.ent, which comes with World Builder (Nexus Mods); it is the only thing CyberCraft takes from it.
+// The collider is built the way the game structures it (and the way Codeware's documentation says to add components). The filter numbers are the
+// ones that make a solid static box that blocks vehicles, the player and bullets. The preset name is ignored by the game here: the numbers decide.
 
 public class CyberCraftColliderRequest extends IScriptable {
   public let halfExtents: Vector3;
-  public let material: CName;
 }
 
 public class CyberCraftColliderService extends ScriptableService {
@@ -26,7 +27,6 @@ public class CyberCraftColliderService extends ScriptableService {
   public func SpawnBox(position: Vector4, halfExtents: Vector3) -> EntityID {
     let request = new CyberCraftColliderRequest();
     request.halfExtents = halfExtents;
-    request.material = n"concrete.physmat";
     ArrayPush(this.m_requests, request);
 
     let spec = new StaticEntitySpec();
@@ -34,11 +34,6 @@ public class CyberCraftColliderService extends ScriptableService {
     spec.position = position;
     spec.tags = [n"CyberCraftCollider", StringToName("cybercraft_box_" + ToString(ArraySize(this.m_requests) - 1))];
     return GameInstance.GetStaticEntitySystem().SpawnEntity(spec);
-  }
-
-  public func Clear() {
-    GameInstance.GetStaticEntitySystem().DespawnTagged(n"CyberCraftCollider");
-    ArrayClear(this.m_requests);
   }
 
   private func FindRequestIndex(id: EntityID) -> Int32 {
@@ -62,13 +57,13 @@ public class CyberCraftColliderService extends ScriptableService {
       return;
     }
     this.AddBoxCollider(entity, this.m_requests[index]);
-    FTLog("CyberCraft: gave entity a box collider");
+    this.m_requests[index] = null; // done with it (the list only ever grows otherwise)
   }
 
   private func AddBoxCollider(entity: ref<Entity>, request: ref<CyberCraftColliderRequest>) {
     let box = new physicsColliderBox();
     box.halfExtents = request.halfExtents;
-    box.material = request.material;
+    box.material = n"concrete.physmat";
 
     let query: QueryFilter;
     query.mask1 = Cast<Uint64>(0);
@@ -93,14 +88,14 @@ public class CyberCraftColliderService extends ScriptableService {
     if IsDefined(typed) {
       entity.AddComponent(typed);
     } else {
-      // The compiler doubts this cast; if it really fails, add the component through reflection instead.
+      // The compiler doubts this cast (it only sees the script's own class tree); if it really fails, add the component through reflection instead.
       FTLog("CyberCraft: collider is not an IComponent here, adding it through reflection");
       Reflection.Call(entity, n"AddComponent", [ToVariant(component)]);
     }
   }
 }
 
-// Entry points for the plugin (static functions of a class, which the plugin can find by name).
+// Entry point for the plugin (a static function of a class, which the plugin finds among the game's global functions).
 public class CyberCraftColliders extends IScriptable {
   public static func SpawnBox(x: Float, y: Float, z: Float, halfX: Float, halfY: Float, halfZ: Float) -> EntityID {
     let service = GameInstance.GetScriptableServiceContainer().GetService(n"CyberCraftColliderService") as CyberCraftColliderService;
@@ -110,12 +105,5 @@ public class CyberCraftColliders extends IScriptable {
       return none;
     }
     return service.SpawnBox(new Vector4(x, y, z, 1.0), new Vector3(halfX, halfY, halfZ));
-  }
-
-  public static func ClearBoxes() {
-    let service = GameInstance.GetScriptableServiceContainer().GetService(n"CyberCraftColliderService") as CyberCraftColliderService;
-    if IsDefined(service) {
-      service.Clear();
-    }
   }
 }

@@ -85,12 +85,33 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   world is, first from the change in view direction, then correcting for the camera having moved using the picture's depth. The hand, hotbar and
   screens are a separate layer and are not moved. `/ccdelay <ms>` sets how far behind the newest published camera the game's own picture is (what the
   blocks are aimed at): if the blocks swing ahead of the world when you turn, raise it; if they trail, lower it. Needs prediction (`/ccpredict`) at 0.
-* **The collision experiment** (`/cctestbox`). Blocks are only a picture; for cars and people to be stopped by them the game needs a physical object where
-  they are. A small script, `cyberpunk\scripts\Colliders.reds` (the build copies it to `<game>\r6\scripts\CyberCraft\`; needs Codeware and redscript), spawns an empty
-  entity and gives it a box collider at the one moment the game allows it, while the entity is being set up. `/cctestbox` asks for a 2 x 2 x 2 m invisible box three
-  metres ahead, on the block grid (`CyberCraft.log` says which blocks it fills); `/cctestbox clear` removes it; `/cctestbox dump` writes what the game offers to the log.
-  Each step is also written to `collision-trace.txt` next to the plugin and flushed at once, so after a crash its last line says where. The empty entity template is
-  `base\spawner\empty_entity.ent`, which comes with World Builder (to be replaced by our own, or by permission from its author).
+* **Collision for what you build** (`/cccollide on`). The blocks around you become invisible collision boxes in Night City, so cars are stopped by your builds.
+  `BlockColliders.java` reads the real blocks near the player (80 blocks wide, from 16 below to 64 above) every few ticks, turns each block's actual collision shape
+  into boxes (full blocks are merged into as few boxes as possible; slabs, stairs, fences and doors give a box per part) and publishes the *complete* list to the plugin
+  through shared memory. The plugin (`Collision.cpp`) makes Night City match it: boxes that are new get spawned, boxes that are gone get removed, a few per frame. Because it
+  is the complete list every time, a new world, a closed Minecraft or a missed update all fix themselves; nothing is saved, so each world only puts up its own boxes.
+  `/cccollide off` takes them down, `/cccollide rebuild` makes everything again, `/cccollide status` says how many there are.
+  * *How a box is made.* An empty entity with a collider component. A component can only be added while the game is setting an entity up, so a small script
+    (`cyberpunk\scripts\Colliders.reds`, which the build copies to `<game>\r6\scripts\CyberCraft\`) hooks that moment through Codeware's callbacks; adding it to a finished
+    entity makes the game crash when the entity is attached. The plugin asks the script for each box and removes boxes through Codeware's `StaticEntitySystem`.
+  * *Needs* Codeware (which needs RED4ext and redscript), and `base\spawner\empty_entity.ent`, the empty entity that comes with World Builder (Nexus Mods). That file is
+    the only thing taken from World Builder; it should be replaced by one of our own (or used with its author's permission) before anyone else uses this.
+  * *Cost.* A frame costs a little more with a few thousand boxes alive (about 10 to 20 percent at 3400 boxes in testing), and a house is a few dozen boxes once merged.
+  * *What it does and doesn't stop.* Cars and V's body are stopped (cars crumple when they hit a wall at speed). **NPCs on foot are not**: they walk through low walls
+    or over them, and through high ones. Tried and ruled out, so nobody has to try them again: the collision filter numbers (including setting every one to "everything"),
+    the collision preset names (the game ignores them here; the numbers decide), the collider's "is obstacle" flag (it switches the collider off), and the game's runtime
+    navigation obstacle (`worldNavigationScriptInterface.AddObstacle`: it is accepted but the game's route-finding does not change at all, measured with
+    `CalculatePathOnlyHumanNavmesh` before and after). World Builder's own live collision boxes behave exactly the same. The likely reason is that characters collide with a
+    separate kind of physical shape, `physicsProxyType.CharacterObstacle`, which World Builder only writes into permanent exported world objects; nothing found lets a
+    runtime component make one. The one idea left: push NPCs that end up inside a box back out to its surface (not built).
+  * *Where the filter numbers come from.* The query mask 2 = 70107400 and simulation masks 114696 and 23627 in the script are the ones World Builder's live collision shapes use
+    (a solid static box that blocks vehicles, the player and bullets); we found they are what decides behaviour, not the preset's name.
+* **Logging and the debug tools.** `CyberCraft.log` (next to the plugin) is quiet by default: it records what happens once (loading, Minecraft linking, hooks found, V following,
+  how many collision boxes exist) and every warning and error. The statistics that used to print every few seconds (camera accuracy, depth capture and its reports, the ground
+  scan, input counts, the overlay's frame delay, V's position) only print while detailed logging is on: `/ccdebug log on` (and `off`) in Minecraft, or a file called
+  `verbose-log.txt` next to the plugin for the plugin to start with it on. The measuring keeps running either way. Also: `/ccdebug find <word>` lists every class, enum and
+  global function in the game whose name contains the word (the first six letters count), which is how most of the game's inner workings were found, and `/ccdebug dump`
+  writes the classes behind the collision boxes to the log, to check them after a game update.
 * **Building on Night City** (`/ccterrain`, on by default). Night City isn't made of blocks, so Minecraft can't aim at it. `TerrainPick` marches the
   camera's ray over the same smooth ground surface and obstacle squares that the player collides with, and answers with the hit Minecraft would
   get from a real block: a point, a face, and the empty cell just outside the surface, which Minecraft then fills when you place a block. Nothing
@@ -103,10 +124,10 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
 * **`/ccdepthdebug`** cycles a debug view of the depth test: 1 shows the game's depth over the whole screen (near dark, far light), 2 shows
   the blocks' distance as grey, 3 colours block pixels red where the game's world hides them and green where they show. The capture also
   checks its copy of the game's depth against the game's own rays and switches to another depth texture if the values don't fit.
-* **`/ccdepthprobe`** (probe, changes nothing visible) watches the game's depth textures and writes what it sees to `CyberCraft.log` every
+* **`/ccdepthprobe`** (probe, changes nothing visible; its reports need `/ccdebug log on`) watches the game's depth textures and writes what it sees to `CyberCraft.log` every
   4 seconds: which textures are used as depth buffers, how big they are, what happens to them afterwards, and whether their memory is
   reused. This is groundwork for hiding blocks behind buildings and the ground, which needs a copy of the game's depth buffer.
-* **`/ccdepthcapture`** (probe) copies the game's main depth texture right after its last depth pass each frame (it works with DLSS on or off), and compares five
+* **`/ccdepthcapture`** (probe; its readings need `/ccdebug log on`) copies the game's main depth texture right after its last depth pass each frame (it works with DLSS on or off), and compares five
   texels of it with how far the game's own rays say the world is at the same places on the screen. The log shows whether the numbers
   agree and how depth values relate to distance. It records commands into the game's own command list, so if the game misbehaves with it
   on, switch it off and report. Stand still, looking at a street or a wall, for the clearest readings.

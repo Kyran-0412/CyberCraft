@@ -381,8 +381,35 @@ public final class CyberLink {
 		return value < -1.0e29f ? Float.NEGATIVE_INFINITY : value;
 	}
 
-	/** Asks Cyberpunk to run the collision experiment (action 0: dump what is on offer, 1: spawn a test object, 2: remove them, 3: give it a collider (variant picks how it is filled in), 4: attach it). Returns the command's number (0: link down). */
-	public static int sendTestBox(int action, int variant) {
+	private static int boxVersion;
+
+	/**
+	 * Publishes the complete list of collision boxes (each six ints: min x, y, z, max x, y, z, in sixteenths of a block, Minecraft
+	 * coordinates) for the plugin to make Night City match. {@code enabled == false} (or no link) makes the plugin remove them all.
+	 */
+	public static void publishBoxes(boolean enabled, int epoch, int[] boxes, int count) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return;
+		}
+		count = Math.max(0, Math.min(count, BOX_TABLE_MAX));
+		long base = OFF_BOX_TABLE;
+		int seq = s.get(JAVA_INT, base + BT_SEQ) & ~1;
+		s.set(JAVA_INT, base + BT_SEQ, seq + 1); // odd: write in progress
+		VarHandle.releaseFence();
+		if (count > 0) {
+			MemorySegment.copy(MemorySegment.ofArray(boxes), 0, s, base + BOX_TABLE_ENTRIES_OFF, count * BOX_ENTRY_BYTES);
+		}
+		s.set(JAVA_INT, base + BT_COUNT, count);
+		s.set(JAVA_INT, base + BT_VERSION, ++boxVersion);
+		s.set(JAVA_INT, base + BT_FLAGS, enabled ? BOXES_ENABLED : 0);
+		s.set(JAVA_INT, base + BT_EPOCH, epoch);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, base + BT_SEQ, seq + 2);
+	}
+
+	/** Sends a debug command to the plugin (action: one of the DEBUG_ constants, arg: its argument). Returns the command's number (0: link down). */
+	public static int sendDebug(int action, double arg) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return 0;
@@ -390,9 +417,9 @@ public final class CyberLink {
 		int base = s.get(JAVA_INT, OFF_MC_COMMAND + C_SEQ) & ~1;
 		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 1);
 		VarHandle.releaseFence();
-		s.set(JAVA_INT, OFF_MC_COMMAND + C_KIND, CMD_TEST_BOX);
+		s.set(JAVA_INT, OFF_MC_COMMAND + C_KIND, CMD_DEBUG);
 		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_X, (double) action);
-		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Y, (double) variant);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Y, arg);
 		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Z, 0.0);
 		VarHandle.releaseFence();
 		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 2);

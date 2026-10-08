@@ -57,3 +57,6 @@ The way Minecraft's picture is split into a world layer (colour and depth, copie
 
 ## Codeware (MIT, psiberx)
 The collider script (cyberpunk/scripts/Colliders.reds) uses Codeware's callback, static entity and reflection scripting API, and follows its documentation on adding components while an entity is assembled. https://github.com/psiberx/cp2077-codeware
+
+## World Builder (no licence file), by keanuWheeze
+CyberCraft's collision boxes use `base\spawner\empty_entity.ent`, the empty entity that World Builder installs (https://www.nexusmods.com/cyberpunk2077/mods/20660); no code or files of World Builder are included. The collision filter numbers in `Colliders.reds` are the ones its live collision shapes use. Its author should be asked before this is relied on or redistributed.

@@ -8,6 +8,7 @@
 
 #include "Camera.hpp"
 #include "Collision.hpp"
+#include "Log.hpp"
 #include "Depth.hpp"
 #include "Ground.hpp"
 #include "Input.hpp"
@@ -25,6 +26,7 @@
 
 #include <Windows.h>
 
+#include <filesystem>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -177,9 +179,9 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
 {
     auto& link = cybercraft::Link::Get();
 
-    if (aCommand.kind == cybercraft::proto::kCmdTestBox)
+    if (aCommand.kind == cybercraft::proto::kCmdDebug)
     {
-        cybercraft::collision::Command(static_cast<int>(aCommand.x), static_cast<int>(aCommand.y));
+        cybercraft::collision::Command(static_cast<int>(aCommand.x), aCommand.y);
         link.AckCommand(aCommand.seq, true);
         return;
     }
@@ -244,6 +246,10 @@ bool ContainsIgnoreCase(const std::string& aText, const char* aPart)
 // log once, so that if the guess below is wrong, the right names are in the file.
 void DumpCameraApi(RED4ext::CClass* aClass)
 {
+    if (!cybercraft::log::Verbose())
+    {
+        return;
+    }
     static const char* kWords[] = {"pitch", "orient", "rotat", "tilt", "look", "heading", "yaw"};
     g_sdk->logger->InfoF(g_handle, "camera: V's camera component is a %s; functions and properties that may matter:", aClass->name.ToString());
     int lines = 0;
@@ -525,6 +531,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
         cybercraft::input::Update(false, false, cybercraft::Link::McSnapshot{});
         cybercraft::ground::Reset();
         cybercraft::camera::Reset();
+        cybercraft::collision::Reset();
         link.PublishPlayer(false, 0.0, 0.0, 0.0);
         if (g_hadPlayer)
         {
@@ -541,7 +548,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     }
 
     cybercraft::camera::Update(player);
-    cybercraft::collision::Update(); // publishes the game's camera for Minecraft to draw its blocks through
+    cybercraft::collision::Update(); // keeps Night City's collision boxes matching what is built in Minecraft
 
     if (!g_lookedUpFunction)
     {
@@ -609,7 +616,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
     // Cyberpunk is Z-up (X east, Y north) in metres; Minecraft is Y-up (X east, -Z north) in blocks.
     link.PublishPlayer(true, position.X, position.Z - cybercraft::mapping::Offset(), -position.Y);
 
-    if (logNow)
+    if (logNow && cybercraft::log::Verbose())
     {
         g_sdk->logger->InfoF(g_handle, "V is at x=%.2f y=%.2f z=%.2f", position.X, position.Y, position.Z);
     }
@@ -634,6 +641,16 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         cybercraft::collision::Init(aHandle, aSdk);
         cybercraft::mapping::Load();
         aSdk->logger->InfoF(aHandle, "vertical offset between the game and Minecraft: %.3f", cybercraft::mapping::Offset());
+
+        // A file called verbose-log.txt next to the plugin turns the detailed log on from the start (otherwise /ccdebug log on in Minecraft).
+        {
+            std::error_code ignored;
+            if (std::filesystem::exists(cybercraft::mapping::PluginFolder() / "verbose-log.txt", ignored))
+            {
+                cybercraft::log::SetVerbose(true);
+                aSdk->logger->Info(aHandle, "detailed logging is on (verbose-log.txt exists)");
+            }
+        }
 
         aSdk->logger->InfoF(aHandle, "CyberCraft loaded (game version %u.%u.%u)", static_cast<unsigned>(aSdk->runtime->major),
                             static_cast<unsigned>(aSdk->runtime->minor), static_cast<unsigned>(aSdk->runtime->patch));

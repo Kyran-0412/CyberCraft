@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 20;
+	inline constexpr std::uint32_t kVersion = 22;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -43,7 +43,13 @@ namespace cybercraft::proto
 	inline constexpr std::uint64_t kOverlayLayerBytes = std::uint64_t(kMaxOverlayW) * kMaxOverlayH * 4;
 	inline constexpr std::uint64_t kOverlaySlotBytes = kOverlayLayerBytes * 3;
 	inline constexpr std::uint32_t kOverlaySlots = 3;
-	inline constexpr std::uint64_t kMappingBytes = kOffOverlayPixels + kOverlaySlotBytes * kOverlaySlots;
+	// The collision boxes of what is built in Minecraft sit after the overlay pixels (see BoxTableHdr).
+	inline constexpr std::uint64_t kOffBoxTable = kOffOverlayPixels + kOverlaySlotBytes * kOverlaySlots;
+	inline constexpr std::uint32_t kBoxTableMax = 4096;
+	inline constexpr std::uint64_t kBoxTableEntriesOff = 0x40;
+	inline constexpr std::uint64_t kBoxEntryBytes = 24;
+	inline constexpr std::uint64_t kBoxTableBytes = kBoxTableEntriesOff + std::uint64_t(kBoxTableMax) * kBoxEntryBytes;
+	inline constexpr std::uint64_t kMappingBytes = kOffBoxTable + kBoxTableBytes;
 
 	// ---- header @0x0 ------------------------------------------------------------------------
 	struct Header
@@ -121,7 +127,7 @@ namespace cybercraft::proto
 		kCmdNone = 0,
 		kCmdTeleport = 1,  // move V to (x, y, z), Minecraft coordinates
 		kCmdAlignGround = 2,  // set the vertical offset so that the street under V lands on a whole-number height
-		kCmdTestBox = 3,      // the collision experiment (x: 0 dump what is on offer, 1 spawn a test object, 2 remove them)
+		kCmdDebug = 3,        // a debug command (x: the DebugAction, y: its argument)
 	};
 
 	enum CommandResult : std::uint32_t
@@ -255,4 +261,40 @@ namespace cybercraft::proto
 		float         roll;                // how far the camera is tilted sideways, degrees (positive = right side up)
 	};
 	static_assert(sizeof(CameraState) == 0x50);
+
+	// What a kCmdDebug command asks the plugin to do (x of the command; y is its argument).
+	enum DebugAction : int
+	{
+		kDebugDump = 0,   // write the classes behind the collision boxes to the log
+		kDebugLog = 1,    // y: 1 detailed logging on, 0 off
+		kDebugFind = 9,   // y: up to six letters packed into the number; list the game's classes, enums and global functions with that in their name
+	};
+
+	// ---- collision boxes @kOffBoxTable (Minecraft -> Cyberpunk; seqlock: seq is odd while being written) -----------------
+	// What is built in Minecraft near the player, as boxes: the plugin keeps invisible collision boxes in Night City exactly
+	// where these are, so cars and people are stopped by builds. This is the complete list every time (not a list of changes),
+	// so a closed Minecraft, a new world or a missed update all fix themselves: the plugin makes Night City match the list.
+	enum BoxTableFlags : std::uint32_t
+	{
+		kBoxesEnabled = 1u << 0,  // Minecraft wants collision boxes (otherwise the plugin removes all of them)
+	};
+
+	struct BoxTableHdr
+	{
+		std::uint32_t seq;      // seqlock
+		std::uint32_t count;    // boxes in the list
+		std::uint32_t version;  // changes whenever the list changes
+		std::uint32_t flags;    // BoxTableFlags
+		std::uint32_t epoch;    // changes when Minecraft asks for every box to be rebuilt
+		std::uint32_t reserved[11];
+	};
+	static_assert(sizeof(BoxTableHdr) == kBoxTableEntriesOff);
+
+	// One box, in Minecraft's coordinates, in sixteenths of a block (min corner, max corner; the max is larger than the min).
+	struct BoxEntry
+	{
+		std::int32_t min[3];  // x, y, z
+		std::int32_t max[3];
+	};
+	static_assert(sizeof(BoxEntry) == kBoxEntryBytes);
 }

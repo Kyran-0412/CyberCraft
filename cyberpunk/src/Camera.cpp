@@ -16,6 +16,7 @@
 // Every two seconds the log says how much the three disagree.
 
 #include "Camera.hpp"
+#include "Log.hpp"
 #include "Depth.hpp"
 #include "Ground.hpp"
 #include "Link.hpp"
@@ -254,7 +255,7 @@ namespace cybercraft::camera
 					auto* prop = cls->props[i];
 					const std::string type = prop->type ? prop->type->GetName().ToString() : "";
 					const std::string name = prop->name.ToString();
-					if (!g_loggedDataLayout) {
+					if (!g_loggedDataLayout && log::Verbose()) {
 						g_sdk->logger->InfoF(g_handle, "camera: entCameraData has %s : %s", name.c_str(), type.c_str());
 					}
 					if (type == "Vector4" && !havePos && (name.find("os") != std::string::npos)) {
@@ -301,7 +302,7 @@ namespace cybercraft::camera
 			cal.sy = (u.Y - c.Y) >= 0 ? 1.0f : -1.0f;
 			const float dx = std::fabs(r.X - c.X) / cal.scaleX;
 			const float dy = std::fabs(u.Y - c.Y) / cal.scaleY;
-			if (a_log) {
+			if (a_log && log::Verbose()) {
 				g_sdk->logger->InfoF(g_handle, "camera: projection test: centre (%.3f, %.3f), 2 m right (%.3f, %.3f), 2 m up (%.3f, %.3f): %s numbers, x grows %s, y grows %s",
 					c.X, c.Y, r.X, r.Y, u.X, u.Y, ndc ? "-1..1" : (c.X < 2.0f ? "0..1" : "pixel"), cal.sx > 0 ? "right" : "left", cal.sy > 0 ? "up" : "down");
 			}
@@ -551,7 +552,9 @@ namespace cybercraft::camera
 				}
 				line += text;
 			}
-			g_sdk->logger->Info(g_handle, line.c_str());
+			if (log::Verbose()) {
+				g_sdk->logger->Info(g_handle, line.c_str());
+			}
 		}
 
 		// For the depth capture: how far along the view the game's world is at five places on the screen, measured with the game's own
@@ -770,13 +773,14 @@ namespace cybercraft::camera
 			g_sdk->logger->Info(g_handle, "camera: publishing the game's camera to Minecraft");
 		}
 		if (logNow) {
-			g_sdk->logger->InfoF(g_handle,
+			const bool verbose = log::Verbose();
+			if (verbose) g_sdk->logger->InfoF(g_handle,
 				"camera: last 2 s (publishing %s): position (%.2f, %.2f, %.2f); the game's fov number %.2f, measured vertical %.2f horizontal %.2f, aspect %.3f; "
 				"largest disagreement in direction: camera data vs transform %.2f deg, projected vs transform %.2f deg (projected tilt up to %.2f deg, fit error up to %.3f deg, %d of %d frames without a projected result)",
 				g_source == 0 ? "the transform" : g_source == 1 ? "the camera data" : g_source == 2 ? "the projected orientation" : "the projected orientation and position", chosen.pos.x, chosen.pos.y, chosen.pos.z, gameFov,
 				g_measuredVfov, g_measuredHfov, aspect, g_stats.dataVsTransform, g_stats.projectedVsTransform, g_stats.projectedRoll, g_stats.projectedFit,
 				g_stats.projectedFailed, g_stats.frames);
-			if (g_stats.gridRuns > 0) {
+			if (g_stats.gridRuns > 0 && verbose) {
 				const double n = std::max(1, g_stats.farSamples);
 				g_sdk->logger->InfoF(g_handle,
 					"camera: check against the game's own projection (transform camera; angle between the two view rays, largest over a grid of 9 directions): at 3 m %.3f deg, at 12 m %.3f deg, at 60 m %.3f deg; "
@@ -784,7 +788,7 @@ namespace cybercraft::camera
 					g_stats.gridMax[0], g_stats.gridMax[1], g_stats.gridMax[2], g_stats.gridCentre[0], g_stats.gridCentre[1], g_stats.gridCentre[2],
 					-g_stats.farSignedX / n, -g_stats.farSignedZ / n);
 			}
-			if (g_stats.shiftSamples > 0) {
+			if (g_stats.shiftSamples > 0 && verbose) {
 				const double n = g_stats.shiftSamples;
 				g_sdk->logger->InfoF(g_handle,
 					"camera: position solved from points near the camera differs from the transform's by up to %.3f m (on average %.3f east, %.3f north, %.3f up)",

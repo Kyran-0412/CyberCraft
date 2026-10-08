@@ -1,7 +1,7 @@
 package dev.cybercraft.client;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
-import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.cybercraft.CyberCraft;
 import dev.cybercraft.link.CyberLink;
 import dev.cybercraft.link.Proto;
@@ -204,21 +204,63 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(String.format("CyberCraft: aiming the blocks at the camera %.0f ms behind the newest.", warpDelayMs)));
 					return 1;
 				})));
-			// /cctestbox [dump|clear]  the collision experiment: no argument spawns one invisible 2 x 2 x 2 m collision box three metres ahead (made by the script
-			// Colliders.reds in the game's r6\\scripts\\CyberCraft folder); "dump" writes what the game and Codeware offer to CyberCraft.log; "clear" removes the boxes.
-			dispatcher.register(ClientCommands.literal("cctestbox")
+			// /cccollide on|off|status|rebuild  collision for what you build: the blocks around you become invisible collision boxes in Night City, so cars and
+			// people are stopped by your builds. Rebuilt from the world each time (nothing is saved), and gone when you switch worlds or close Minecraft.
+			dispatcher.register(ClientCommands.literal("cccollide")
 				.executes(c -> {
-					c.getSource().sendFeedback(Component.literal(sendTestBox(1, 0, "Asking Cyberpunk for a 2 x 2 x 2 m invisible collision box three metres ahead, on the block grid. CyberCraft.log says which blocks it fills: build a 2 x 2 x 2 of blocks there to see it, then drive a car into it.")));
+					c.getSource().sendFeedback(Component.literal("CyberCraft: block collision is " + BlockColliders.status() + ". /cccollide on|off|rebuild"));
 					return 1;
 				})
-				.then(ClientCommands.literal("dump").executes(c -> {
-					c.getSource().sendFeedback(Component.literal(sendTestBox(0, 0, "Asking Cyberpunk to write what it offers for spawning objects and colliders to CyberCraft.log.")));
+				.then(ClientCommands.literal("on").executes(c -> {
+					if (!CyberLink.active()) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked. Start the game with the plugin installed."));
+						return 1;
+					}
+					BlockColliders.setEnabled(true);
+					c.getSource().sendFeedback(Component.literal("CyberCraft: block collision on. What you build near you becomes solid for cars and people in Night City."));
 					return 1;
 				}))
-				.then(ClientCommands.literal("clear").executes(c -> {
-					c.getSource().sendFeedback(Component.literal(sendTestBox(2, 0, "Removing the test objects.")));
+				.then(ClientCommands.literal("off").executes(c -> {
+					BlockColliders.setEnabled(false);
+					c.getSource().sendFeedback(Component.literal("CyberCraft: block collision off. The boxes are being taken down."));
+					return 1;
+				}))
+				.then(ClientCommands.literal("status").executes(c -> {
+					c.getSource().sendFeedback(Component.literal("CyberCraft: block collision is " + BlockColliders.status()));
+					return 1;
+				}))
+				.then(ClientCommands.literal("rebuild").executes(c -> {
+					BlockColliders.rebuild();
+					c.getSource().sendFeedback(Component.literal("CyberCraft: rebuilding every collision box."));
 					return 1;
 				})));
+			// /ccdebug log on|off | dump | find <word>   tools for working on the mod (they write to Cyberpunk's CyberCraft.log):
+			//   log: detailed statistics every few seconds (camera accuracy, depth capture, ground scan, input counts); the log is quiet without it
+			//   dump: the classes behind the collision boxes, to check them after a game update
+			//   find: every class, enum and global function in the game whose name contains the word (the first six letters count)
+			dispatcher.register(ClientCommands.literal("ccdebug")
+				.then(ClientCommands.literal("log")
+					.then(ClientCommands.literal("on").executes(c -> {
+						c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_LOG, 1, "Detailed logging on: statistics every few seconds in CyberCraft.log.")));
+						return 1;
+					}))
+					.then(ClientCommands.literal("off").executes(c -> {
+						c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_LOG, 0, "Detailed logging off.")));
+						return 1;
+					})))
+				.then(ClientCommands.literal("dump").executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_DUMP, 0, "Writing the classes behind the collision boxes to CyberCraft.log.")));
+					return 1;
+				}))
+				.then(ClientCommands.literal("find").then(ClientCommands.argument("word", StringArgumentType.word()).executes(c -> {
+					String word = StringArgumentType.getString(c, "word").toLowerCase();
+					long packed = 0;
+					for (int i = 0; i < Math.min(6, word.length()); i++) {
+						packed |= ((long) (word.charAt(i) & 0x7F)) << (8 * i);
+					}
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_FIND, (double) packed, "Searching the game for \"" + word.substring(0, Math.min(6, word.length())) + "\": the result is in CyberCraft.log.")));
+					return 1;
+				}))));
 			// /ccterrain  turns aiming at Night City itself (to build on its streets and walls) off and on.
 			dispatcher.register(ClientCommands.literal("ccterrain").executes(c -> {
 				TerrainPick.setEnabled(!TerrainPick.enabled());
@@ -289,14 +331,11 @@ public final class CyberCraftClient implements ClientModInitializer {
 		return String.format("CyberCraft: asked Cyberpunk to move V by east %.1f, north %.1f, up %.1f m. Check the log for the result.", east, north, up);
 	}
 
-	private static String sendTestBox(int action, int variant, String message) {
+	private static String sendDebug(int action, double arg, String message) {
 		if (!CyberLink.active()) {
 			return "CyberCraft: Cyberpunk isn't linked. Start the game with the plugin installed.";
 		}
-		if (!CyberLink.readGameState(STATE) || !STATE.inGame()) {
-			return "CyberCraft: Cyberpunk is linked, but no save is loaded.";
-		}
-		if (CyberLink.sendTestBox(action, variant) == 0) {
+		if (CyberLink.sendDebug(action, arg) == 0) {
 			return "CyberCraft: couldn't send the command.";
 		}
 		return "CyberCraft: " + message;
@@ -633,6 +672,7 @@ public final class CyberCraftClient implements ClientModInitializer {
 
 	private static void tick(Minecraft client) {
 		CyberLink.poll();
+		BlockColliders.tick(client);
 
 		// How fast the Minecraft player is moving, from where it was a tick ago (one tick = 1/20 s). A jump of more than
 		// a few blocks in one tick is a teleport, not walking: it doesn't count.

@@ -12,6 +12,7 @@
 // Each key or button is only sent when its state changes, so having both costs nothing.
 
 #include "Input.hpp"
+#include "Log.hpp"
 
 #include <cybercraft_protocol.h>
 
@@ -444,6 +445,10 @@ namespace cybercraft::input
 				return;
 			}
 			g.lastReport = now;
+			if (!log::Verbose()) {
+				std::fill(std::begin(g.counts), std::end(g.counts), 0ull);
+				return;
+			}
 			if (!g.routing.load() && g.counts[0] + g.counts[1] + g.counts[3] + g.counts[4] == 0) {
 				return;
 			}

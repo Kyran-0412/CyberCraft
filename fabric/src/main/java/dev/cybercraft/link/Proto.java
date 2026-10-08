@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 20;
+	public static final int VERSION = 22;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -67,7 +67,10 @@ public final class Proto {
 
 	public static final int CMD_TELEPORT = 1;
 	public static final int CMD_ALIGN_GROUND = 2;
-	public static final int CMD_TEST_BOX = 3; // the collision experiment: x = 0 dump what is on offer, 1 spawn a test object, 2 remove them
+	public static final int CMD_DEBUG = 3; // a debug command: x = the DEBUG_ action, y = its argument
+	public static final int DEBUG_DUMP = 0; // write the classes behind the collision boxes to the plugin's log
+	public static final int DEBUG_LOG = 1; // y: 1 detailed logging on, 0 off
+	public static final int DEBUG_FIND = 9; // y: up to six letters packed into the number; list the game's classes, enums and functions with that in their name
 
 	public static final int RESULT_NONE = 0;
 	public static final int RESULT_OK = 1;
@@ -115,7 +118,20 @@ public final class Proto {
 	public static final int OVERLAY_SLOTS = 3;
 	public static final int OVERLAY_DIRTY = 1 << 2;
 
-	public static final long MAPPING_BYTES = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * OVERLAY_SLOTS;
+	// ---- collision boxes (Minecraft -> Cyberpunk; seqlock): the complete list of boxes of what is built near the player ----
+	public static final long OFF_BOX_TABLE = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * OVERLAY_SLOTS;
+	public static final int BOX_TABLE_MAX = 4096;
+	public static final long BOX_TABLE_ENTRIES_OFF = 0x40;
+	public static final long BOX_ENTRY_BYTES = 24; // 6 ints: min x, y, z, max x, y, z, in sixteenths of a block
+	public static final long BOX_TABLE_BYTES = BOX_TABLE_ENTRIES_OFF + BOX_TABLE_MAX * BOX_ENTRY_BYTES;
+	public static final long BT_SEQ = 0; // u32, odd while being written
+	public static final long BT_COUNT = 4; // u32
+	public static final long BT_VERSION = 8; // u32, changes whenever the list changes
+	public static final long BT_FLAGS = 12; // u32
+	public static final long BT_EPOCH = 16; // u32, changes when every box should be rebuilt
+	public static final int BOXES_ENABLED = 1;
+
+	public static final long MAPPING_BYTES = OFF_BOX_TABLE + BOX_TABLE_BYTES;
 
 	// ---- the game's camera @0x400 (seqlock): Minecraft draws its blocks looking through it ----
 	public static final long OFF_CAMERA = 0x400;

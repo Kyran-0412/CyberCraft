@@ -18,6 +18,7 @@
 // has the right depth in it and how its numbers relate to distance.
 
 #include "Depth.hpp"
+#include "Log.hpp"
 
 #include <RED4ext/GpuApi/DeviceData.hpp>
 
@@ -820,10 +821,10 @@ namespace cybercraft::depth
 			return std::uint64_t(a.entry->width) * a.entry->height * (a.enter + 1) > std::uint64_t(b.entry->width) * b.entry->height * (b.enter + 1);
 		});
 
-		g_sdk->logger->InfoF(g_handle, "depth: report %d: %u textures were moved into or out of depth write in the last 4 s", g_reports, static_cast<unsigned>(rows.size()));
+		if (log::Verbose()) g_sdk->logger->InfoF(g_handle, "depth: report %d: %u textures were moved into or out of depth write in the last 4 s", g_reports, static_cast<unsigned>(rows.size()));
 		int shown = 0;
 		for (const Row& row : rows) {
-			if (shown++ >= 10) {
+			if (!log::Verbose() || shown++ >= 10) {
 				break;
 			}
 			const Entry& e = *row.entry;
@@ -854,7 +855,7 @@ namespace cybercraft::depth
 			}
 		}
 		const std::uint32_t copies = g_copies.exchange(0);
-		g_sdk->logger->InfoF(g_handle, "depth: capture: %u copies of the %u x %u texture %p in the last 4 s (copy moments seen: %u; readings that fit depth = 0.02 / distance: %d of %d)", copies,
+		if (log::Verbose()) g_sdk->logger->InfoF(g_handle, "depth: capture: %u copies of the %u x %u texture %p in the last 4 s (copy moments seen: %u; readings that fit depth = 0.02 / distance: %d of %d)", copies,
 			g_texWidth, g_texHeight, static_cast<void*>(candidate), copyMoments, g_sampleGood, g_sampleGood + g_sampleBad);
 		g_candidateMisses = copyMoments == 0 ? g_candidateMisses + 1 : 0;
 		if (g_candidateMisses >= 3) {
@@ -899,11 +900,11 @@ namespace cybercraft::depth
 				}
 			}
 			if (fresh && refs[i].valid && refs[i].z > 0.0f) {
-				g_sdk->logger->InfoF(g_handle,
+				if (log::Verbose()) g_sdk->logger->InfoF(g_handle,
 					"  depth sample %d at (%.2f, %.2f), pixel (%u, %u): value %.6f; the game's ray says the world is %.2f m ahead there; value x distance = %.5f (if depth = near / distance, near = that), (1 - value) x distance = %.5f (if depth = 1 - near / distance)",
 					i, kReferenceUV[i][0], kReferenceUV[i][1], g_samplePixel[i][0], g_samplePixel[i][1], value, refs[i].z, value * refs[i].z, (1.0f - value) * refs[i].z);
 			} else {
-				g_sdk->logger->InfoF(g_handle, "  depth sample %d at (%.2f, %.2f), pixel (%u, %u): value %.6f; the game's ray found nothing there (or hasn't been measured; stand still)", i,
+				if (log::Verbose()) g_sdk->logger->InfoF(g_handle, "  depth sample %d at (%.2f, %.2f), pixel (%u, %u): value %.6f; the game's ray found nothing there (or hasn't been measured; stand still)", i,
 					kReferenceUV[i][0], kReferenceUV[i][1], g_samplePixel[i][0], g_samplePixel[i][1], value);
 			}
 		}

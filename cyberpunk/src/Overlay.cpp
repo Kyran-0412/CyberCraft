@@ -14,6 +14,7 @@
 // can see it, the drawing itself works. Every 5 seconds a status line goes to the log.
 
 #include "Overlay.hpp"
+#include "Log.hpp"
 #include "Depth.hpp"
 #include "Input.hpp"
 #include "Link.hpp"
@@ -975,15 +976,16 @@ float4 PS(VSOut i) : SV_Target
 			g_lastStatus = now;
 			auto& link = Link::Get();
 			const bool mcAlive = link.IsOpen() && link.McPid() != 0 && (::GetTickCount64() - link.McHeartbeatMs()) < 3000;
-			g_sdk->logger->InfoF(g_handle,
+			const bool verbose = log::Verbose();
+			if (verbose) g_sdk->logger->InfoF(g_handle,
 				"overlay: status: %llu presents, in game=%d, Minecraft linked=%d, frames sent by Minecraft so far=%llu, frames uploaded=%llu, HUD draws=%llu, test-square draws=%llu, GPU ready=%d, failed=%d",
 				static_cast<unsigned long long>(g_presents), link.InGame() ? 1 : 0, mcAlive ? 1 : 0,
 				static_cast<unsigned long long>(mcAlive ? link.OverlayFramesPublished() : 0), static_cast<unsigned long long>(g_framesUploaded),
 				static_cast<unsigned long long>(g_hudDraws), static_cast<unsigned long long>(g_badgeDraws), g.ready ? 1 : 0, g.failed ? 1 : 0);
-			g_sdk->logger->InfoF(g_handle, "overlay: draws so far: %llu plain, %llu layered, %llu of those hidden against the game's depth, %llu re-aimed at the current camera (aiming %.0f ms behind the newest)",
+			if (verbose) g_sdk->logger->InfoF(g_handle, "overlay: draws so far: %llu plain, %llu layered, %llu of those hidden against the game's depth, %llu re-aimed at the current camera (aiming %.0f ms behind the newest)",
 				static_cast<unsigned long long>(g_plainDraws), static_cast<unsigned long long>(g_layeredDraws), static_cast<unsigned long long>(g_depthDraws),
 				static_cast<unsigned long long>(g_warpDraws), g_warpDelayMs);
-			if (g_ageCount > 0) {
+			if (g_ageCount > 0 && verbose) {
 				g_sdk->logger->InfoF(g_handle, "overlay: delay: the picture Minecraft sends was drawn through a camera published %.0f ms earlier on average (up to %.0f ms), over %llu frames; the game presented about %.0f frames a second, Minecraft sent about %.0f",
 					g_ageSum / double(g_ageCount), g_ageMax, static_cast<unsigned long long>(g_ageCount), double(g_presents) / 5.0, double(g_ageCount) / 5.0);
 			}

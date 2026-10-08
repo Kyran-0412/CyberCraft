@@ -16,6 +16,7 @@
 // Everything goes into the shared ground grid for the Minecraft mod to read.
 
 #include "Ground.hpp"
+#include "Log.hpp"
 #include "Link.hpp"
 #include "Mapping.hpp"
 
@@ -170,6 +171,9 @@ namespace cybercraft::ground
 
 		void LogParameters(const char* a_name, RED4ext::CClassFunction* a_func)
 		{
+			if (!log::Verbose()) {
+				return;
+			}
 			g_sdk->logger->InfoF(g_handle, "ground: %s takes %u parameters:", a_name, static_cast<unsigned>(a_func->params.Size()));
 			for (uint32_t i = 0; i < a_func->params.Size(); ++i) {
 				auto* param = a_func->params[i];
@@ -251,7 +255,7 @@ namespace cybercraft::ground
 			}
 			if (!g_loggedFirstHit) {
 				g_loggedFirstHit = true;
-				g_sdk->logger->InfoF(g_handle, "ground: first hit at x=%.2f y=%.2f z=%.2f (ray from z=%.2f to z=%.2f)",
+				if (log::Verbose()) g_sdk->logger->InfoF(g_handle, "ground: first hit at x=%.2f y=%.2f z=%.2f (ray from z=%.2f to z=%.2f)",
 					g_trace.position.X, g_trace.position.Y, g_trace.position.Z, a_zTop, a_zBottom);
 			}
 			return g_trace.position.Z;
@@ -605,7 +609,7 @@ namespace cybercraft::ground
 
 		if (end - g_lastReport >= std::chrono::seconds(5)) {
 			g_lastReport = end;
-			if (g_cells > 0) {
+			if (g_cells > 0 && log::Verbose()) {
 				g_sdk->logger->InfoF(g_handle, "ground: %llu cells in 5 s (%llu per frame), %.0f%% found ground, %.0f%% blocked, %.0f us per frame, %.1f us per cell",
 					static_cast<unsigned long long>(g_cells), static_cast<unsigned long long>(g_cells / std::max<std::uint64_t>(1, g_frames)),
 					100.0 * double(g_hits) / double(g_cells), 100.0 * double(g_blocked) / double(std::max<std::uint64_t>(1, g_hits)),
