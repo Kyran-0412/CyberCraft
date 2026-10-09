@@ -34,6 +34,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <algorithm>
 #include <vector>
 
 namespace cybercraft::collision
@@ -360,6 +361,70 @@ namespace cybercraft::collision
 			}
 		}
 
+		// The name of a type, for a parameter, a return value or a field ("?" if the type isn't known).
+		std::string TypeName(RED4ext::CProperty* a_property)
+		{
+			if (!a_property || !a_property->type) {
+				return "Void";
+			}
+			return a_property->type->GetName().ToString();
+		}
+
+		std::string Signature(RED4ext::CBaseFunction* a_function)
+		{
+			std::string text = a_function->shortName.ToString();
+			text += "(";
+			for (uint32_t i = 0; i < a_function->params.Size(); ++i) {
+				RED4ext::CProperty* p = a_function->params[i];
+				if (i) {
+					text += ", ";
+				}
+				text += std::string(p->name.ToString()) + ": " + TypeName(p);
+			}
+			text += ") -> " + TypeName(a_function->returnType);
+			return text;
+		}
+
+		// Writes to the log the methods and fields of the classes whose name contains the word (the shortest names first, at most four classes): what a script can call on them.
+		void DumpClasses(const std::string& a_word)
+		{
+			if (a_word.empty()) {
+				return;
+			}
+			auto rtti = RED4ext::CRTTISystem::Get();
+			RED4ext::DynArray<RED4ext::CClass*> classes;
+			rtti->GetClasses(nullptr, classes, nullptr, true);
+			std::vector<RED4ext::CClass*> matches;
+			for (uint32_t i = 0; i < classes.Size(); ++i) {
+				if (ContainsNoCase(classes[i]->name.ToString(), a_word)) {
+					matches.push_back(classes[i]);
+				}
+			}
+			std::sort(matches.begin(), matches.end(), [](RED4ext::CClass* a, RED4ext::CClass* b) {
+				return std::string(a->name.ToString()).size() < std::string(b->name.ToString()).size();
+			});
+			g_sdk->logger->InfoF(g_handle, "debug: class \"%s\": %u classes match; the %u shortest names are described:", a_word.c_str(), static_cast<unsigned>(matches.size()), static_cast<unsigned>(std::min<std::size_t>(matches.size(), 4)));
+			for (std::size_t m = 0; m < matches.size() && m < 4; ++m) {
+				RED4ext::CClass* c = matches[m];
+				std::string chain;
+				for (auto* p = c->parent; p; p = p->parent) {
+					chain += " < ";
+					chain += p->name.ToString();
+				}
+				g_sdk->logger->InfoF(g_handle, "  class %s%s", c->name.ToString(), chain.c_str());
+				for (uint32_t i = 0; i < c->funcs.Size() && i < 150; ++i) {
+					g_sdk->logger->InfoF(g_handle, "      method %s", Signature(c->funcs[i]).c_str());
+				}
+				for (uint32_t i = 0; i < c->staticFuncs.Size() && i < 80; ++i) {
+					g_sdk->logger->InfoF(g_handle, "      static %s", Signature(c->staticFuncs[i]).c_str());
+				}
+				for (uint32_t i = 0; i < c->props.Size() && i < 80; ++i) {
+					g_sdk->logger->InfoF(g_handle, "      field %s: %s", c->props[i]->name.ToString(), TypeName(c->props[i]).c_str());
+				}
+			}
+			g_sdk->logger->Info(g_handle, "debug: class: done");
+		}
+
 		// Writes to the log every class, enum and global function whose name contains the word.
 		void Find(const std::string& a_word)
 		{
@@ -460,7 +525,7 @@ namespace cybercraft::collision
 		} else if (a_action == proto::kDebugLog) {
 			log::SetVerbose(a_arg != 0.0);
 			g_sdk->logger->InfoF(g_handle, "debug: detailed logging %s", log::Verbose() ? "ON (statistics every few seconds)" : "off");
-		} else if (a_action == proto::kDebugFind) {
+		} else if (a_action == proto::kDebugFind || a_action == proto::kDebugClass) {
 			// The word to look for arrives as up to six letters packed into the number.
 			std::string word;
 			const std::uint64_t packed = static_cast<std::uint64_t>(a_arg);
@@ -471,7 +536,11 @@ namespace cybercraft::collision
 				}
 				word += ch;
 			}
-			Find(word);
+			if (a_action == proto::kDebugClass) {
+				DumpClasses(word);
+			} else {
+				Find(word);
+			}
 		}
 	}
 

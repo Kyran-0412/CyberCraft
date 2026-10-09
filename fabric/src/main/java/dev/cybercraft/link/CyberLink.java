@@ -307,6 +307,26 @@ public final class CyberLink {
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 2); // even: done
 	}
 
+	private static long worldFrame;
+
+	/** Tells Cyberpunk Minecraft's time of day and weather, and whether the player wants the game's to follow them (/ccsync). */
+	public static void publishMcWorld(boolean inWorld, boolean syncTime, boolean syncWeather, long dayTime, float rain, float thunder) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return;
+		}
+		int base = s.get(JAVA_INT, OFF_MC_WORLD + W_SEQ) & ~1;
+		s.set(JAVA_INT, OFF_MC_WORLD + W_SEQ, base + 1); // odd: write in progress
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_WORLD + W_FLAGS, (inWorld ? W_IN_WORLD : 0) | (syncTime ? W_SYNC_TIME : 0) | (syncWeather ? W_SYNC_WEATHER : 0));
+		s.set(JAVA_LONG, OFF_MC_WORLD + W_DAYTIME, dayTime);
+		s.set(JAVA_FLOAT, OFF_MC_WORLD + W_RAIN, rain);
+		s.set(JAVA_FLOAT, OFF_MC_WORLD + W_THUNDER, thunder);
+		s.set(JAVA_LONG, OFF_MC_WORLD + W_FRAME, ++worldFrame);
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_MC_WORLD + W_SEQ, base + 2); // even: done
+	}
+
 	/**
 	 * Asks Cyberpunk to teleport V to a position (Minecraft coordinates). Returns the command's sequence
 	 * number (watch for it in GameState.cmdAck), or 0 if the link is down.

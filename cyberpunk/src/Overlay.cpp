@@ -74,8 +74,12 @@ namespace cybercraft::overlay
 		std::uint64_t g_badgeDraws = 0;
 		int g_debugView = 0;
 		std::recursive_mutex g_gpuMutex;           // Draw (at Present) and DrawWorldIntoScene (from the game's queue submission) share the textures and descriptors
-		float g_sceneGain = 1.0f;                  // the blocks' brightness in the game's HDR scene (1 = a Minecraft white is 1.0 in the scene's units)
-		float g_sceneGlow = 3.0f;                  // how much the brightest pixels are boosted in the scene: up to (1 + this) times
+		float g_sceneGain = 3.0f;                  // the blocks' brightness in the game's HDR scene (1 = a Minecraft white is 1.0 in the scene's units)
+		float g_sceneAo = 1.0f;                    // ambient occlusion where blocks meet the game's world: strength 0 (off) to 1
+		float g_terrainAo = 0.6f;                  // the same on the game's own surfaces next to blocks (the shadow a block makes on the road): strength 0 (off) to 1
+		float g_sceneAoRadius = 0.8f;              // metres
+		bool g_sceneAoView = false;                // show only the occlusion term
+		float g_sceneGlow = 1.0f;                  // how much the brightest pixels are boosted in the scene: up to (1 + this) times
 		const char* g_sceneWhy = "";                // why the last attempt to draw the blocks into the scene drew nothing
 		float g_sceneDelayMs = 0.0f;               // how far behind the newest published camera the blocks are aimed when drawn into the scene
 		std::atomic<std::uint64_t> g_sceneDrawn{ 0 };  // how many times the blocks were drawn into the scene
@@ -98,7 +102,8 @@ namespace cybercraft::overlay
 		bool g_wasInGame = false;
 		std::chrono::steady_clock::time_point g_inGameSince{};
 
-		const char* kShaderSource = R"HLSL(
+		const char* kShaderSource =
+R"HLSL(
 cbuffer P : register(b0)
 {
 	float flipY; float mode; float cursorOn; float layered;
@@ -111,12 +116,14 @@ cbuffer P : register(b0)
 	float4 uiXform;                                // the interface layer: x: stretch across and w: stretch down, both about the middle of the screen; y, z: shift in pixels
 	float4 sceneParams;                            // x: 1 = draw into the game's HDR scene (linear, scaled by y, brightest pixels boosted by up to w); z: 1 = leave the blocks out (they were drawn into the scene)
 	float4 shadeX; float4 shadeY; float4 shadeZ;   // rows of the matrix from Minecraft's camera space to Minecraft's world (xyz), w of shadeX: 1 = valid: used to tell which way a face points
+	float4 aoParams;                               // ambient occlusion where blocks meet the game's world: x: the blocks' occlusion strength (0 = off; negative = show only the occlusion term, white for none and dark for a lot), y: radius in metres, z: the occlusion strength on the game's own surfaces next to blocks, w: tan(half the vertical field of view)
 };
 Texture2D tex : register(t0);          // the whole frame (plain mode), or the world's colour (layered)
 Texture2D mcDepthTex : register(t1);   // layered: the world's depth, as Minecraft wrote it
 Texture2D overlayTex : register(t2);   // layered: the hand, hotbar and screens
 Texture2D gameDepthTex : register(t3); // the game's own depth (a copy), when there is one
 Texture2D uiTex : register(t4);        // the game's interface layer (a copy), when there is one: its sRGB-encoded values as they are
+Texture2D blockDepthTex : register(t5); // how far the nearest block is at each place on the screen, as seen from the current camera (0: none); made by the scene's first pass
 SamplerState samp : register(s0);
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut VS(uint id : SV_VertexID)
@@ -141,16 +148,14 @@ float3 McViewPos(float2 texUv)
 	float2 nm = float2(tuv.x * 2.0 - 1.0, 1.0 - tuv.y * 2.0);
 	return float3(nm * tans.zw, 1.0) * zk;
 }
-// How bright Minecraft made the face at this place: 1 for a top, 0.8 north and south, 0.6 east and west, 0.5 a bottom (1 if it can't tell). The way the face points comes
-// from the slope of the picture's depth there, and the camera's axes in Minecraft's world.
-float McShade(float2 texUv)
+// Which way the surface at this place in Minecraft's picture faces, in Minecraft's camera space, from the slope of the picture's depth (zero if it can't tell).
+float3 McNormal(float2 texUv)
 {
-	if (shadeX.w < 0.5) { return 1.0; }
 	uint mw, mh;
 	mcDepthTex.GetDimensions(mw, mh);
 	float2 d = 1.0 / float2(mw, mh);
 	float3 pc = McViewPos(texUv);
-	if (pc.z <= 0.0 || pc.z > 48.0) { return 1.0; }
+	if (pc.z <= 0.0 || pc.z > 48.0) { return float3(0, 0, 0); }
 	float3 pr = McViewPos(texUv + float2(d.x, 0));
 	float3 pl = McViewPos(texUv - float2(d.x, 0));
 	float3 pu = McViewPos(texUv + float2(0, d.y));
@@ -160,12 +165,60 @@ float McShade(float2 texUv)
 	float3 dy = abs(pu.z - pc.z) < abs(pc.z - pd.z) ? pu - pc : pc - pd;
 	float3 n = cross(dx, dy);
 	float len = length(n);
-	if (len < 1e-12) { return 1.0; }
+	if (len < 1e-12) { return float3(0, 0, 0); }
 	n /= len;
 	if (dot(n, pc) > 0.0) { n = -n; }   // facing the camera
+	return n;
+}
+// How bright Minecraft made the face at this place: 1 for a top, 0.8 north and south, 0.6 east and west, 0.5 a bottom (1 if it can't tell). The way the face points
+// comes from McNormal and the camera's axes in Minecraft's world.
+float McShade(float2 texUv)
+{
+	if (shadeX.w < 0.5) { return 1.0; }
+	float3 n = McNormal(texUv);
+	if (dot(n, n) < 0.5) { return 1.0; }
 	float3 nw = float3(dot(shadeX.xyz, n), dot(shadeY.xyz, n), dot(shadeZ.xyz, n));
 	if (abs(nw.y) > 0.7) { return nw.y > 0.0 ? 1.0 : 0.5; }
 	return abs(nw.z) > abs(nw.x) ? 0.8 : 0.6;
+}
+// Ambient occlusion where a block meets the game's world. Points are taken in 3D on the side of the surface at P that faces N (spread over a hemisphere, turned a little at every
+// pixel), each is projected onto the screen, and it counts as hidden if the game's depth there is in front of it (the point is inside, or behind, the game's geometry) and the
+// game's surface is near P in depth. Taking the points in 3D rather than around the pixel on the screen matters: a road seen at a shallow angle is only a few pixels tall on the
+// screen however far it is in the world, so a disk of screen pixels would miss it at a distance. About 0 to 0.5: half the points are inside the ground at the foot of a wall.
+float SceneAO(float2 pix, float3 P, float3 N)
+{
+	uint gw, gh;
+	gameDepthTex.GetDimensions(gw, gh);
+	float2 size = float2(gw, gh);
+	float tanY = aoParams.w;
+	float2 tanXY = float2(tanY * size.x / size.y, tanY);
+	float radius = aoParams.y;
+	float noise = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
+	float3 up = abs(N.y) < 0.9 ? float3(0, 1, 0) : float3(1, 0, 0);
+	float3 T = normalize(cross(up, N));
+	float3 B = cross(N, T);
+	float bias = 0.02 + 0.004 * P.z;
+	float occ = 0.0;
+	[unroll] for (int k = 0; k < 16; ++k) {
+		float u = (float(k) + 0.5) / 16.0;
+		float phi = (float(k) + noise) * 2.39996323;     // the golden angle: an even spread that is turned a little at every pixel
+		float sinT = sqrt(u);
+		float cosT = sqrt(1.0 - u);
+		float3 dir = T * (cos(phi) * sinT) + B * (sin(phi) * sinT) + N * cosT;
+		float sc = radius * (0.25 + 0.75 * frac(float(k) * 0.61803399 + noise));
+		float3 S = P + dir * sc;
+		if (S.z < 0.05) { continue; }
+		float2 ndcS = S.xy / (S.z * tanXY);
+		float2 sp = float2((ndcS.x * 0.5 + 0.5) * size.x, (0.5 - ndcS.y * 0.5) * size.y);
+		if (sp.x < 0.0 || sp.y < 0.0 || sp.x >= size.x || sp.y >= size.y) { continue; }
+		float sg = gameDepthTex.Load(int3(uint2(sp), 0)).r;
+		if (sg <= 1e-8) { continue; }                    // sky
+		float zs = gameNear / sg;
+		if (zs < S.z - bias) {
+			occ += saturate(radius / max(abs(P.z - zs), 1e-3));   // something far in front of the block doesn't count
+		}
+	}
+	return occ / 16.0;
 }
 float4 PS(VSOut i) : SV_Target
 {
@@ -213,13 +266,18 @@ float4 PS(VSOut i) : SV_Target
 		} else {
 			w = tex.Sample(samp, uv);       // the world, premultiplied alpha
 			if (w.a > 0.0) {
-				// How far is this block pixel from the camera? Minecraft's depth is the matrix's: ndc = -A + B / distance.
+)HLSL"
+R"HLSL(				// How far is this block pixel from the camera? Minecraft's depth is the matrix's: ndc = -A + B / distance.
 				float s = mcDepthTex.Load(int3(min(uint2(uv * float2(mw, mh)), uint2(mw - 1, mh - 1)), 0)).r;
 				float ndc = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
 				float den = ndc + mcA;
 				zm = abs(den) > 1e-9 ? mcB / den : 1e9;
 				if (zm <= 0.0) { zm = 1e9; }
 			}
+		}
+		if (sceneParams.x > 1.5 && sceneParams.x < 2.5) {
+			// The scene's first pass: how far the nearest block is here, as seen from the current camera (0 for none), whether or not it is hidden behind the game's world.
+			return float4((w.a > 0.01 && zm < 1e6) ? zm : 0.0, 0.0, 0.0, 0.0);
 		}
 		float zg = 1e9;
 		if (haveGameDepth > 0.5) {
@@ -255,6 +313,20 @@ float4 PS(VSOut i) : SV_Target
 			float peak = max(s.r, max(s.g, s.b)) / McShade(mcUv);
 			float hot = smoothstep(0.7, 1.0, saturate(peak));
 			float3 lin = pow(saturate(s), 2.2) * sceneParams.y * (1.0 + sceneParams.w * hot * hot);
+			if (abs(aoParams.x) > 0.001 && haveGameDepth > 0.5 && zm < 1e6 && w.a > 0.01) {
+				float3 Nm = McNormal(mcUv);
+				if (dot(Nm, Nm) > 0.5) {
+					// The normal in the current camera's space (the picture was drawn through an older camera), and where this pixel is in that space.
+					float3 Nc = warpT.w > 0.5 ? float3(dot(warpR0.xyz, Nm), dot(warpR1.xyz, Nm), dot(warpR2.xyz, Nm)) : Nm;
+					uint gw2, gh2;
+					gameDepthTex.GetDimensions(gw2, gh2);
+					float2 ndcP = float2(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
+					float3 P = float3(ndcP * float2(aoParams.w * float(gw2) / float(gh2), aoParams.w) * zm, zm);
+					float ao = 1.0 - saturate(SceneAO(i.pos.xy, P, Nc) * 1.6 * abs(aoParams.x));
+					if (aoParams.x < 0.0) { return float4(ao, ao, ao, 1.0) * w.a; }   // the occlusion alone: white for none, dark for a lot
+					lin *= ao;
+				}
+			}
 			return float4(lin * w.a, w.a);
 		}
 		if (sceneParams.z > 0.5) { w = float4(0, 0, 0, 0); }
@@ -291,6 +363,70 @@ float4 PS(VSOut i) : SV_Target
 	}
 	return c;
 }
+
+// The game's own surface at a pixel, in the current camera's space.
+float3 GameViewPos(float2 pix, float2 size, float2 tanXY)
+{
+	float sg = gameDepthTex.Load(int3(uint2(clamp(pix, float2(0, 0), size - 1.0)), 0)).r;
+	float z = sg > 1e-8 ? gameNear / sg : 1e9;
+	float2 ndc = float2(pix.x / size.x * 2.0 - 1.0, 1.0 - pix.y / size.y * 2.0);
+	return float3(ndc * tanXY * z, z);
+}
+// Ambient occlusion on the game's world where Minecraft's blocks are next to it (the shadow a block makes on the road at its foot): the same hemisphere of 3D points as
+// SceneAO, but around the game's surface at this pixel, tested against the blocks' depth (see blockDepthTex): a point counts as hidden if a block is in front of it.
+// The result is multiplied onto the scene (aoParams.z is the strength).
+float4 PSTerrain(VSOut i) : SV_Target
+{
+	uint gw, gh;
+	gameDepthTex.GetDimensions(gw, gh);
+	float2 size = float2(gw, gh);
+	float tanY = aoParams.w;
+	float2 tanXY = float2(tanY * size.x / size.y, tanY);
+	float2 pix = i.pos.xy;
+	float3 P = GameViewPos(pix, size, tanXY);
+	if (P.z > 150.0) { return float4(1, 1, 1, 1); }
+	float3 pr = GameViewPos(pix + float2(1, 0), size, tanXY);
+	float3 pl = GameViewPos(pix - float2(1, 0), size, tanXY);
+	float3 pu = GameViewPos(pix + float2(0, 1), size, tanXY);
+	float3 pd = GameViewPos(pix - float2(0, 1), size, tanXY);
+	float3 dx = abs(pr.z - P.z) < abs(P.z - pl.z) ? pr - P : P - pl;
+	float3 dy = abs(pu.z - P.z) < abs(P.z - pd.z) ? pu - P : P - pd;
+	float3 N = cross(dx, dy);
+	float len = length(N);
+	if (len < 1e-12) { return float4(1, 1, 1, 1); }
+	N /= len;
+	if (dot(N, P) > 0.0) { N = -N; }
+	float radius = aoParams.y;
+	float noise = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
+	float3 up = abs(N.y) < 0.9 ? float3(0, 1, 0) : float3(1, 0, 0);
+	float3 T = normalize(cross(up, N));
+	float3 B = cross(N, T);
+	float bias = 0.02 + 0.004 * P.z;
+	float occ = 0.0;
+	[unroll] for (int k = 0; k < 16; ++k) {
+		float u = (float(k) + 0.5) / 16.0;
+		float phi = (float(k) + noise) * 2.39996323;
+		float sinT = sqrt(u);
+		float cosT = sqrt(1.0 - u);
+		float3 dir = T * (cos(phi) * sinT) + B * (sin(phi) * sinT) + N * cosT;
+		float sc = radius * (0.25 + 0.75 * frac(float(k) * 0.61803399 + noise));
+		float3 S = P + dir * sc;
+		if (S.z < 0.05) { continue; }
+		float2 ndcS = S.xy / (S.z * tanXY);
+		float2 sp = float2((ndcS.x * 0.5 + 0.5) * size.x, (0.5 - ndcS.y * 0.5) * size.y);
+		if (sp.x < 0.0 || sp.y < 0.0 || sp.x >= size.x || sp.y >= size.y) { continue; }
+		float zb = blockDepthTex.Load(int3(uint2(sp), 0)).r;
+		if (zb <= 0.0) { continue; }                     // no block there
+		// Only the blocks' front surface is known, so a block is taken to be a metre thick: the point is inside it if it is behind the front surface, but by less than that. (Without the limit
+		// every point anywhere behind a block's silhouette counted, which darkened the floor at the back and sides of a block and left the front looking weak.)
+		float into = S.z - zb;
+		if (into > bias && into < 1.0) {
+			occ += saturate(radius / max(abs(P.z - zb), 1e-3));   // a block far in front of this surface doesn't count
+		}
+	}
+	float ao = 1.0 - saturate((occ / 16.0) * 1.6 * abs(aoParams.z));
+	return float4(ao, ao, ao, 1.0);
+}
 )HLSL";
 
 		struct Gpu
@@ -306,6 +442,11 @@ float4 PS(VSOut i) : SV_Target
 			DXGI_FORMAT psoFormat = DXGI_FORMAT_UNKNOWN;
 			ComPtr<ID3DBlob> vs, ps;
 			ComPtr<ID3D12DescriptorHeap> rtvHeap;
+			ComPtr<ID3D12DescriptorHeap> sceneRtvHeap;  // one render target view: for the block depth
+			ComPtr<ID3DBlob> psTerrain;
+			ComPtr<ID3D12Resource> blockDepth;           // the nearest block's distance at each place on the screen (R32_FLOAT, screen sized), made by the scene's first pass
+			UINT blockDepthW = 0, blockDepthH = 0;
+			ComPtr<ID3D12PipelineState> psoDepth, psoTerrain, psoTerrainView;
 			ComPtr<ID3D12DescriptorHeap> srvHeap;
 			UINT rtvSize = 0;
 			ComPtr<ID3D12CommandAllocator> allocator[kFrames];
@@ -453,7 +594,7 @@ float4 PS(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_HEAP_DESC srv{};
 			srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-			srv.NumDescriptors = 5;
+			srv.NumDescriptors = 6;
 			srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 			hr = g.device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&g.srvHeap));
 			if (FAILED(hr)) {
@@ -462,13 +603,13 @@ float4 PS(VSOut i) : SV_Target
 			}
 			g.srvInc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			{
-				// All five descriptors must be valid for the shader, even the ones a frame doesn't use: make them null ones.
+				// All six descriptors must be valid for the shader, even the ones a frame doesn't use: make them null ones.
 				D3D12_SHADER_RESOURCE_VIEW_DESC nullView{};
 				nullView.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				nullView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 				nullView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 				nullView.Texture2D.MipLevels = 1;
-				for (UINT i = 0; i < 5; ++i) {
+				for (UINT i = 0; i < 6; ++i) {
 					D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
 					h.ptr += SIZE_T(i) * g.srvInc;
 					g.device->CreateShaderResourceView(nullptr, &nullView, h);
@@ -494,10 +635,19 @@ float4 PS(VSOut i) : SV_Target
 				}
 				return false;
 			}
+			errors.Reset();
+			hr = ::D3DCompile(kShaderSource, std::strlen(kShaderSource), nullptr, nullptr, nullptr, "PSTerrain", "ps_5_0", 0, 0, &g.psTerrain, &errors);
+			if (FAILED(hr)) {
+				LogError("compiling the pixel shader for the terrain", hr);
+				if (errors) {
+					g_sdk->logger->Error(g_handle, static_cast<const char*>(errors->GetBufferPointer()));
+				}
+				return false;
+			}
 
 			D3D12_DESCRIPTOR_RANGE range{};
 			range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-			range.NumDescriptors = 5;
+			range.NumDescriptors = 6;
 			range.BaseShaderRegister = 0;
 			range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -508,7 +658,7 @@ float4 PS(VSOut i) : SV_Target
 			params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 			params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 			params[1].Constants.ShaderRegister = 0;
-			params[1].Constants.Num32BitValues = 56;
+			params[1].Constants.Num32BitValues = 60;
 			params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 			D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -613,11 +763,107 @@ float4 PS(VSOut i) : SV_Target
 			desc.NumRenderTargets = 1;
 			desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 			desc.SampleDesc.Count = 1;
-			const HRESULT hr = g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g.psoScene));
+			HRESULT hr = g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g.psoScene));
 			if (FAILED(hr)) {
 				LogError("creating the pipeline for the game's HDR scene", hr);
 				return false;
 			}
+			// The block depth pass: plain float output, no blending.
+			{
+				D3D12_GRAPHICS_PIPELINE_STATE_DESC d = desc;
+				d.BlendState.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC{};
+				d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+				d.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+				hr = g.device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&g.psoDepth));
+				if (FAILED(hr)) {
+					LogError("creating the pipeline for the block depth", hr);
+					return false;
+				}
+			}
+			// The terrain's ambient occlusion: multiplied onto the scene (the colour already there times the result); the scene's alpha is left as it is.
+			{
+				D3D12_GRAPHICS_PIPELINE_STATE_DESC d = desc;
+				d.PS = { g.psTerrain->GetBufferPointer(), g.psTerrain->GetBufferSize() };
+				auto& b = d.BlendState.RenderTarget[0];
+				b = D3D12_RENDER_TARGET_BLEND_DESC{};
+				b.BlendEnable = TRUE;
+				b.SrcBlend = D3D12_BLEND_DEST_COLOR;
+				b.DestBlend = D3D12_BLEND_ZERO;
+				b.BlendOp = D3D12_BLEND_OP_ADD;
+				b.SrcBlendAlpha = D3D12_BLEND_ZERO;
+				b.DestBlendAlpha = D3D12_BLEND_ONE;
+				b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+				b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+				hr = g.device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&g.psoTerrain));
+				if (FAILED(hr)) {
+					LogError("creating the pipeline for the terrain's occlusion", hr);
+					return false;
+				}
+				// The same, written over the scene instead (for /ccdebug sceneaoview): the occlusion alone, white for none.
+				b = D3D12_RENDER_TARGET_BLEND_DESC{};
+				b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+				hr = g.device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&g.psoTerrainView));
+				if (FAILED(hr)) {
+					LogError("creating the pipeline for the terrain's occlusion view", hr);
+					return false;
+				}
+			}
+			return true;
+		}
+
+		// The block depth texture (screen sized) and its views, made again if the screen's size changes.
+		bool EnsureBlockDepth(UINT a_w, UINT a_h)
+		{
+			if (g.blockDepth && g.blockDepthW == a_w && g.blockDepthH == a_h) {
+				return true;
+			}
+			WaitIdle();
+			g.blockDepth.Reset();
+			D3D12_HEAP_PROPERTIES heap{};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			heap.CreationNodeMask = 1;
+			heap.VisibleNodeMask = 1;
+			D3D12_RESOURCE_DESC desc{};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			desc.Width = a_w;
+			desc.Height = a_h;
+			desc.DepthOrArraySize = 1;
+			desc.MipLevels = 1;
+			desc.Format = DXGI_FORMAT_R32_FLOAT;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			D3D12_CLEAR_VALUE clear{};
+			clear.Format = DXGI_FORMAT_R32_FLOAT;
+			HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&g.blockDepth));
+			if (FAILED(hr)) {
+				LogError("creating the block depth texture", hr);
+				return false;
+			}
+			if (!g.sceneRtvHeap) {
+				D3D12_DESCRIPTOR_HEAP_DESC rtv{};
+				rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+				rtv.NumDescriptors = 1;
+				hr = g.device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&g.sceneRtvHeap));
+				if (FAILED(hr)) {
+					LogError("creating the block depth render target heap", hr);
+					return false;
+				}
+			}
+			D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
+			rtvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+			rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+			g.device->CreateRenderTargetView(g.blockDepth.Get(), &rtvDesc, g.sceneRtvHeap->GetCPUDescriptorHandleForHeapStart());
+			D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+			view.Format = DXGI_FORMAT_R32_FLOAT;
+			view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			view.Texture2D.MipLevels = 1;
+			D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+			h.ptr += SIZE_T(5) * g.srvInc;
+			g.device->CreateShaderResourceView(g.blockDepth.Get(), &view, h);
+			g.blockDepthW = a_w;
+			g.blockDepthH = a_h;
 			return true;
 		}
 
@@ -1083,7 +1329,7 @@ float4 PS(VSOut i) : SV_Target
 				if (useGameDepth) {
 					++g_depthDraws;
 				}
-				float constants[56] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
+				float constants[60] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
 					g.mcA, g.mcB, 0.02f /* the game's near plane: its depth is 0.02 / distance */, 0.06f, 0.004f, float(g_debugView), float(g_uiMode), useUi ? 1.0f : 0.0f };
 				// Re-aim the blocks (the world layer) at the game's camera as it is now, so the time the picture took to arrive isn't seen.
 				if (g.layered && g_warpEnabled) {
@@ -1115,15 +1361,15 @@ float4 PS(VSOut i) : SV_Target
 					constants[4] = g.texW ? cx * float(bb.Width) / float(g.texW) : cx;
 					constants[5] = g.texH ? cy * float(bb.Height) / float(g.texH) : cy;
 				}
-				g.list->SetGraphicsRoot32BitConstants(1, 56, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			} else if (badge) {
 				++g_badgeDraws;
 				D3D12_RECT scissor{ 8, 8, 72, 72 };  // the test square
 				g.list->RSSetScissorRects(1, &scissor);
-				float constants[56] = {};
+				float constants[60] = {};
 				constants[1] = 1.0f;
-				g.list->SetGraphicsRoot32BitConstants(1, 56, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			}
 
@@ -1342,11 +1588,9 @@ float4 PS(VSOut i) : SV_Target
 		auto toRead = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		a_list->ResourceBarrier(1, &toRead);
 
-		a_list->OMSetRenderTargets(1, &a_rtv, FALSE, nullptr);
 		ID3D12DescriptorHeap* heaps[] = { g.srvHeap.Get() };
 		a_list->SetDescriptorHeaps(1, heaps);
 		a_list->SetGraphicsRootSignature(g.rootSignature.Get());
-		a_list->SetPipelineState(g.psoScene.Get());
 		a_list->SetGraphicsRootDescriptorTable(0, g.srvHeap->GetGPUDescriptorHandleForHeapStart());
 		a_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(a_width), float(a_height), 0.0f, 1.0f };
@@ -1354,16 +1598,29 @@ float4 PS(VSOut i) : SV_Target
 		D3D12_RECT scissor{ 0, 0, LONG(a_width), LONG(a_height) };
 		a_list->RSSetScissorRects(1, &scissor);
 
-		float constants[56] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, 1.0f,
+		float constants[60] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, 1.0f,
 			g.mcA, g.mcB, 0.02f /* the game's near plane */, 0.06f, 0.004f, 0.0f, 0.0f, 0.0f };
 		auto& link = Link::Get();
 		bool warped = false;
 		Link::CameraPose drawn;
+		Link::CameraPose target;
+		bool haveTarget = false;
 		const bool haveDrawn = link.CameraPoseForFrame(g.cameraFrame, drawn);
 		if (g_warpEnabled) {
-			Link::CameraPose target;
 			const auto aim = std::chrono::steady_clock::now() - std::chrono::microseconds(static_cast<long long>(g_sceneDelayMs * 1000.0f));
-			warped = haveDrawn && link.CameraPoseAt(aim, target) && BuildWarp(drawn, target, &constants[16]);
+			haveTarget = link.CameraPoseAt(aim, target);
+			warped = haveDrawn && haveTarget && BuildWarp(drawn, target, &constants[16]);
+		}
+		if ((g_sceneAo > 0.0f || g_sceneAoView || g_terrainAo > 0.0f) && (haveDrawn || haveTarget)) {
+			// Ambient occlusion needs the camera's field of view.
+			constexpr double kRad = 3.14159265358979323846 / 180.0;
+			const double tanHalfY = std::tan((haveTarget ? target.vfov : drawn.vfov) * 0.5 * kRad);
+			if (tanHalfY > 0.01) {
+				constants[56] = g_sceneAoView ? -std::max(g_sceneAo, 0.01f) : g_sceneAo;   // the blocks' own occlusion: strength (negative: show only the occlusion)
+				constants[57] = g_sceneAoRadius;
+				constants[58] = 0.0f;                                                       // (set below for the terrain's occlusion: its strength)
+				constants[59] = static_cast<float>(tanHalfY);
+			}
 		}
 		if (haveDrawn) {
 			// Minecraft's camera axes in Minecraft's world, as the rows of the matrix from camera space to world space: used to tell which way a face points.
@@ -1378,10 +1635,39 @@ float4 PS(VSOut i) : SV_Target
 		if (!warped) {
 			constants[31] = 0.0f;
 		}
-		constants[40] = 1.0f;          // into the scene
 		constants[41] = g_sceneGain;
 		constants[43] = g_sceneGlow;
-		a_list->SetGraphicsRoot32BitConstants(1, 56, constants, 0);
+		const bool haveCamera = haveDrawn || haveTarget;
+		// The terrain's occlusion needs the camera's field of view (set above with the block occlusion's); its strength rides in aoParams.z.
+		if (haveCamera && (g_terrainAo > 0.0f || g_sceneAoView) && constants[59] > 0.0f) {
+			if (EnsureBlockDepth(a_width, a_height)) {
+				constants[58] = std::max(g_terrainAo, g_sceneAoView ? 0.01f : 0.0f);
+				// Pass 1: how far the nearest block is at each place on the screen, from the current camera (0 where there is none).
+				auto toTarget = Transition(g.blockDepth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+				a_list->ResourceBarrier(1, &toTarget);
+				D3D12_CPU_DESCRIPTOR_HANDLE depthRtv = g.sceneRtvHeap->GetCPUDescriptorHandleForHeapStart();
+				a_list->OMSetRenderTargets(1, &depthRtv, FALSE, nullptr);
+				const float none[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+				a_list->ClearRenderTargetView(depthRtv, none, 0, nullptr);
+				a_list->SetPipelineState(g.psoDepth.Get());
+				constants[40] = 2.0f;
+				a_list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
+				a_list->DrawInstanced(3, 1, 0, 0);
+				auto toRead = Transition(g.blockDepth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				a_list->ResourceBarrier(1, &toRead);
+				// Pass 2: the game's own surfaces darkened where blocks are close to them (multiplied onto the scene).
+				a_list->OMSetRenderTargets(1, &a_rtv, FALSE, nullptr);
+				a_list->SetPipelineState(g_sceneAoView ? g.psoTerrainView.Get() : g.psoTerrain.Get());
+				constants[40] = 3.0f;
+				a_list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
+				a_list->DrawInstanced(3, 1, 0, 0);
+			}
+		}
+		// The blocks themselves, over all of that.
+		a_list->OMSetRenderTargets(1, &a_rtv, FALSE, nullptr);
+		a_list->SetPipelineState(g.psoScene.Get());
+		constants[40] = 1.0f;          // into the scene
+		a_list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
 		a_list->DrawInstanced(3, 1, 0, 0);
 
 		auto back = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1393,6 +1679,27 @@ float4 PS(VSOut i) : SV_Target
 	const char* SceneBlockedReason()
 	{
 		return g_sceneWhy;
+	}
+
+	void SetSceneTerrainAo(float a_percent)
+	{
+		g_terrainAo = std::clamp(a_percent, 0.0f, 100.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: ambient occlusion on the game's surfaces next to blocks: %s (strength %.0f%%)", g_terrainAo > 0.0f ? "on" : "off", g_terrainAo * 100.0f);
+	}
+
+	void SetSceneAoView(bool a_on)
+	{
+		g_sceneAoView = a_on;
+		g_sdk->logger->InfoF(g_handle, "overlay: ambient occlusion view: %s", a_on ? "showing only the occlusion (white: none, dark: a lot); strength 0 is treated as 1%" : "off");
+	}
+
+	void SetSceneAo(float a_percent, float a_radiusCm)
+	{
+		g_sceneAo = std::clamp(a_percent, 0.0f, 100.0f) / 100.0f;
+		if (a_radiusCm > 0.0f) {
+			g_sceneAoRadius = std::clamp(a_radiusCm, 10.0f, 300.0f) / 100.0f;
+		}
+		g_sdk->logger->InfoF(g_handle, "overlay: ambient occlusion where blocks meet the game's world: %s (strength %.0f%%, radius %.2f m)", g_sceneAo > 0.0f ? "on" : "off", g_sceneAo * 100.0f, g_sceneAoRadius);
 	}
 
 	void SetSceneGlow(float a_percent)

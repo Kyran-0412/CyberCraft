@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 22;
+	public static final int VERSION = 23;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -58,6 +58,16 @@ public final class Proto {
 	public static final int MC_CAM_SOURCE_SHIFT = 3; // bits 3-4: which camera the plugin should publish: 0 transform, 1 data, 2 projected
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock) ----
+	public static final long OFF_MC_WORLD = 0x240; // Minecraft's time of day and weather (see McWorld in the protocol header)
+	public static final long W_SEQ = 0; // u32, seqlock
+	public static final long W_FLAGS = 4; // u32
+	public static final long W_DAYTIME = 8; // i64, ticks (tick 0 is 6:00)
+	public static final long W_RAIN = 16; // float, 0 to 1
+	public static final long W_THUNDER = 20; // float, 0 to 1
+	public static final long W_FRAME = 24; // u64
+	public static final int W_IN_WORLD = 1;
+	public static final int W_SYNC_TIME = 2;
+	public static final int W_SYNC_WEATHER = 4;
 	public static final long OFF_MC_COMMAND = 0x300;
 	public static final long C_SEQ = 0; // u32, odd while being written; Cyberpunk acts on each new even value
 	public static final long C_KIND = 4; // u32
@@ -78,6 +88,10 @@ public final class Proto {
 	public static final int DEBUG_SCENE_GAIN = 7; // y: the blocks' brightness in the game's HDR scene, in percent
 	public static final int DEBUG_SCENE_DELAY = 8; // y: milliseconds behind the newest published camera that the blocks are aimed at when drawn into the scene
 	public static final int DEBUG_SCENE_GLOW = 10; // y: how much the brightest pixels of the blocks are boosted in the game's HDR scene, in percent
+	public static final int DEBUG_SCENE_AO = 11; // y: ambient occlusion where blocks meet the game's world, strength in percent (0 off); z: radius in centimetres (0: unchanged)
+	public static final int DEBUG_SCENE_AO_VIEW = 12; // y: 1 show only the ambient occlusion term, 0 normal
+	public static final int DEBUG_SCENE_TERRAIN_AO = 13; // y: ambient occlusion on the game's own surfaces next to blocks, strength in percent (0 off)
+	public static final int DEBUG_CLASS = 14; // y: up to six letters packed into the number; list the methods and fields of the game's classes with that in their name
 	public static final int DEBUG_FIND = 9; // y: up to six letters packed into the number; list the game's classes, enums and functions with that in their name
 
 	public static final int RESULT_NONE = 0;

@@ -1,6 +1,7 @@
 package dev.cybercraft.client;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.cybercraft.CyberCraft;
@@ -306,6 +307,33 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_GAIN, percent, "The blocks drawn into the game's scene are " + percent + "% as bright as before.")));
 					return 1;
 				})))
+				// /ccdebug sceneao <percent> [radiusCm]: ambient occlusion where blocks meet the game's world (the foot of a wall, a corner, where a block sinks into the road), found from the game's depth;
+				// 0 is off (the default), try 60 to 100; the radius is how far away something still counts, 60 cm by default.
+				.then(ClientCommands.literal("sceneao").then(ClientCommands.argument("percent", IntegerArgumentType.integer(0, 100)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_AO, percent, percent == 0 ? "Ambient occlusion on the blocks: off." : "Ambient occlusion on the blocks: " + percent + "%.")));
+					return 1;
+				}).then(ClientCommands.argument("radiusCm", IntegerArgumentType.integer(10, 300)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent"), radius = IntegerArgumentType.getInteger(c, "radiusCm");
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_SCENE_AO, percent, radius) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: ambient occlusion on the blocks: " + percent + "%, radius " + radius + " cm."));
+					}
+					return 1;
+				}))))
+				// /ccdebug sceneterrainao <percent>: the shadow a block makes on the road and walls next to it (the game's own surfaces darkened where blocks are close), 0 is off; default 60.
+				.then(ClientCommands.literal("sceneterrainao").then(ClientCommands.argument("percent", IntegerArgumentType.integer(0, 100)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_TERRAIN_AO, percent, percent == 0 ? "Occlusion on the game's surfaces next to blocks: off." : "Occlusion on the game's surfaces next to blocks: " + percent + "%.")));
+					return 1;
+				})))
+				// /ccdebug sceneaoview <0|1>: show only the ambient occlusion term (white where there is none, dark where there is a lot), to see what it does.
+				.then(ClientCommands.literal("sceneaoview").then(ClientCommands.argument("on", IntegerArgumentType.integer(0, 1)).executes(c -> {
+					int on = IntegerArgumentType.getInteger(c, "on");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_AO_VIEW, on, on == 1 ? "Showing only the ambient occlusion on the blocks (white: none, dark: a lot)." : "Ambient occlusion view off.")));
+					return 1;
+				})))
 				// /ccdebug sceneglow <percent>: how much the brightest pixels (lit whites, glowstone, torch flames) are boosted in the game's scene so that they glow with the game's bloom (0 off; default 300: up to 4 times).
 				.then(ClientCommands.literal("sceneglow").then(ClientCommands.argument("percent", IntegerArgumentType.integer(0, 3000)).executes(c -> {
 					int percent = IntegerArgumentType.getInteger(c, "percent");
@@ -322,6 +350,16 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_DUMP, 0, "Writing the classes behind the collision boxes to CyberCraft.log.")));
 					return 1;
 				}))
+				// /ccdebug class <word>: the methods and fields of the game's classes with <word> (up to six letters) in their name; the shortest names first, at most four classes.
+				.then(ClientCommands.literal("class").then(ClientCommands.argument("word", StringArgumentType.word()).executes(c -> {
+					String word = StringArgumentType.getString(c, "word").toLowerCase();
+					long packed = 0;
+					for (int i = 0; i < Math.min(6, word.length()); i++) {
+						packed |= ((long) (word.charAt(i) & 0x7F)) << (8 * i);
+					}
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_CLASS, (double) packed, "Describing the game's classes with \"" + word.substring(0, Math.min(6, word.length())) + "\" in their name: the result is in CyberCraft.log (lines starting with debug:).")));
+					return 1;
+				})))
 				.then(ClientCommands.literal("find").then(ClientCommands.argument("word", StringArgumentType.word()).executes(c -> {
 					String word = StringArgumentType.getString(c, "word").toLowerCase();
 					long packed = 0;
@@ -329,6 +367,22 @@ public final class CyberCraftClient implements ClientModInitializer {
 						packed |= ((long) (word.charAt(i) & 0x7F)) << (8 * i);
 					}
 					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_FIND, (double) packed, "Searching the game for \"" + word.substring(0, Math.min(6, word.length())) + "\": the result is in CyberCraft.log.")));
+					return 1;
+				}))));
+			// /ccsync time <true|false> and /ccsync weather <true|false>: Night City's time of day and weather follow Minecraft's (so /time set day and /weather rain change the city).
+			dispatcher.register(ClientCommands.literal("ccsync")
+				.then(ClientCommands.literal("time").then(ClientCommands.argument("on", BoolArgumentType.bool()).executes(c -> {
+					WorldSync.syncTime = BoolArgumentType.getBool(c, "on");
+					c.getSource().sendFeedback(Component.literal(WorldSync.syncTime
+						? "CyberCraft: Night City's time of day now follows Minecraft's (use /time set ...)."
+						: "CyberCraft: Night City keeps its own time of day."));
+					return 1;
+				})))
+				.then(ClientCommands.literal("weather").then(ClientCommands.argument("on", BoolArgumentType.bool()).executes(c -> {
+					WorldSync.syncWeather = BoolArgumentType.getBool(c, "on");
+					c.getSource().sendFeedback(Component.literal(WorldSync.syncWeather
+						? "CyberCraft: Night City's weather now follows Minecraft's (use /weather clear|rain|thunder)."
+						: "CyberCraft: Night City keeps its own weather."));
 					return 1;
 				}))));
 			// /ccterrain  turns aiming at Night City itself (to build on its streets and walls) off and on.
@@ -843,6 +897,10 @@ public final class CyberCraftClient implements ClientModInitializer {
 		} else {
 			CyberLink.publishMcState(true, false, screenOpen, camSource, depthProbe, depthCapture || occludeActive(), depthDebug, !warp, (float) warpDelayMs, sensitivity, 0, 0, 0, player.getYRot(), player.getXRot());
 		}
+
+		// Minecraft's time of day and weather: published every tick, and Cyberpunk sets the game's from them when the player has turned the sync on (/ccsync).
+		WorldSync.read(client.level);
+		CyberLink.publishMcWorld(client.level != null && WorldSync.ok, WorldSync.syncTime, WorldSync.syncWeather, WorldSync.dayTime, WorldSync.rain, WorldSync.thunder);
 
 		if (!haveState) {
 			return;

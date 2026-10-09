@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 22;
+	inline constexpr std::uint32_t kVersion = 23;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -25,6 +25,7 @@ namespace cybercraft::proto
 	inline constexpr std::uint64_t kOffHeader = 0x0;
 	inline constexpr std::uint64_t kOffGameState = 0x100;  // Cyberpunk -> Minecraft
 	inline constexpr std::uint64_t kOffMcState = 0x200;    // Minecraft -> Cyberpunk: where Minecraft wants V
+	inline constexpr std::uint64_t kOffMcWorld = 0x240;    // Minecraft -> Cyberpunk: Minecraft's time of day and weather, see McWorld (fits between McState and the command slot)
 	inline constexpr std::uint64_t kOffMcCommand = 0x300;  // Minecraft -> Cyberpunk: one-off commands
 	inline constexpr std::uint64_t kOffCamera = 0x400;     // Cyberpunk -> Minecraft: the game's camera, see CameraState
 	inline constexpr std::uint64_t kOffGround = 0x1000;   // Cyberpunk -> Minecraft: ground heights, see GroundSlot
@@ -118,6 +119,26 @@ namespace cybercraft::proto
 		float         warpDelayMs;                // how far behind the newest camera the game's picture is, for re-aiming the blocks (see kMcNoWarp)
 	};
 	static_assert(sizeof(McState) == 0x38);
+
+	// ---- Minecraft's world: time of day and weather @kOffMcWorld (seqlock: seq is odd while being written) -----
+	// Minecraft is the clock and the weather of Night City when the player turns the sync on (/ccsync): the plugin sets the game's time and weather from these.
+	enum McWorldFlags : std::uint32_t
+	{
+		kWorldInWorld = 1u << 0,      // the values below are Minecraft's current ones (there is a world)
+		kWorldSyncTime = 1u << 1,     // the player wants the game's time of day to follow Minecraft's
+		kWorldSyncWeather = 1u << 2,  // the player wants the game's weather to follow Minecraft's
+	};
+
+	struct McWorld
+	{
+		std::uint32_t seq;
+		std::uint32_t flags;    // McWorldFlags
+		std::int64_t  dayTime;  // Minecraft's time of day in ticks (tick 0 is 6:00, 6000 noon, 12000 18:00, 18000 midnight); may be larger than a day
+		float         rain;     // 0 to 1
+		float         thunder;  // 0 to 1
+		std::uint64_t frame;    // counts up with every write
+	};
+	static_assert(sizeof(McWorld) == 0x20);
 
 	// ---- Minecraft -> Cyberpunk command @0x300 (seqlock: seq is odd while being written) -----
 	// A latest-value slot. Minecraft writes the fields and bumps seq by 2 (even); Cyberpunk acts on a
@@ -275,6 +296,10 @@ namespace cybercraft::proto
 		kDebugSceneGain = 7,   // y: the blocks' brightness in the game's HDR scene, in percent (100: a Minecraft white is 1.0 in the scene's units)
 		kDebugSceneDelay = 8,  // y: how many milliseconds behind the newest published camera the blocks are aimed when they are drawn into the scene
 		kDebugSceneGlow = 10,  // y: how much the brightest pixels of the blocks are boosted in the game's HDR scene, in percent of their brightness (300: up to four times as bright)
+		kDebugSceneAo = 11,    // y: ambient occlusion where blocks meet the game's world, strength in percent (0 off); z: its radius in centimetres (0: unchanged)
+		kDebugSceneAoView = 12,  // y: 1 show only the ambient occlusion term (white: none, dark: a lot), 0 normal
+		kDebugSceneTerrainAo = 13,  // y: ambient occlusion on the game's own surfaces next to blocks (the shadow a block makes on the road), strength in percent (0 off)
+		kDebugClass = 14,  // y: up to six letters packed into the number; list the methods and fields of the game's classes with that in their name
 		kDebugFind = 9,   // y: up to six letters packed into the number; list the game's classes, enums and global functions with that in their name
 	};
 

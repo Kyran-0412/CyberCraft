@@ -120,6 +120,27 @@ namespace cybercraft
 		seq.store(start + 2, std::memory_order_release);  // even: done
 	}
 
+	bool Link::ReadMcWorld(McWorldSnapshot& a_out) const
+	{
+		if (!base_) {
+			return false;
+		}
+		auto* world = reinterpret_cast<proto::McWorld*>(base_ + proto::kOffMcWorld);
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			const auto seq1 = Atomic(world->seq).load(std::memory_order_acquire);
+			if ((seq1 & 1) != 0) {
+				continue;  // Minecraft is writing it right now
+			}
+			const McWorldSnapshot copy{ world->flags, world->dayTime, world->rain, world->thunder, world->frame };
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (Atomic(world->seq).load(std::memory_order_relaxed) == seq1) {
+				a_out = copy;
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool Link::ReadMcState(McSnapshot& a_out) const
 	{
 		if (!base_) {

@@ -22,6 +22,9 @@ namespace cybercraft::overlay
 	// While blocks are drawn into the scene, the draw at Present leaves them out (it draws only the hand, hotbar and screens).
 	bool DrawWorldIntoScene(ID3D12GraphicsCommandList* a_list, D3D12_CPU_DESCRIPTOR_HANDLE a_rtv, UINT a_width, UINT a_height);
 	void SetSceneGain(float a_percent);
+	void SetSceneTerrainAo(float a_percent);  // the shadow a block makes on the road and walls next to it, strength in percent (0 off)
+	void SetSceneAoView(bool a_on);  // show only the occlusion term, for tuning
+	void SetSceneAo(float a_percent, float a_radiusCm);  // ambient occlusion where blocks meet the game's world: strength in percent (0 off), radius in centimetres (0: unchanged)
 	void SetSceneGlow(float a_percent);  // the brightest pixels (lit whites, glowstone, torch flames) are boosted by up to this much, so that they glow with the game's bloom
 	const char* SceneBlockedReason();    // why the last DrawWorldIntoScene drew nothing
 	void SetSceneDelay(float a_ms);

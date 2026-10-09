@@ -72,6 +72,17 @@ namespace cybercraft
 		// True when a consistent copy was read.
 		bool ReadMcState(McSnapshot& a_out) const;
 
+		// Minecraft's time of day and weather (see McWorld in the protocol).
+		struct McWorldSnapshot
+		{
+			std::uint32_t flags = 0;
+			std::int64_t dayTime = 0;
+			float rain = 0.0f;
+			float thunder = 0.0f;
+			std::uint64_t frame = 0;
+		};
+		bool ReadMcWorld(McWorldSnapshot& a_out) const;
+
 		// A one-off command from Minecraft (see McCommand in the protocol).
 		struct Command
 		{

@@ -11,6 +11,7 @@
 #include "Log.hpp"
 #include "UiProbe.hpp"
 #include "InScene.hpp"
+#include "World.hpp"
 #include "Depth.hpp"
 #include "Ground.hpp"
 #include "Input.hpp"
@@ -183,7 +184,19 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
 
     if (aCommand.kind == cybercraft::proto::kCmdDebug)
     {
-        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneGlow)
+        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneTerrainAo)
+        {
+            cybercraft::overlay::SetSceneTerrainAo(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneAoView)
+        {
+            cybercraft::overlay::SetSceneAoView(aCommand.y != 0.0);
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneAo)
+        {
+            cybercraft::overlay::SetSceneAo(static_cast<float>(aCommand.y), static_cast<float>(aCommand.z));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneGlow)
         {
             cybercraft::overlay::SetSceneGlow(static_cast<float>(aCommand.y));
         }
@@ -588,6 +601,7 @@ bool OnRunningUpdate(RED4ext::CGameApplication*)
 
     cybercraft::camera::Update(player);
     cybercraft::collision::Update(); // keeps Night City's collision boxes matching what is built in Minecraft
+    cybercraft::world::Update();     // Minecraft's time of day and weather (the game's follow them when /ccsync is on)
 
     if (!g_lookedUpFunction)
     {
@@ -680,6 +694,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         cybercraft::collision::Init(aHandle, aSdk);
         cybercraft::uiprobe::Init(aHandle, aSdk);
         cybercraft::inscene::Init(aHandle, aSdk);
+        cybercraft::world::Init(aHandle, aSdk);
         cybercraft::mapping::Load();
         aSdk->logger->InfoF(aHandle, "vertical offset between the game and Minecraft: %.3f", cybercraft::mapping::Offset());
 
