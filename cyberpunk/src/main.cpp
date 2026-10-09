@@ -184,7 +184,11 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
 
     if (aCommand.kind == cybercraft::proto::kCmdDebug)
     {
-        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneTerrainAo)
+        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugWeather)
+        {
+            cybercraft::world::SetWeatherByWord(cybercraft::world::UnpackWord(aCommand.y, aCommand.z));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneTerrainAo)
         {
             cybercraft::overlay::SetSceneTerrainAo(static_cast<float>(aCommand.y));
         }
@@ -232,7 +236,7 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
         }
         else
         {
-            cybercraft::collision::Command(static_cast<int>(aCommand.x), aCommand.y);
+            cybercraft::collision::Command(static_cast<int>(aCommand.x), aCommand.y, aCommand.z);
         }
         link.AckCommand(aCommand.seq, true);
         return;

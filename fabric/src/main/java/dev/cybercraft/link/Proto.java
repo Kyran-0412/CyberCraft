@@ -92,6 +92,7 @@ public final class Proto {
 	public static final int DEBUG_SCENE_AO_VIEW = 12; // y: 1 show only the ambient occlusion term, 0 normal
 	public static final int DEBUG_SCENE_TERRAIN_AO = 13; // y: ambient occlusion on the game's own surfaces next to blocks, strength in percent (0 off)
 	public static final int DEBUG_CLASS = 14; // y: up to six letters packed into the number; list the methods and fields of the game's classes with that in their name
+	public static final int DEBUG_WEATHER = 15; // y, z: up to twelve letters packed into the numbers (six each): a weather name to set in the game, or "reset"
 	public static final int DEBUG_FIND = 9; // y: up to six letters packed into the number; list the game's classes, enums and functions with that in their name
 
 	public static final int RESULT_NONE = 0;

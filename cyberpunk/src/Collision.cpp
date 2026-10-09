@@ -518,7 +518,7 @@ namespace cybercraft::collision
 		g_sdk = a_sdk;
 	}
 
-	void Command(int a_action, double a_arg)
+	void Command(int a_action, double a_arg, double a_arg2)
 	{
 		if (a_action == proto::kDebugDump) {
 			DumpCollisionClasses();
@@ -535,6 +535,17 @@ namespace cybercraft::collision
 					break;
 				}
 				word += ch;
+			}
+			if (a_action == proto::kDebugClass && word.size() == 6) {
+				// /ccdebug class takes up to twelve letters: the next six arrive in the second argument.
+				const std::uint64_t packed2 = static_cast<std::uint64_t>(a_arg2);
+				for (int i = 0; i < 6; ++i) {
+					const char ch = static_cast<char>((packed2 >> (8 * i)) & 0x7F);
+					if (!ch) {
+						break;
+					}
+					word += ch;
+				}
 			}
 			if (a_action == proto::kDebugClass) {
 				DumpClasses(word);

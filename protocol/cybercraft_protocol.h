@@ -299,7 +299,8 @@ namespace cybercraft::proto
 		kDebugSceneAo = 11,    // y: ambient occlusion where blocks meet the game's world, strength in percent (0 off); z: its radius in centimetres (0: unchanged)
 		kDebugSceneAoView = 12,  // y: 1 show only the ambient occlusion term (white: none, dark: a lot), 0 normal
 		kDebugSceneTerrainAo = 13,  // y: ambient occlusion on the game's own surfaces next to blocks (the shadow a block makes on the road), strength in percent (0 off)
-		kDebugClass = 14,  // y: up to six letters packed into the number; list the methods and fields of the game's classes with that in their name
+		kDebugClass = 14,  // y: up to six letters packed into the number, z: the next six; list the methods and fields of the game's classes with that in their name
+		kDebugWeather = 15,  // y, z: up to twelve letters packed into the numbers (six each): a weather name to set in the game (see /ccweather), or "reset" to give the weather back to the game
 		kDebugFind = 9,   // y: up to six letters packed into the number; list the game's classes, enums and global functions with that in their name
 	};
 

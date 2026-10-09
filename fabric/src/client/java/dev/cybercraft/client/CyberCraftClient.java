@@ -354,10 +354,20 @@ public final class CyberCraftClient implements ClientModInitializer {
 				.then(ClientCommands.literal("class").then(ClientCommands.argument("word", StringArgumentType.word()).executes(c -> {
 					String word = StringArgumentType.getString(c, "word").toLowerCase();
 					long packed = 0;
-					for (int i = 0; i < Math.min(6, word.length()); i++) {
-						packed |= ((long) (word.charAt(i) & 0x7F)) << (8 * i);
+					long packed2 = 0;
+					for (int i = 0; i < Math.min(12, word.length()); i++) {
+						if (i < 6) {
+							packed |= ((long) (word.charAt(i) & 0x7F)) << (8 * i);
+						} else {
+							packed2 |= ((long) (word.charAt(i) & 0x7F)) << (8 * (i - 6));
+						}
 					}
-					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_CLASS, (double) packed, "Describing the game's classes with \"" + word.substring(0, Math.min(6, word.length())) + "\" in their name: the result is in CyberCraft.log (lines starting with debug:).")));
+					String shown = word.substring(0, Math.min(12, word.length()));
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_CLASS, (double) packed, (double) packed2) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: describing the game's classes with \"" + shown + "\" in their name (up to twelve letters): the result is in CyberCraft.log (lines starting with debug:)."));
+					}
 					return 1;
 				})))
 				.then(ClientCommands.literal("find").then(ClientCommands.argument("word", StringArgumentType.word()).executes(c -> {
@@ -371,6 +381,14 @@ public final class CyberCraftClient implements ClientModInitializer {
 				}))));
 			// /ccsync time <true|false> and /ccsync weather <true|false>: Night City's time of day and weather follow Minecraft's (so /time set day and /weather rain change the city).
 			dispatcher.register(ClientCommands.literal("ccsync")
+				// /ccsync status: what the mod found of Minecraft's time and weather (the method names differ between versions), and what it reads now.
+				.then(ClientCommands.literal("status").executes(c -> {
+					WorldSync.read(net.minecraft.client.Minecraft.getInstance().level);
+					for (String line : WorldSync.status()) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: " + line));
+					}
+					return 1;
+				}))
 				.then(ClientCommands.literal("time").then(ClientCommands.argument("on", BoolArgumentType.bool()).executes(c -> {
 					WorldSync.syncTime = BoolArgumentType.getBool(c, "on");
 					c.getSource().sendFeedback(Component.literal(WorldSync.syncTime
@@ -385,6 +403,29 @@ public final class CyberCraftClient implements ClientModInitializer {
 						: "CyberCraft: Night City keeps its own weather."));
 					return 1;
 				}))));
+			// /ccweather <name>: sets one of Night City's own weathers (Minecraft only has clear, rain and thunder): clear, sunny, lightclouds, cloudy, heavyclouds, rain, lightrain, fog, pollution,
+			// acid, sandstorm; or reset, which gives the weather back to the game's own schedule. (With /ccsync weather on, Minecraft's weather will set it again when it changes.)
+			dispatcher.register(ClientCommands.literal("ccweather").then(ClientCommands.argument("name", StringArgumentType.word()).executes(c -> {
+				String word = StringArgumentType.getString(c, "name").toLowerCase();
+				long first = 0;
+				long second = 0;
+				for (int i = 0; i < Math.min(12, word.length()); i++) {
+					if (i < 6) {
+						first |= ((long) (word.charAt(i) & 0x7F)) << (8 * i);
+					} else {
+						second |= ((long) (word.charAt(i) & 0x7F)) << (8 * (i - 6));
+					}
+				}
+				if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_WEATHER, (double) first, (double) second) == 0) {
+					c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+				} else {
+					c.getSource().sendFeedback(Component.literal("CyberCraft: asking Night City for the weather \"" + word + "\" (known: clear, sunny, lightclouds, cloudy, heavyclouds, rain, lightrain, fog, pollution, acid, sandstorm, reset; the log says what the game answered)."));
+				}
+				return 1;
+			})).executes(c -> {
+				c.getSource().sendFeedback(Component.literal("CyberCraft: /ccweather <clear|sunny|lightclouds|cloudy|heavyclouds|rain|lightrain|fog|pollution|acid|sandstorm|reset>"));
+				return 1;
+			}));
 			// /ccterrain  turns aiming at Night City itself (to build on its streets and walls) off and on.
 			dispatcher.register(ClientCommands.literal("ccterrain").executes(c -> {
 				TerrainPick.setEnabled(!TerrainPick.enabled());
