@@ -112,6 +112,9 @@ namespace cybercraft::depth
 		std::vector<ID3D12Resource*> g_rejected;  // textures whose depth did not agree with the game's rays: not chosen again
 		int g_sampleGood = 0;
 		int g_sampleBad = 0;
+		int g_prevGood = 0;      // the tallies at the previous report, to tell what the latest report found
+		int g_prevBad = 0;
+		int g_badReports = 0;    // reports in a row in which most readings did not fit depth = 0.02 / distance
 
 		struct Graveyard
 		{
@@ -716,6 +719,9 @@ namespace cybercraft::depth
 			g_candidateMisses = 0;
 			g_sampleGood = 0;
 			g_sampleBad = 0;
+			g_prevGood = 0;
+			g_prevBad = 0;
+			g_badReports = 0;
 			g_candidate.store(source, std::memory_order_release);
 			g_copyPtr.store(g_copy.Get(), std::memory_order_release);
 			g_readbackPtr.store(g_readback.Get(), std::memory_order_release);
@@ -935,6 +941,20 @@ namespace cybercraft::depth
 		return true;
 	}
 
+	ID3D12Resource* CandidateResource()
+	{
+		return g_candidate.load(std::memory_order_acquire);
+	}
+
+	bool RecordSceneCapture(ID3D12GraphicsCommandList* a_list, std::uint32_t a_state)
+	{
+		if (!a_list || !g_copyReady.load(std::memory_order_acquire) || !g_candidate.load(std::memory_order_acquire)) {
+			return false;
+		}
+		RecordCapture(a_list, static_cast<D3D12_RESOURCE_STATES>(a_state));
+		return true;
+	}
+
 	bool CaptureWanted()
 	{
 		return g_captureWanted && g_active.load();
@@ -1044,11 +1064,37 @@ namespace cybercraft::depth
 		if (!g_readbackData) {
 			return;
 		}
-		if (g_sampleGood + g_sampleBad >= 15 && g_sampleGood * 100 < 35 * (g_sampleGood + g_sampleBad)) {
-			g_sdk->logger->InfoF(g_handle, "depth: capture: this texture's values did not fit depth = 0.02 / distance in %d of %d readings: choosing another", g_sampleBad, g_sampleGood + g_sampleBad);
+		// The readings are compared with rays measured on the CPU at another moment than the frame they are read from, so while the camera moves fast (a jump, a fall, a car) many fail even
+		// though the texture is right. So one bad report is not enough: judge each report on its own readings, and give a texture up only after three bad ones in a row (a wrong texture
+		// fails every time; a right one recovers the first time the camera is still) that are also poor over the whole run. (A single running total from the start threw a good texture away
+		// in the middle of a jump, and for about a second the blocks had no depth to hide behind.)
+		{
+			const int newGood = g_sampleGood - g_prevGood;
+			const int newBad = g_sampleBad - g_prevBad;
+			g_prevGood = g_sampleGood;
+			g_prevBad = g_sampleBad;
+			if (newGood + newBad >= 3) {
+				g_badReports = newGood * 100 < 35 * (newGood + newBad) ? g_badReports + 1 : 0;
+			}
+		}
+		// A texture that has fitted the rays at least eight times has proved itself (a wrong one fits almost never): bad stretches after that are the camera moving, not the texture.
+		if (g_badReports >= 3 && g_sampleGood < 8 && g_sampleGood + g_sampleBad >= 15 && g_sampleGood * 100 < 50 * (g_sampleGood + g_sampleBad)) {
+			// And only give it up if there is something to switch to: when it is the only candidate, switching just means a second without any depth (the blocks can't be hidden behind the
+			// world, so they fall back to the plain draw) and then the same texture chosen again, which is what happened twice while jumping and flying.
 			g_rejected.push_back(candidate);
-			StopCapture();
-			return;
+			if (ChooseCaptureTexture() == nullptr) {
+				g_rejected.pop_back();
+				g_badReports = 0;
+				static auto lastNote = std::chrono::steady_clock::time_point{};
+				if (now - lastNote > std::chrono::seconds(30)) {
+					lastNote = now;
+					g_sdk->logger->InfoF(g_handle, "depth: capture: the readings do not fit depth = 0.02 / distance (%d of %d bad: probably fast movement), but this is the only candidate: keeping it", g_sampleBad, g_sampleGood + g_sampleBad);
+				}
+			} else {
+				g_sdk->logger->InfoF(g_handle, "depth: capture: this texture's values did not fit depth = 0.02 / distance in %d of %d readings, for three reports in a row: choosing another", g_sampleBad, g_sampleGood + g_sampleBad);
+				StopCapture();
+				return;
+			}
 		}
 		for (int i = 0; i < kSamples; ++i) {
 			std::uint32_t bits = 0;

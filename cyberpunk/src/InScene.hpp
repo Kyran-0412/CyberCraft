@@ -14,6 +14,9 @@ namespace cybercraft::inscene
 	// Drawing into the game's own HDR scene (see InScene.cpp): 0 off, 1 to 3 a dim, bright and very bright square in the middle of the screen (the proof of concept), 4 Minecraft's blocks.
 	void SetMode(int a_mode);
 
+	// Starts drawing Minecraft's blocks into the scene (mode 4) unless the player has chosen a mode with /ccdebug scene: called when Minecraft's first frame arrives.
+	void EnableByDefault();
+
 	// Called from the swapchain's Present hook every frame (cheap when off): installs the hooks the first time, and says in the log if the scene is never found.
 	void OnPresent();
 }

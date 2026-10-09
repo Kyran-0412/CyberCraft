@@ -173,7 +173,7 @@ namespace cybercraft::world
 				}
 				for (const char* name : a.names) {
 					const bool ok = SetGameWeather(name, a_blendSeconds);
-					if (a_log || !ok) {
+					if (a_log) {
 						g_sdk->logger->InfoF(g_handle, "world: weather %s -> %s: the game %s", a.word, name, ok ? "accepted it" : "did NOT accept it");
 					}
 					if (ok) {

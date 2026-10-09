@@ -38,6 +38,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
@@ -74,12 +75,14 @@ namespace cybercraft::overlay
 		std::uint64_t g_badgeDraws = 0;
 		int g_debugView = 0;
 		std::recursive_mutex g_gpuMutex;           // Draw (at Present) and DrawWorldIntoScene (from the game's queue submission) share the textures and descriptors
-		float g_sceneGain = 3.0f;                  // the blocks' brightness in the game's HDR scene (1 = a Minecraft white is 1.0 in the scene's units)
+		float g_sceneGain = 1.5f;                  // the blocks' brightness in the game's HDR scene (1 = a Minecraft white is 1.0 in the scene's units)
 		float g_sceneAo = 1.0f;                    // ambient occlusion where blocks meet the game's world: strength 0 (off) to 1
 		float g_terrainAo = 0.6f;                  // the same on the game's own surfaces next to blocks (the shadow a block makes on the road): strength 0 (off) to 1
 		float g_sceneAoRadius = 0.8f;              // metres
 		bool g_sceneAoView = false;                // show only the occlusion term
-		float g_sceneGlow = 1.0f;                  // how much the brightest pixels are boosted in the scene: up to (1 + this) times
+		float g_glowStart = 0.7f;                  // how bright a pixel has to be (after undoing Minecraft's face shading) to count as light-emitting: 0.3 to 0.99
+		float g_fogGlowExp = 0.0f;                 // how much of the fog the glowing pixels of a block feel: the transmittance to this power (1: all of it, 0: none)
+		float g_sceneGlow = 15.0f;                 // how much the brightest pixels are boosted in the scene: up to (1 + this) times
 		const char* g_sceneWhy = "";                // why the last attempt to draw the blocks into the scene drew nothing
 		float g_sceneDelayMs = 0.0f;               // how far behind the newest published camera the blocks are aimed when drawn into the scene
 		std::atomic<std::uint64_t> g_sceneDrawn{ 0 };  // how many times the blocks were drawn into the scene
@@ -88,6 +91,12 @@ namespace cybercraft::overlay
 		float g_uiScaleY = 1.0f;
 		float g_uiShiftX = 0.0f;  // pixels
 		float g_uiShiftY = 0.0f;
+		int g_fogView = 0;                          // 0 off, 1 show a fog volume's colour on the blocks, 2 its transmittance (a debug view)
+		int g_fogIndex = 0;                         // which of the fog volumes found; negative: the one the compute shaders write twice a frame (the integrated volume)
+		float g_fogNear = 0.5f;                     // metres: the distance of the volume's first slice (a guess to be tuned by eye)
+		float g_fogFar = 200.0f;                    // metres: the distance of its last slice
+		bool g_fogExp = true;                       // the slices are spread exponentially with distance (otherwise evenly)
+		std::vector<FogVolume> g_fogVolumes;        // the fog volumes as of the scene being complete, sorted by address (set by the in-scene hook)
 		int g_uiMode = 0;  // the game's interface over the blocks: 0 off, 1 the layer is premultiplied alpha, 2 it is straight alpha, 3 show the layer alone
 		bool g_warpEnabled = true;
 		float g_warpDelayMs = 10.0f;
@@ -117,12 +126,15 @@ cbuffer P : register(b0)
 	float4 sceneParams;                            // x: 1 = draw into the game's HDR scene (linear, scaled by y, brightest pixels boosted by up to w); z: 1 = leave the blocks out (they were drawn into the scene)
 	float4 shadeX; float4 shadeY; float4 shadeZ;   // rows of the matrix from Minecraft's camera space to Minecraft's world (xyz), w of shadeX: 1 = valid: used to tell which way a face points
 	float4 aoParams;                               // ambient occlusion where blocks meet the game's world: x: the blocks' occlusion strength (0 = off; negative = show only the occlusion term, white for none and dark for a lot), y: radius in metres, z: the occlusion strength on the game's own surfaces next to blocks, w: tan(half the vertical field of view)
+	float3 fogParams;                              // the game's volumetric fog on the blocks: x: 0 off, 1 its colour shown instead of the blocks, 2 its transmittance shown, 3 applied to the blocks (block * transmittance + fog light); y: the volume's near distance in metres; z: its far distance (negative: the slices are spread evenly, positive: exponentially)
 };
 Texture2D tex : register(t0);          // the whole frame (plain mode), or the world's colour (layered)
 Texture2D mcDepthTex : register(t1);   // layered: the world's depth, as Minecraft wrote it
 Texture2D overlayTex : register(t2);   // layered: the hand, hotbar and screens
 Texture2D gameDepthTex : register(t3); // the game's own depth (a copy), when there is one
 Texture2D uiTex : register(t4);        // the game's interface layer (a copy), when there is one: its sRGB-encoded values as they are
+Texture3D emitTex : register(t7);       // the light emission level (0 to 15) of every block around the player, one byte each: which blocks are light sources
+Texture3D fogTex : register(t6);       // one of the game's volumetric fog textures (the screen divided by 8 across, 128 slices deep), when one is being looked at
 Texture2D blockDepthTex : register(t5); // how far the nearest block is at each place on the screen, as seen from the current camera (0: none); made by the scene's first pass
 SamplerState samp : register(s0);
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -149,13 +161,13 @@ float3 McViewPos(float2 texUv)
 	return float3(nm * tans.zw, 1.0) * zk;
 }
 // Which way the surface at this place in Minecraft's picture faces, in Minecraft's camera space, from the slope of the picture's depth (zero if it can't tell).
-float3 McNormal(float2 texUv)
+float3 McNormalWithin(float2 texUv, float maxDistance)
 {
 	uint mw, mh;
 	mcDepthTex.GetDimensions(mw, mh);
 	float2 d = 1.0 / float2(mw, mh);
 	float3 pc = McViewPos(texUv);
-	if (pc.z <= 0.0 || pc.z > 48.0) { return float3(0, 0, 0); }
+	if (pc.z <= 0.0 || pc.z > maxDistance) { return float3(0, 0, 0); }
 	float3 pr = McViewPos(texUv + float2(d.x, 0));
 	float3 pl = McViewPos(texUv - float2(d.x, 0));
 	float3 pu = McViewPos(texUv + float2(0, d.y));
@@ -170,6 +182,10 @@ float3 McNormal(float2 texUv)
 	if (dot(n, pc) > 0.0) { n = -n; }   // facing the camera
 	return n;
 }
+float3 McNormal(float2 texUv)
+{
+	return McNormalWithin(texUv, 48.0);
+}
 // How bright Minecraft made the face at this place: 1 for a top, 0.8 north and south, 0.6 east and west, 0.5 a bottom (1 if it can't tell). The way the face points
 // comes from McNormal and the camera's axes in Minecraft's world.
 float McShade(float2 texUv)
@@ -181,6 +197,26 @@ float McShade(float2 texUv)
 	if (abs(nw.y) > 0.7) { return nw.y > 0.0 ? 1.0 : 0.5; }
 	return abs(nw.z) > abs(nw.x) ? 0.8 : 0.6;
 }
+// How much light the block this pixel shows gives out, from the grid Minecraft publishes: its light level / 15, or -1 if there is no grid or the pixel is outside it. Where the block is: the
+// pixel's place in Minecraft's camera space (from the picture's depth), moved a little way into the surface (against its normal, which faces the camera) so that it is inside the block,
+// then turned into Minecraft's world with the camera's axes and measured from the grid's corner (uiXform.xyz is the camera's place relative to that corner).
+float EmissionAt(float2 texUv)
+{
+	if (uiXform.w < 0.5 || shadeX.w < 0.5) { return -1.0; }
+	float3 Pc = McViewPos(texUv);
+	if (Pc.z <= 0.0 || Pc.z > 400.0) { return -1.0; }
+	// The surface direction is worked out as far as the grid goes, and the step into the block grows with distance (the depth is less exact far away).
+	float3 n = McNormalWithin(texUv, 400.0);
+	float push = min(0.12 + 0.0005 * Pc.z, 0.4);
+	float3 Pi = dot(n, n) > 0.5 ? Pc - n * push : Pc + normalize(Pc) * (push * 0.5);
+	float3 Pw = uiXform.xyz + float3(dot(shadeX.xyz, Pi), dot(shadeY.xyz, Pi), dot(shadeZ.xyz, Pi));
+	int3 v = int3(floor(Pw));
+	uint ew, eh, ed;
+	emitTex.GetDimensions(ew, eh, ed);
+	if (any(v < 0) || v.x >= int(ew) || v.y >= int(eh) || v.z >= int(ed)) { return -1.0; }
+	return round(emitTex.Load(int4(v, 0)).r * 255.0) / 15.0;
+}
+
 // Ambient occlusion where a block meets the game's world. Points are taken in 3D on the side of the surface at P that faces N (spread over a hemisphere, turned a little at every
 // pixel), each is projected onto the screen, and it counts as hidden if the game's depth there is in front of it (the point is inside, or behind, the game's geometry) and the
 // game's surface is near P in depth. Taking the points in 3D rather than around the pixel on the screen matters: a road seen at a shallow angle is only a few pixels tall on the
@@ -198,7 +234,8 @@ float SceneAO(float2 pix, float3 P, float3 N)
 	float3 T = normalize(cross(up, N));
 	float3 B = cross(N, T);
 	float bias = 0.02 + 0.004 * P.z;
-	float occ = 0.0;
+)HLSL"
+R"HLSL(	float occ = 0.0;
 	[unroll] for (int k = 0; k < 16; ++k) {
 		float u = (float(k) + 0.5) / 16.0;
 		float phi = (float(k) + noise) * 2.39996323;     // the golden angle: an even spread that is turned a little at every pixel
@@ -220,6 +257,101 @@ float SceneAO(float2 pix, float3 P, float3 N)
 	}
 	return occ / 16.0;
 }
+// The game's depth at a pixel, as a distance (huge for the sky).
+float GameZ(int2 p, int2 size)
+{
+	float sg = gameDepthTex.Load(int3(clamp(p, int2(0, 0), size - 1), 0)).r;
+	return sg > 1e-8 ? gameNear / sg : 1e9;
+}
+// Re-aiming, part one: is the point on the current camera's line of sight at distance t behind the surface that Minecraft's (older) picture shows there? The line is
+// centre + t * direction in Minecraft's camera space (t is also the distance along the current camera's view). nm is where that point is in Minecraft's picture (-1 to 1), and gap how far
+// behind that picture's surface it is (a huge number if the point is off the picture or behind the camera).
+bool PointBehind(float3 centre, float3 direction, float t, uint mw, uint mh, out float2 nm, out float gap)
+{
+	float3 X = centre + t * direction;
+	nm = float2(2.0, 2.0);
+	gap = 1e9;
+	if (X.z <= 0.01) { return false; }
+	nm = X.xy / X.z / tans.zw;
+	if (abs(nm.x) > 1.0 || abs(nm.y) > 1.0) { return false; }
+	float2 tuv = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
+	float2 tex2 = flipY > 0.5 ? float2(tuv.x, 1.0 - tuv.y) : tuv;
+	float s = mcDepthTex.Load(int3(clamp(uint2(tex2 * float2(mw, mh)), uint2(0, 0), uint2(mw - 1, mh - 1)), 0)).r;
+	float ndcz = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
+	float den = ndcz + mcA;
+	float zk = abs(den) > 1e-9 ? mcB / den : 1e9;
+	if (zk <= 0.0) { zk = 1e9; }
+	gap = X.z - zk;
+	return gap >= 0.0;
+}
+// Re-aiming, part two: for this place on the current camera's screen, where in Minecraft's older picture is the nearest block along the line of sight? Walks the line from near to far
+// in steps of equal pixels in the old picture (equal steps of one over the distance, because the picture's parallax is proportional to that) looking for where it goes from in front of
+// a surface to behind it, refines that crossing by bisection, and only then checks that the point found is not more than a block's thickness behind the surface (otherwise the line
+// went behind the block's edge: keep looking). The check must come after the refining: the steps are further apart in metres the further away they are, so a thickness test on the steps
+// themselves misses far blocks altogether, which showed as bands that flickered with the speed. The fixed point iteration this replaced started at the pixel's own place and, where the
+// camera had moved, landed beside a block's edge (on empty space, whose depth says "far away"): a strip of the block along that edge vanished, as wide as the shift.
+bool FindSource(float2 ndc, uint mw, uint mh, out float2 nm, out float zHit)
+{
+	float3 dc = float3(ndc * tans.xy, 1.0);
+	float3 direction = warpR0.xyz * dc.x + warpR1.xyz * dc.y + warpR2.xyz * dc.z;               // the line of sight, in Minecraft's camera space
+	float3 centre = -(warpR0.xyz * warpT.x + warpR1.xyz * warpT.y + warpR2.xyz * warpT.z);     // where the current camera is, in Minecraft's camera space
+	nm = float2(2.0, 2.0);
+	zHit = 1e9;
+	if (direction.z <= 0.01) { return false; }
+	float moved = length(centre.xy) + 0.5 * abs(centre.z);
+	if (moved < 0.002) {
+		// The camera hasn't moved (only turned): the same direction in the old picture, whatever the depth.
+		nm = direction.xy / direction.z / tans.zw;
+		if (abs(nm.x) > 1.0 || abs(nm.y) > 1.0) { return false; }
+		float2 tuv0 = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
+		float2 tex0 = flipY > 0.5 ? float2(tuv0.x, 1.0 - tuv0.y) : tuv0;
+		float s0 = mcDepthTex.Load(int3(clamp(uint2(tex0 * float2(mw, mh)), uint2(0, 0), uint2(mw - 1, mh - 1)), 0)).r;
+		float nz = zeroToOne > 0.5 ? s0 : s0 * 2.0 - 1.0;
+		float dn = nz + mcA;
+		zHit = abs(dn) > 1e-9 ? mcB / dn : 1e9;
+		if (zHit <= 0.0) { zHit = 1e9; }
+		return true;
+	}
+	float focal = 0.5 * float(mh) / tans.w;                   // pixels of Minecraft's picture per unit of tangent
+	float uNear = 1.0 / 0.8;                                   // nearest block looked for: 0.8 m
+	float uFar = 1.0 / 250.0;                                  // furthest: 250 m
+	float steps = clamp(ceil(focal * moved * (uNear - uFar) / 4.0), 6.0, 64.0);   // about four pixels a step, as many as the movement needs
+	float du = (uNear - uFar) / steps;
+	float tPrev = 1.0 / uNear;
+	bool prevBehind = false;
+	[loop] for (int k = 0; k <= 64; ++k) {
+		if (float(k) > steps) { break; }
+		float t = 1.0 / max(uNear - du * float(k), 1e-4);
+		float2 pn;
+		float gap;
+		bool behind = PointBehind(centre, direction, t, mw, mh, pn, gap);
+		if (behind && !prevBehind) {
+			// The line has just gone from in front of a surface to behind one: find where, between the last step and this one.
+			float lo = tPrev;
+			float hi = t;
+			if (k > 0) {
+				[loop] for (int b = 0; b < 18; ++b) {
+					if (hi - lo < 0.01 + 0.0005 * hi) { break; }   // about a centimetre close, and a twentieth of a percent far away
+					float mid = 0.5 * (lo + hi);
+					float2 pm2;
+					float g2;
+					if (PointBehind(centre, direction, mid, mw, mh, pm2, g2)) { hi = mid; } else { lo = mid; }
+				}
+			}
+			float2 nmHit;
+			float gapHit;
+			PointBehind(centre, direction, hi, mw, mh, nmHit, gapHit);
+			if (gapHit < 1.5) {
+				nm = nmHit;
+				zHit = hi;
+				return true;
+			}
+		}
+		prevBehind = behind;
+		tPrev = t;
+	}
+	return false;
+}
 float4 PS(VSOut i) : SV_Target
 {
 	if (mode > 0.5) {
@@ -236,38 +368,20 @@ float4 PS(VSOut i) : SV_Target
 		uint mw, mh;
 		mcDepthTex.GetDimensions(mw, mh);
 		if (warpT.w > 0.5) {
-			// Re-aim: for this place on the screen, where in Minecraft's (older) picture is the same point of the world? Start from the
-			// view direction, then correct for the camera having moved using the picture's own depth (a few rounds are enough).
+			// Re-aim: for this place on the screen, where in Minecraft's (older) picture is the nearest block along the line of sight (see FindSource)?
 			float2 ndc = float2(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
-			float3 dc = float3(ndc * tans.xy, 1.0);
-			float3 dm = warpR0.xyz * dc.x + warpR1.xyz * dc.y + warpR2.xyz * dc.z;
-			bool ok = dm.z > 0.01;
-			float2 nm = ok ? dm.xy / dm.z / tans.zw : float2(2.0, 2.0);
-			float3 pc = float3(0, 0, 1);
-			[unroll] for (int k = 0; k < 4; ++k) {
-				float2 tuv = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
-				float2 tex2 = flipY > 0.5 ? float2(tuv.x, 1.0 - tuv.y) : tuv;
-				float s = mcDepthTex.Load(int3(clamp(uint2(tex2 * float2(mw, mh)), uint2(0, 0), uint2(mw - 1, mh - 1)), 0)).r;
-				float ndcz = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
-				float den = ndcz + mcA;
-				float zk = abs(den) > 1e-9 ? mcB / den : 1e9;
-				if (zk <= 0.0) { zk = 1e9; }
-				float3 pm = float3(nm * tans.zw, 1.0) * zk;
-				pc = float3(dot(warpR0.xyz, pm), dot(warpR1.xyz, pm), dot(warpR2.xyz, pm)) + warpT.xyz;
-				float2 npc = pc.z > 0.01 ? pc.xy / pc.z / tans.xy : ndc;
-				nm += (ndc - npc) * tans.xy / tans.zw;
-			}
-			ok = ok && all(abs(nm) <= 1.0);
+			float2 nm;
+			float zHit;
+			bool ok = FindSource(ndc, mw, mh, nm, zHit);
 			float2 tuv = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
 			float2 tex2 = flipY > 0.5 ? float2(tuv.x, 1.0 - tuv.y) : tuv;
 			w = ok ? tex.Sample(samp, tex2) : float4(0, 0, 0, 0);
 			mcUv = tex2;
-			zm = pc.z > 0.0 ? pc.z : 1e9;      // how far the block is along the current camera's view
+			zm = ok ? zHit : 1e9;              // how far the block is along the current camera's view
 		} else {
 			w = tex.Sample(samp, uv);       // the world, premultiplied alpha
 			if (w.a > 0.0) {
-)HLSL"
-R"HLSL(				// How far is this block pixel from the camera? Minecraft's depth is the matrix's: ndc = -A + B / distance.
+				// How far is this block pixel from the camera? Minecraft's depth is the matrix's: ndc = -A + B / distance.
 				float s = mcDepthTex.Load(int3(min(uint2(uv * float2(mw, mh)), uint2(mw - 1, mh - 1)), 0)).r;
 				float ndc = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
 				float den = ndc + mcA;
@@ -280,7 +394,8 @@ R"HLSL(				// How far is this block pixel from the camera? Minecraft's depth is 
 			return float4((w.a > 0.01 && zm < 1e6) ? zm : 0.0, 0.0, 0.0, 0.0);
 		}
 		float zg = 1e9;
-		if (haveGameDepth > 0.5) {
+)HLSL"
+R"HLSL(		if (haveGameDepth > 0.5) {
 			// The game's world at this place on the screen: its depth is gameNear / distance (reversed, no far plane).
 			uint gw, gh;
 			gameDepthTex.GetDimensions(gw, gh);
@@ -288,6 +403,16 @@ R"HLSL(				// How far is this block pixel from the camera? Minecraft's depth is 
 			zg = sg > 1e-8 ? gameNear / sg : 1e9;
 			// Hidden if it is behind what the game drew there (with a little room for rounding, and for the game's jittered depth).
 			hidden = w.a > 0.0 && zm > zg + biasAbs + biasRel * zg;
+			if (hidden) {
+				// Where a block meets the ground at a shallow angle the ground's depth changes quickly from pixel to pixel (0.3 m a pixel at 20 m), and its depth is jittered by up to half a pixel
+				// (the game's temporal anti-aliasing), while ours comes from a re-aimed picture: so along the line where they meet, pixels flipped between hidden and shown from frame to frame. Don't
+				// hide a block pixel by less than a pixel's worth of the ground's slope (a jump in depth, like the edge of a building, doesn't count as slope).
+				int2 gsize = int2(gw, gh);
+				int2 gp = int2(min(uint2(i.uv * float2(gw, gh)), uint2(gw - 1, gh - 1)));
+				float zMax = max(max(GameZ(gp + int2(1, 0), gsize), GameZ(gp - int2(1, 0), gsize)), max(GameZ(gp + int2(0, 1), gsize), GameZ(gp - int2(0, 1), gsize)));
+				float slope = max(min(zMax - zg, 0.1 * zg + 0.3), 0.0);
+				hidden = zm > zg + biasAbs + biasRel * zg + slope;
+			}
 		}
 		if (debugView > 2.5) {
 			if (w.a <= 0.0) { return float4(0, 0, 0, 0); }
@@ -304,15 +429,55 @@ R"HLSL(				// How far is this block pixel from the camera? Minecraft's depth is 
 		}
 		if (hidden) { w = float4(0, 0, 0, 0); }
 		if (sceneParams.x > 0.5) {
+			float fogT = 1.0;
+			float3 fogC = float3(0.0, 0.0, 0.0);
+			bool plainBlocks = fogParams.x > 4.5;   // mode 5: flat grey blocks with only the game's fog on them
+			if (fogParams.x > 0.5) {
+				// The game's volumetric fog where this block is: shown instead of the block (to find out which volume is the fog the scene uses, and how distance maps to its slices),
+				// or applied to it (the light the fog adds, and how much of the block shows through).
+				if (fogParams.x > 5.5) {
+					// The light level of the block, white for 15 and black for none, magenta where there is no grid: to check that the right pixels are found to be light sources.
+					float e = EmissionAt(mcUv);
+					return (e < 0.0 ? float4(1.0, 0.0, 1.0, 1.0) : float4(e, e, e, 1.0)) * w.a;
+				}
+				if (fogParams.x > 3.5 && fogParams.x < 4.5) {
+					// Distance bands: each block painted with colours that repeat every metre (red), four metres (green) and twenty-five (blue): the blocks' own distance, to check it is right.
+					return float4(frac(zm), frac(zm * 0.25), frac(zm * 0.04), 1.0) * w.a;
+				}
+				uint fw, fh, fd;
+				fogTex.GetDimensions(fw, fh, fd);
+				float zq = max(zm, 0.01);
+				float nearD = max(fogParams.y, 0.01);
+				float farD = max(abs(fogParams.z), nearD + 0.1);
+				float t = fogParams.z > 0.0 ? log(zq / nearD) / log(farD / nearD) : (zq - nearD) / (farD - nearD);
+				float2 uvv = i.pos.xy / (float2(fw, fh) * 8.0);
+				float4 f = fogTex.SampleLevel(samp, float3(uvv, saturate(t)), 0);
+				if (fogParams.x < 2.5) {
+					return (fogParams.x < 1.5 ? float4(f.rgb, 1.0) : float4(f.aaa, 1.0)) * w.a;
+				}
+				fogT = saturate(f.a);
+				fogC = f.rgb;
+			}
 			// Into the game's HDR scene: Minecraft's colours are gamma encoded and premultiplied; the scene is linear.
 			float3 s = w.a > 1e-4 ? w.rgb / w.a : float3(0, 0, 0);
 			// Minecraft's whites are only 1.0, while the city's lights are many times that: the brightest pixels (lit white, glowstone, torch flames) are boosted, the way a texture pack
 			// with brighter light sources would, so that they glow when the game's bloom gets them.
 			// Minecraft dims faces by direction (a top is 100%, north and south 80%, east and west 60%, a bottom 50%), so a lit side face is never as bright as a top: undo that
 			// first, or only the tops would glow.
-			float peak = max(s.r, max(s.g, s.b)) / McShade(mcUv);
-			float hot = smoothstep(0.7, 1.0, saturate(peak));
-			float3 lin = pow(saturate(s), 2.2) * sceneParams.y * (1.0 + sceneParams.w * hot * hot);
+			// Which pixels are light sources: Minecraft says (the light level of the block, from the grid it publishes). Without that grid, guess from the brightness.
+			float emit = EmissionAt(mcUv);
+			float hot = emit;
+			if (emit < 0.0) {
+				float peak = max(s.r, max(s.g, s.b)) / McShade(mcUv);
+				// Outside the grid (further than about 32 blocks from the player) only the very brightest pixels count, so that far sunlit pale blocks don't glow.
+				float start = uiXform.w > 0.5 ? max(aoParams.z, 0.9) : aoParams.z;   // aoParams.z is the glow threshold in the blocks' pass (the terrain's occlusion strength in its own)
+				hot = smoothstep(start, 1.0, saturate(peak));
+			}
+			// Ordinary light and the light sources' own light are separate: a block's colour times the gain (so that ordinary blocks can sit at the brightness of the street, where bloom ignores them),
+			// and, for a light source, its colour times the glow, however low the gain is (the game's own emissives are ten to twenty times a white surface, which is what makes them bloom).
+			float3 lin0 = pow(saturate(s), 2.2);
+			float3 baseLin = lin0 * sceneParams.y;
+			float3 glowLin = lin0 * (sceneParams.w * hot * hot);
 			if (abs(aoParams.x) > 0.001 && haveGameDepth > 0.5 && zm < 1e6 && w.a > 0.01) {
 				float3 Nm = McNormal(mcUv);
 				if (dot(Nm, Nm) > 0.5) {
@@ -324,9 +489,19 @@ R"HLSL(				// How far is this block pixel from the camera? Minecraft's depth is 
 					float3 P = float3(ndcP * float2(aoParams.w * float(gw2) / float(gh2), aoParams.w) * zm, zm);
 					float ao = 1.0 - saturate(SceneAO(i.pos.xy, P, Nc) * 1.6 * abs(aoParams.x));
 					if (aoParams.x < 0.0) { return float4(ao, ao, ao, 1.0) * w.a; }   // the occlusion alone: white for none, dark for a lot
-					lin *= ao;
+					baseLin *= ao;
+					glowLin *= ao;
 				}
 			}
+			if (plainBlocks) {
+				baseLin = float3(0.4, 0.4, 0.4);   // no texture, no Minecraft shading, no occlusion, no glow: the fog alone
+				glowLin = float3(0.0, 0.0, 0.0);
+			}
+			// The game's fog: how much of the block shows through, plus the light the fog adds. The extra light of glowing pixels is held back less than that of ordinary ones: Cyberpunk's own
+			// emissives are tens of times brighter than a white surface, which is why they still glow (and bloom) after the fog has taken most of their light, while ours start only a few
+			// times brighter. So the glow's share is the transmittance to a power below one (sceneParams.z: 1 is the physical amount, 0 no fog on the glow at all).
+			float glowT = exp2(sceneParams.z * log2(max(fogT, 1e-4)));
+			float3 lin = baseLin * fogT + glowLin * glowT + fogC;
 			return float4(lin * w.a, w.a);
 		}
 		if (sceneParams.z > 0.5) { w = float4(0, 0, 0, 0); }
@@ -343,7 +518,8 @@ R"HLSL(				// How far is this block pixel from the camera? Minecraft's depth is 
 				return float4(u.rgb + float3(0.35, 0.0, 0.35) * (1.0 - u.a), 1.0);   // the layer alone; where it is transparent, magenta
 			}
 			if (w.a > 0.0) {
-				// The game's interface over the blocks (the picture underneath already has it on, so only pixels with blocks need this).
+)HLSL"
+R"HLSL(				// The game's interface over the blocks (the picture underneath already has it on, so only pixels with blocks need this).
 				float3 ur = uiMode > 1.5 ? u.rgb * u.a : u.rgb;
 				w = float4(ur + w.rgb * (1.0 - u.a), u.a + w.a * (1.0 - u.a));
 			}
@@ -473,6 +649,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 			ID3D12Resource* boundGameDepth = nullptr;
 			UINT boundGameW = 0, boundGameH = 0;
 			ID3D12Resource* boundUi = nullptr;
+			ID3D12Resource* boundFog = nullptr;  // the 3D fog texture the seventh descriptor points at
 			UINT boundUiW = 0, boundUiH = 0;
 			DXGI_FORMAT boundGameFormat = DXGI_FORMAT_UNKNOWN;
 			ComPtr<ID3D12Resource> upload[kFrames];
@@ -594,7 +771,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_HEAP_DESC srv{};
 			srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-			srv.NumDescriptors = 6;
+			srv.NumDescriptors = 8;
 			srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 			hr = g.device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&g.srvHeap));
 			if (FAILED(hr)) {
@@ -603,7 +780,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 			}
 			g.srvInc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			{
-				// All six descriptors must be valid for the shader, even the ones a frame doesn't use: make them null ones.
+				// All eight descriptors must be valid for the shader, even the ones a frame doesn't use: make them null ones.
 				D3D12_SHADER_RESOURCE_VIEW_DESC nullView{};
 				nullView.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				nullView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -613,6 +790,20 @@ float4 PSTerrain(VSOut i) : SV_Target
 					D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
 					h.ptr += SIZE_T(i) * g.srvInc;
 					g.device->CreateShaderResourceView(nullptr, &nullView, h);
+				}
+				{
+					// The seventh and eighth are for 3D textures.
+					D3D12_SHADER_RESOURCE_VIEW_DESC null3d{};
+					null3d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+					null3d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+					null3d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+					null3d.Texture3D.MostDetailedMip = 0;
+					null3d.Texture3D.MipLevels = 1;
+					for (UINT i = 6; i < 8; ++i) {
+						D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+						h.ptr += SIZE_T(i) * g.srvInc;
+						g.device->CreateShaderResourceView(nullptr, &null3d, h);
+					}
 				}
 			}
 
@@ -647,7 +838,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_RANGE range{};
 			range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-			range.NumDescriptors = 6;
+			range.NumDescriptors = 8;
 			range.BaseShaderRegister = 0;
 			range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -658,7 +849,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 			params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 			params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 			params[1].Constants.ShaderRegister = 0;
-			params[1].Constants.Num32BitValues = 60;
+			params[1].Constants.Num32BitValues = 63;
 			params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 			D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -809,6 +1000,136 @@ float4 PSTerrain(VSOut i) : SV_Target
 				}
 			}
 			return true;
+		}
+
+		D3D12_HEAP_PROPERTIES HeapProps(D3D12_HEAP_TYPE a_type);  // defined below
+		D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* a_resource, D3D12_RESOURCE_STATES a_before, D3D12_RESOURCE_STATES a_after);  // defined below
+
+		// ---- which blocks are light sources: a small 3D texture (one byte per block) filled from what Minecraft publishes ----------------------------------------
+		struct EmissionState
+		{
+			ComPtr<ID3D12Resource> texture;
+			ComPtr<ID3D12Resource> upload[kFrames];
+			std::uint8_t* mapped[kFrames] = {};
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+			bool ready = false;
+			bool failed = false;
+			bool valid = false;  // the texture holds a grid
+			std::uint32_t generation = 0;
+			std::int32_t originX = 0, originY = 0, originZ = 0;
+			std::vector<std::uint8_t> bytes;
+		};
+		EmissionState g_emit;
+
+		bool EnsureEmissionTexture()
+		{
+			if (g_emit.ready) {
+				return true;
+			}
+			if (g_emit.failed) {
+				return false;
+			}
+			const D3D12_HEAP_PROPERTIES heap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+			D3D12_RESOURCE_DESC desc{};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+			desc.Width = proto::kEmissionSizeX;
+			desc.Height = proto::kEmissionSizeY;
+			desc.DepthOrArraySize = static_cast<UINT16>(proto::kEmissionSizeZ);
+			desc.MipLevels = 1;
+			desc.Format = DXGI_FORMAT_R8_UNORM;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g_emit.texture));
+			if (FAILED(hr)) {
+				g_emit.failed = true;
+				LogError("creating the light emission texture", hr);
+				return false;
+			}
+			UINT64 total = 0;
+			g.device->GetCopyableFootprints(&desc, 0, 1, 0, &g_emit.footprint, nullptr, nullptr, &total);
+			const D3D12_HEAP_PROPERTIES uploadHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+			D3D12_RESOURCE_DESC bufferDesc{};
+			bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			bufferDesc.Width = total;
+			bufferDesc.Height = 1;
+			bufferDesc.DepthOrArraySize = 1;
+			bufferDesc.MipLevels = 1;
+			bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+			bufferDesc.SampleDesc.Count = 1;
+			bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			for (UINT i = 0; i < kFrames; ++i) {
+				hr = g.device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_emit.upload[i]));
+				void* mapped = nullptr;
+				if (FAILED(hr) || FAILED(g_emit.upload[i]->Map(0, nullptr, &mapped))) {
+					g_emit.failed = true;
+					LogError("creating the light emission upload buffer", FAILED(hr) ? hr : E_FAIL);
+					return false;
+				}
+				g_emit.mapped[i] = static_cast<std::uint8_t*>(mapped);
+			}
+			D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+			view.Format = DXGI_FORMAT_R8_UNORM;
+			view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+			view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			view.Texture3D.MostDetailedMip = 0;
+			view.Texture3D.MipLevels = 1;
+			D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+			h.ptr += SIZE_T(7) * g.srvInc;
+			g.device->CreateShaderResourceView(g_emit.texture.Get(), &view, h);
+			g_emit.ready = true;
+			g_sdk->logger->Info(g_handle, "overlay: the light emission texture is ready (which blocks are light sources)");
+			return true;
+		}
+
+		// If Minecraft has published a new grid of block light levels, copy it into the texture (recorded into this frame's list, after the list's reset).
+		void UpdateEmission(Link& a_link, UINT a_slot)
+		{
+			Link::EmissionSnapshot info;
+			if (!a_link.ReadEmission(info, g_emit.generation, nullptr)) {
+				return;
+			}
+			const std::uint32_t sx = proto::kEmissionSizeX, sy = proto::kEmissionSizeY, sz = proto::kEmissionSizeZ;
+			if ((info.flags & proto::kEmissionValid) == 0 || info.sizeX != sx || info.sizeY != sy || info.sizeZ != sz) {
+				g_emit.valid = false;
+				return;
+			}
+			if (g_emit.valid && info.generation == g_emit.generation) {
+				return;
+			}
+			if (!EnsureEmissionTexture()) {
+				return;
+			}
+			if (!a_link.ReadEmission(info, g_emit.valid ? g_emit.generation : info.generation + 1, &g_emit.bytes) || g_emit.bytes.size() != std::size_t(sx) * sy * sz) {
+				return;
+			}
+			const UINT rowPitch = g_emit.footprint.Footprint.RowPitch;
+			std::uint8_t* dst = g_emit.mapped[a_slot];
+			for (std::uint32_t z = 0; z < sz; ++z) {
+				for (std::uint32_t y = 0; y < sy; ++y) {
+					std::memcpy(dst + (std::size_t(z) * sy + y) * rowPitch, g_emit.bytes.data() + (std::size_t(z) * sy + y) * sx, sx);
+				}
+			}
+			auto toCopy = Transition(g_emit.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+			g.list->ResourceBarrier(1, &toCopy);
+			D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+			dstLoc.pResource = g_emit.texture.Get();
+			dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dstLoc.SubresourceIndex = 0;
+			D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+			srcLoc.pResource = g_emit.upload[a_slot].Get();
+			srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			srcLoc.PlacedFootprint = g_emit.footprint;
+			g.list->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+			auto toRead = Transition(g_emit.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			g.list->ResourceBarrier(1, &toRead);
+			g_emit.generation = info.generation;
+			g_emit.originX = info.originX;
+			g_emit.originY = info.originY;
+			g_emit.originZ = info.originZ;
+			if (!g_emit.valid) {
+				g_sdk->logger->InfoF(g_handle, "overlay: Minecraft's light emission grid arrived: %u x %u x %u blocks from (%d, %d, %d)", sx, sy, sz, info.originX, info.originY, info.originZ);
+			}
+			g_emit.valid = true;
 		}
 
 		// The block depth texture (screen sized) and its views, made again if the screen's size changes.
@@ -1148,6 +1469,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 			if (FAILED(g.allocator[slot]->Reset()) || FAILED(g.list->Reset(g.allocator[slot].Get(), nullptr))) {
 				return;
 			}
+			UpdateEmission(link, slot);  // Minecraft's grid of which blocks give light
 
 			// A new frame from Minecraft: copy it up to the GPU. A plain frame is one picture; a layered one has three (the world's
 			// colour, the world's depth, the overlay), all of the same size.
@@ -1220,6 +1542,9 @@ float4 PSTerrain(VSOut i) : SV_Target
 							if (!g.loggedFirstFrame) {
 								g.loggedFirstFrame = true;
 								g_sdk->logger->InfoF(g_handle, "overlay: first HUD frame received (%u x %u, %s)", w, h, layered ? "layered: world colour, world depth, overlay" : "plain");
+								if (layered) {
+									inscene::EnableByDefault();  // the blocks are drawn into the game's own scene unless the player has said otherwise
+								}
 							}
 							// The picture is stretched over the whole screen, so it has to be the same shape as the screen
 							// for Minecraft's blocks to line up with Night City.
@@ -1329,7 +1654,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 				if (useGameDepth) {
 					++g_depthDraws;
 				}
-				float constants[60] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
+				float constants[63] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
 					g.mcA, g.mcB, 0.02f /* the game's near plane: its depth is 0.02 / distance */, 0.06f, 0.004f, float(g_debugView), float(g_uiMode), useUi ? 1.0f : 0.0f };
 				// Re-aim the blocks (the world layer) at the game's camera as it is now, so the time the picture took to arrive isn't seen.
 				if (g.layered && g_warpEnabled) {
@@ -1361,15 +1686,15 @@ float4 PSTerrain(VSOut i) : SV_Target
 					constants[4] = g.texW ? cx * float(bb.Width) / float(g.texW) : cx;
 					constants[5] = g.texH ? cy * float(bb.Height) / float(g.texH) : cy;
 				}
-				g.list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			} else if (badge) {
 				++g_badgeDraws;
 				D3D12_RECT scissor{ 8, 8, 72, 72 };  // the test square
 				g.list->RSSetScissorRects(1, &scissor);
-				float constants[60] = {};
+				float constants[63] = {};
 				constants[1] = 1.0f;
-				g.list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			}
 
@@ -1598,7 +1923,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 		D3D12_RECT scissor{ 0, 0, LONG(a_width), LONG(a_height) };
 		a_list->RSSetScissorRects(1, &scissor);
 
-		float constants[60] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, 1.0f,
+		float constants[63] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, 1.0f,
 			g.mcA, g.mcB, 0.02f /* the game's near plane */, 0.06f, 0.004f, 0.0f, 0.0f, 0.0f };
 		auto& link = Link::Get();
 		bool warped = false;
@@ -1631,12 +1956,75 @@ float4 PSTerrain(VSOut i) : SV_Target
 				}
 			}
 			constants[47] = 1.0f;  // valid
+			if (g_emit.valid && g_emit.ready) {
+				// Where Minecraft's camera is relative to the corner of the light emission grid (the pose is in Minecraft's world); [39] says there is a grid.
+				constants[36] = static_cast<float>(drawn.x - g_emit.originX);
+				constants[37] = static_cast<float>(drawn.y - g_emit.originY);
+				constants[38] = static_cast<float>(drawn.z - g_emit.originZ);
+				constants[39] = 1.0f;
+			}
 		}
 		if (!warped) {
 			constants[31] = 0.0f;
 		}
 		constants[41] = g_sceneGain;
+		constants[42] = g_fogGlowExp;  // (at Present this slot says whether the blocks are left out; in the scene's passes it is free)
 		constants[43] = g_sceneGlow;
+		// One of the game's fog volumes, for the debug view: bound to the seventh descriptor, and moved to a readable state for the blocks' pass if it isn't in one.
+		ID3D12Resource* fogResource = nullptr;
+		D3D12_RESOURCE_STATES fogState = D3D12_RESOURCE_STATE_COMMON;
+		bool fogMoved = false;
+		if (g_fogView > 0) {
+			std::size_t pick = g_fogIndex < 0 ? 0 : static_cast<std::size_t>(g_fogIndex);
+			if (g_fogIndex < 0) {
+				// By behaviour, not by address (the addresses change from one run to the next): the volume that is readable when the scene is complete and was written by compute the most.
+				std::uint32_t most = 0;
+				for (std::size_t i = 0; i < g_fogVolumes.size(); ++i) {
+					if ((g_fogVolumes[i].state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) != 0 && g_fogVolumes[i].uavWrites > most) {
+						most = g_fogVolumes[i].uavWrites;
+						pick = i;
+					}
+				}
+			}
+			if (pick < g_fogVolumes.size()) {
+				fogResource = g_fogVolumes[pick].resource;
+				fogState = static_cast<D3D12_RESOURCE_STATES>(g_fogVolumes[pick].state);
+				if (g.boundFog != fogResource) {
+					WaitIdle();  // the descriptor may be in use by a frame still on the GPU
+					D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+					view.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+					view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+					view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+					view.Texture3D.MostDetailedMip = 0;
+					view.Texture3D.MipLevels = 1;
+					D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+					h.ptr += SIZE_T(6) * g.srvInc;
+					g.device->CreateShaderResourceView(fogResource, &view, h);
+					g.boundFog = fogResource;
+					g_sdk->logger->InfoF(g_handle, "overlay: using fog volume %u of %u (%p)%s", static_cast<unsigned>(pick), static_cast<unsigned>(g_fogVolumes.size()), static_cast<void*>(fogResource), g_fogIndex < 0 ? ", picked as the one written most often by compute" : "");
+				}
+				if ((fogState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) == 0) {
+					D3D12_RESOURCE_BARRIER b{};
+					b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+					b.Transition.pResource = fogResource;
+					b.Transition.Subresource = 0;
+					b.Transition.StateBefore = fogState;
+					b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+					a_list->ResourceBarrier(1, &b);
+					fogMoved = true;
+				}
+				constants[60] = static_cast<float>(g_fogView);
+				constants[61] = g_fogNear;
+				constants[62] = g_fogExp ? g_fogFar : -g_fogFar;
+			} else {
+				static auto lastNote = std::chrono::steady_clock::time_point{};
+				const auto t = std::chrono::steady_clock::now();
+				if (t - lastNote > std::chrono::seconds(8)) {
+					lastNote = t;
+					g_sdk->logger->InfoF(g_handle, "overlay: there is no fog volume %d (the game has %u of them at this point of the frame)", g_fogIndex, static_cast<unsigned>(g_fogVolumes.size()));
+				}
+			}
+		}
 		const bool haveCamera = haveDrawn || haveTarget;
 		// The terrain's occlusion needs the camera's field of view (set above with the block occlusion's); its strength rides in aoParams.z.
 		if (haveCamera && (g_terrainAo > 0.0f || g_sceneAoView) && constants[59] > 0.0f) {
@@ -1651,7 +2039,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 				a_list->ClearRenderTargetView(depthRtv, none, 0, nullptr);
 				a_list->SetPipelineState(g.psoDepth.Get());
 				constants[40] = 2.0f;
-				a_list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
+				a_list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
 				a_list->DrawInstanced(3, 1, 0, 0);
 				auto toRead = Transition(g.blockDepth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 				a_list->ResourceBarrier(1, &toRead);
@@ -1659,17 +2047,30 @@ float4 PSTerrain(VSOut i) : SV_Target
 				a_list->OMSetRenderTargets(1, &a_rtv, FALSE, nullptr);
 				a_list->SetPipelineState(g_sceneAoView ? g.psoTerrainView.Get() : g.psoTerrain.Get());
 				constants[40] = 3.0f;
-				a_list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
+				a_list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
 				a_list->DrawInstanced(3, 1, 0, 0);
 			}
+		}
+		if (g_fogView == 6) {
+			constants[60] = 6.0f;  // the light level view needs no fog volume
 		}
 		// The blocks themselves, over all of that.
 		a_list->OMSetRenderTargets(1, &a_rtv, FALSE, nullptr);
 		a_list->SetPipelineState(g.psoScene.Get());
 		constants[40] = 1.0f;          // into the scene
-		a_list->SetGraphicsRoot32BitConstants(1, 60, constants, 0);
+		constants[58] = g_glowStart;   // (the terrain's occlusion strength was in this slot for its pass)
+		a_list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
 		a_list->DrawInstanced(3, 1, 0, 0);
 
+		if (fogMoved) {
+			D3D12_RESOURCE_BARRIER b{};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = fogResource;
+			b.Transition.Subresource = 0;
+			b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			b.Transition.StateAfter = fogState;
+			a_list->ResourceBarrier(1, &b);
+		}
 		auto back = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 		a_list->ResourceBarrier(1, &back);
 		++g_sceneDrawn;
@@ -1679,6 +2080,45 @@ float4 PSTerrain(VSOut i) : SV_Target
 	const char* SceneBlockedReason()
 	{
 		return g_sceneWhy;
+	}
+
+	void SetFogVolumes(const std::vector<FogVolume>& a_volumes)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_fogVolumes = a_volumes;
+	}
+
+	void SetFogView(int a_mode, int a_index)
+	{
+		g_fogView = std::clamp(a_mode, 0, 6);
+		g_fogIndex = a_index;
+		g_sdk->logger->InfoF(g_handle, "overlay: fog on the blocks: %s (volume %s)", g_fogView == 0 ? "off" : g_fogView == 1 ? "showing the fog's light instead of the blocks" : g_fogView == 2 ? "showing the fog's transmittance instead of the blocks" : g_fogView == 3 ? "applied to the blocks" : g_fogView == 4 ? "showing the blocks' own distance as colour bands (a metre, four metres and twenty-five)" : g_fogView == 5 ? "applied to plain grey blocks (no texture, shading, occlusion or glow)" : "showing the blocks' light level (white: 15, black: none, magenta: no grid)",
+			a_index < 0 ? "picked by behaviour" : std::to_string(a_index).c_str());
+	}
+
+	void SetFogRange(float a_nearMetres, float a_farMetres)
+	{
+		g_fogNear = std::clamp(a_nearMetres, 0.01f, 100.0f);
+		g_fogFar = std::clamp(a_farMetres, g_fogNear + 0.1f, 5000.0f);
+		g_sdk->logger->InfoF(g_handle, "overlay: the fog volume's slices run from %.2f m to %.1f m (%s)", g_fogNear, g_fogFar, g_fogExp ? "exponentially spread" : "evenly spread");
+	}
+
+	void SetGlowStart(float a_percent)
+	{
+		g_glowStart = std::clamp(a_percent, 30.0f, 99.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: pixels count as light-emitting from %.0f%% of full brightness (after undoing Minecraft's face shading)", g_glowStart * 100.0f);
+	}
+
+	void SetFogGlow(float a_percent)
+	{
+		g_fogGlowExp = std::clamp(a_percent, 0.0f, 150.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: glowing pixels feel the fog's transmittance to the power %.2f (100%% is the physical amount, 0%% no fog on their glow)", g_fogGlowExp);
+	}
+
+	void SetFogCurve(bool a_exponential)
+	{
+		g_fogExp = a_exponential;
+		g_sdk->logger->InfoF(g_handle, "overlay: the fog volume's slices are %s", g_fogExp ? "exponentially spread with distance" : "evenly spread with distance");
 	}
 
 	void SetSceneTerrainAo(float a_percent)

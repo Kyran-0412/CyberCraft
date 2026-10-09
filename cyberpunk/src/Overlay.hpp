@@ -4,6 +4,9 @@
 
 #include <d3d12.h>
 
+#include <cstdint>
+#include <vector>
+
 namespace cybercraft::overlay
 {
 	// Called once from Main with the RED4ext handles, so this file can write to the log.
@@ -22,6 +25,21 @@ namespace cybercraft::overlay
 	// While blocks are drawn into the scene, the draw at Present leaves them out (it draws only the hand, hotbar and screens).
 	bool DrawWorldIntoScene(ID3D12GraphicsCommandList* a_list, D3D12_CPU_DESCRIPTOR_HANDLE a_rtv, UINT a_width, UINT a_height);
 	void SetSceneGain(float a_percent);
+	// The game's volumetric fog (3D textures of float colour, the screen divided by 8 across and 128 slices deep) as found by the in-scene hook, with the state each is in when the
+	// scene is complete. /ccdebug fogview shows one of them on the blocks instead of the blocks, to find which is the fog the scene uses and how distance maps to its slices.
+	struct FogVolume
+	{
+		ID3D12Resource* resource;
+		std::uint32_t state;      // D3D12_RESOURCE_STATES of its first mip level
+		std::uint32_t uavWrites;  // how many times compute shaders were given it to write since the last frame: the integrated volume is the one written twice
+	};
+	void SetFogVolumes(const std::vector<FogVolume>& a_volumes);
+	void SetFogView(int a_mode, int a_index);          // 0 off, 1 its colour, 2 its transmittance, 3 the fog applied to the blocks (block * transmittance + fog light), 4 the blocks' own distance as colour bands (a check of the depth), 5 the fog applied to plain grey blocks (the fog alone), 6 the blocks' light level from Minecraft's grid (white 15, black none, magenta no grid); which of the volumes (negative: pick by behaviour)
+	void SetFogRange(float a_nearMetres, float a_farMetres);
+	void SetFogCurve(bool a_exponential);
+	void SetGlowStart(float a_percent);  // how bright a pixel has to be to count as light-emitting (and so glow), in percent of full brightness: default 70; raise it so sunlit pale blocks don't glow
+	void SetFogGlow(float a_percent);  // how much of the fog the glow of a block's brightest pixels feels: 100 the physical amount, 0 none; the default 0 lets them bloom in the fog
+
 	void SetSceneTerrainAo(float a_percent);  // the shadow a block makes on the road and walls next to it, strength in percent (0 off)
 	void SetSceneAoView(bool a_on);  // show only the occlusion term, for tuning
 	void SetSceneAo(float a_percent, float a_radiusCm);  // ambient occlusion where blocks meet the game's world: strength in percent (0 off), radius in centimetres (0: unchanged)

@@ -6,7 +6,7 @@ package dev.cybercraft.link;
  */
 public final class Proto {
 	public static final int MAGIC = 0x43425943; // "CYBC"
-	public static final int VERSION = 23;
+	public static final int VERSION = 25;
 	public static final String MAPPING_NAME = "Local\\CyberCraft_v1";
 
 	// ---- header @0x0 ----
@@ -93,6 +93,11 @@ public final class Proto {
 	public static final int DEBUG_SCENE_TERRAIN_AO = 13; // y: ambient occlusion on the game's own surfaces next to blocks, strength in percent (0 off)
 	public static final int DEBUG_CLASS = 14; // y: up to six letters packed into the number; list the methods and fields of the game's classes with that in their name
 	public static final int DEBUG_WEATHER = 15; // y, z: up to twelve letters packed into the numbers (six each): a weather name to set in the game, or "reset"
+	public static final int DEBUG_FOG_VIEW = 16; // y: 0 off, 1 a fog volume's colour on the blocks, 2 its transmittance; z: which volume
+	public static final int DEBUG_FOG_RANGE = 17; // y: near distance in centimetres, z: far distance in metres
+	public static final int DEBUG_FOG_CURVE = 18; // y: 1 exponential, 0 even
+	public static final int DEBUG_FOG_GLOW = 19; // y: how much of the fog the glow of the blocks' brightest pixels feels, in percent
+	public static final int DEBUG_GLOW_START = 20; // y: how bright a pixel has to be to count as light-emitting, in percent (default 70)
 	public static final int DEBUG_FIND = 9; // y: up to six letters packed into the number; list the game's classes, enums and functions with that in their name
 
 	public static final int RESULT_NONE = 0;
@@ -154,7 +159,24 @@ public final class Proto {
 	public static final long BT_EPOCH = 16; // u32, changes when every box should be rebuilt
 	public static final int BOXES_ENABLED = 1;
 
-	public static final long MAPPING_BYTES = OFF_BOX_TABLE + BOX_TABLE_BYTES;
+	// The light emission of the blocks around the player (see EmissionHdr in the protocol header).
+	public static final long OFF_EMISSION = OFF_BOX_TABLE + BOX_TABLE_BYTES;
+	public static final int EMISSION_SIZE_X = 128; // blocks: 64 each way horizontally (four chunks), 32 up and down
+	public static final int EMISSION_SIZE_Y = 64;
+	public static final int EMISSION_SIZE_Z = 128;
+	public static final long EMISSION_HDR_BYTES = 48;
+	public static final long EMISSION_BYTES = EMISSION_HDR_BYTES + (long) EMISSION_SIZE_X * EMISSION_SIZE_Y * EMISSION_SIZE_Z;
+	public static final long E_SEQ = 0; // u32, seqlock
+	public static final long E_GEN = 4; // u32
+	public static final long E_OX = 8; // i32
+	public static final long E_OY = 12; // i32
+	public static final long E_OZ = 16; // i32
+	public static final long E_FLAGS = 20; // u32
+	public static final long E_SX = 24; // u32
+	public static final long E_SY = 28; // u32
+	public static final long E_SZ = 32; // u32
+	public static final int E_VALID = 1;
+	public static final long MAPPING_BYTES = OFF_EMISSION + EMISSION_BYTES;
 
 	// ---- the game's camera @0x400 (seqlock): Minecraft draws its blocks looking through it ----
 	public static final long OFF_CAMERA = 0x400;

@@ -13,7 +13,7 @@
 namespace cybercraft::proto
 {
 	inline constexpr std::uint32_t kMagic = 0x43425943;  // "CYBC"
-	inline constexpr std::uint32_t kVersion = 23;
+	inline constexpr std::uint32_t kVersion = 25;
 	inline constexpr wchar_t       kMappingName[] = L"Local\\CyberCraft_v1";
 
 	// Cyberpunk uses metres and Minecraft blocks are 1 m, so no scaling is needed.
@@ -50,7 +50,14 @@ namespace cybercraft::proto
 	inline constexpr std::uint64_t kBoxTableEntriesOff = 0x40;
 	inline constexpr std::uint64_t kBoxEntryBytes = 24;
 	inline constexpr std::uint64_t kBoxTableBytes = kBoxTableEntriesOff + std::uint64_t(kBoxTableMax) * kBoxEntryBytes;
-	inline constexpr std::uint64_t kMappingBytes = kOffBoxTable + kBoxTableBytes;
+	// The light emission of the blocks around the player (see EmissionHdr) sits after the box table.
+	inline constexpr std::uint64_t kOffEmission = kOffBoxTable + kBoxTableBytes;
+	inline constexpr std::uint32_t kEmissionSizeX = 128;  // blocks: 64 each way from the player horizontally (four chunks), and 32 up and down
+	inline constexpr std::uint32_t kEmissionSizeY = 64;
+	inline constexpr std::uint32_t kEmissionSizeZ = 128;
+	inline constexpr std::uint64_t kEmissionHdrBytes = 48;
+	inline constexpr std::uint64_t kEmissionBytes = kEmissionHdrBytes + std::uint64_t(kEmissionSizeX) * kEmissionSizeY * kEmissionSizeZ;
+	inline constexpr std::uint64_t kMappingBytes = kOffEmission + kEmissionBytes;
 
 	// ---- header @0x0 ------------------------------------------------------------------------
 	struct Header
@@ -301,8 +308,37 @@ namespace cybercraft::proto
 		kDebugSceneTerrainAo = 13,  // y: ambient occlusion on the game's own surfaces next to blocks (the shadow a block makes on the road), strength in percent (0 off)
 		kDebugClass = 14,  // y: up to six letters packed into the number, z: the next six; list the methods and fields of the game's classes with that in their name
 		kDebugWeather = 15,  // y, z: up to twelve letters packed into the numbers (six each): a weather name to set in the game (see /ccweather), or "reset" to give the weather back to the game
+		kDebugFogView = 16,   // y: 0 off, 1 show a fog volume's colour on the blocks, 2 its transmittance; z: which of the game's fog volumes
+		kDebugFogRange = 17,  // y: the fog volume's near distance in centimetres, z: its far distance in metres
+		kDebugFogCurve = 18,  // y: 1 the volume's slices are spread exponentially with distance, 0 evenly
+		kDebugFogGlow = 19,   // y: how much of the fog the glow of the blocks' brightest pixels feels, in percent (100: the physical amount, 0: none; default 50)
+		kDebugGlowStart = 20, // y: how bright a pixel has to be to count as light-emitting, in percent of full brightness (default 70)
 		kDebugFind = 9,   // y: up to six letters packed into the number; list the game's classes, enums and global functions with that in their name
 	};
+
+	// ---- light emission of the blocks around the player @kOffEmission (Minecraft -> Cyberpunk; seqlock: seq is odd while being written) -----
+	// A box of sizeX x sizeY x sizeZ blocks whose lowest corner is the block (originX, originY, originZ) in Minecraft's world. One byte per block, the block's light
+	// emission level (0 to 15: glowstone 15, a torch 14, a candle 3, white concrete 0), laid out as (z * sizeY + y) * sizeX + x with x, y, z counted from the origin
+	// (the same order as the slices, rows and columns of a 3D texture whose width is x, height y and depth z). Lets the shader know which pixels are light sources.
+	enum EmissionFlags : std::uint32_t
+	{
+		kEmissionValid = 1u << 0,  // the grid holds what Minecraft's world has (there is a world and the scan has begun)
+	};
+
+	struct EmissionHdr
+	{
+		std::uint32_t seq;
+		std::uint32_t generation;  // counts up every time the grid changes
+		std::int32_t  originX;
+		std::int32_t  originY;
+		std::int32_t  originZ;
+		std::uint32_t flags;       // EmissionFlags
+		std::uint32_t sizeX;       // kEmissionSizeX
+		std::uint32_t sizeY;
+		std::uint32_t sizeZ;
+		std::uint32_t pad[3];
+	};
+	static_assert(sizeof(EmissionHdr) == kEmissionHdrBytes);
 
 	// ---- collision boxes @kOffBoxTable (Minecraft -> Cyberpunk; seqlock: seq is odd while being written) -----------------
 	// What is built in Minecraft near the player, as boxes: the plugin keeps invisible collision boxes in Night City exactly

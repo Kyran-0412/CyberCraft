@@ -184,7 +184,27 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
 
     if (aCommand.kind == cybercraft::proto::kCmdDebug)
     {
-        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugWeather)
+        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGlowStart)
+        {
+            cybercraft::overlay::SetGlowStart(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugFogGlow)
+        {
+            cybercraft::overlay::SetFogGlow(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugFogView)
+        {
+            cybercraft::overlay::SetFogView(static_cast<int>(aCommand.y), static_cast<int>(aCommand.z));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugFogRange)
+        {
+            cybercraft::overlay::SetFogRange(static_cast<float>(aCommand.y) / 100.0f, static_cast<float>(aCommand.z));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugFogCurve)
+        {
+            cybercraft::overlay::SetFogCurve(aCommand.y != 0.0);
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugWeather)
         {
             cybercraft::world::SetWeatherByWord(cybercraft::world::UnpackWord(aCommand.y, aCommand.z));
         }

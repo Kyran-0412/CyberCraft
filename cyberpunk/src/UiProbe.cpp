@@ -5,6 +5,9 @@
 // draws it onto the finished picture. So the blocks have to be inserted into the game's own drawing commands, right where the interface starts,
 // and for that we need to know where that is.
 //
+// It also lists every 3D texture the frame moves between states (or puts a UAV barrier on), with its size and format and the lists that touch it: the game's fog, volumetric lighting and colour
+// grading tables are stored as 3D textures, so this is how they are found.
+//
 // The first two captures turned out to show only the plugin's own overlay list (it takes the back buffer out of PRESENT too), and merged the
 // frames of command lists the game re-uses. So this probe keeps a separate record for each recording of a list (a list is recorded again after
 // it is Reset), cuts frames at the swapchain's Present calls, notes which lists were run without being recorded in the capture (a list the game
@@ -134,6 +137,16 @@ namespace cybercraft::uiprobe
 			return w | (h << 16) | (std::uint64_t(d.Format) << 32) | (std::uint64_t(d.Flags & 0xFFFF) << 48);
 		}
 
+		// The shape of a texture: depth or array size (16 bits), dimension (4 bits: 3 is a 2D texture, 4 a 3D one) and mip levels (8 bits).
+		std::uint32_t ShapeInfo(ID3D12Resource* a_resource)
+		{
+			if (!a_resource) {
+				return 0;
+			}
+			const D3D12_RESOURCE_DESC d = a_resource->GetDesc();
+			return std::min<UINT>(d.DepthOrArraySize, 0xFFFF) | (static_cast<std::uint32_t>(d.Dimension) << 16) | (std::min<UINT>(d.MipLevels, 0xFF) << 20);
+		}
+
 		struct Event
 		{
 			std::uint8_t type;
@@ -234,10 +247,16 @@ namespace cybercraft::uiprobe
 					if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
 						const auto& t = b.Transition;
 						const std::uint64_t info = ResourceInfo(t.pResource);
-						Add(log, kBarrier, t.StateBefore, t.StateAfter, t.Subresource, reinterpret_cast<std::uint64_t>(t.pResource), info, IsBackBuffer(t.pResource) ? 1 : 0);
+						Add(log, kBarrier, t.StateBefore, t.StateAfter, ShapeInfo(t.pResource), reinterpret_cast<std::uint64_t>(t.pResource), info, IsBackBuffer(t.pResource) ? 1 : 0);
 						if (t.StateAfter == D3D12_RESOURCE_STATE_RENDER_TARGET) {
 							log->lastRtRes = reinterpret_cast<std::uint64_t>(t.pResource);
 							log->lastRtInfo = info;
+						}
+					} else if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && b.UAV.pResource) {
+						// A UAV barrier (the compute shaders that wrote it must finish before the next use): only for 3D textures, which is where fog and volumetric lighting live.
+						const std::uint32_t shape = ShapeInfo(b.UAV.pResource);
+						if (((shape >> 16) & 0xF) == static_cast<std::uint32_t>(D3D12_RESOURCE_DIMENSION_TEXTURE3D)) {
+							Add(log, kBarrier, 0xFFFFFFFFu, 0xFFFFFFFFu, shape, reinterpret_cast<std::uint64_t>(b.UAV.pResource), ResourceInfo(b.UAV.pResource), 0);
 						}
 					}
 				}
@@ -730,6 +749,64 @@ namespace cybercraft::uiprobe
 						static_cast<void*>(x.list));
 				}
 				++position;
+			}
+			// The 3D textures of the frame: where the game's fog, volumetric lighting and colour grading tables should show up.
+			{
+				struct Use
+				{
+					int position;
+					std::uint32_t before, after;
+				};
+				struct Volume
+				{
+					std::uint64_t pointer, info;
+					std::uint32_t shape;
+					std::vector<Use> uses;
+				};
+				std::vector<Volume> volumes;
+				int pos = 0;
+				for (int i = start; i <= end; ++i) {
+					const Execution& x = g_executions[i];
+					if (!x.list) {
+						continue;
+					}
+					if (x.log) {
+						for (const Event& e : x.log->events) {
+							if (e.type != kBarrier || ((e.c >> 16) & 0xF) != static_cast<std::uint32_t>(D3D12_RESOURCE_DIMENSION_TEXTURE3D)) {
+								continue;
+							}
+							Volume* v = nullptr;
+							for (Volume& candidate : volumes) {
+								if (candidate.pointer == e.p) {
+									v = &candidate;
+									break;
+								}
+							}
+							if (!v) {
+								volumes.push_back({ e.p, e.q, e.c, {} });
+								v = &volumes.back();
+							}
+							if (v->uses.size() < 40) {
+								v->uses.push_back({ pos, e.a, e.b });
+							}
+						}
+					}
+					++pos;
+				}
+				g_sdk->logger->InfoF(g_handle, "ui: %u 3D textures were used in this frame (the game's fog, volumetric lighting and colour grading tables are 3D textures):", static_cast<unsigned>(volumes.size()));
+				for (const Volume& v : volumes) {
+					const unsigned w = static_cast<unsigned>(v.info & 0xFFFF), h = static_cast<unsigned>((v.info >> 16) & 0xFFFF), f = static_cast<unsigned>((v.info >> 32) & 0xFFFF);
+					const unsigned d = v.shape & 0xFFFF, mips = (v.shape >> 20) & 0xFF;
+					const char* fmt = FormatName(f);
+					g_sdk->logger->InfoF(g_handle, "ui:   3D texture %p: %u x %u x %u, %s%s, %u mip levels", reinterpret_cast<void*>(v.pointer), w, h, d, fmt ? fmt : "format ", fmt ? "" : std::to_string(f).c_str(), mips);
+					for (const Use& u : v.uses) {
+						if (u.before == 0xFFFFFFFFu) {
+							g_sdk->logger->InfoF(g_handle, "ui:       list %d: UAV barrier (its compute writes are made visible)", u.position);
+						} else {
+							g_sdk->logger->InfoF(g_handle, "ui:       list %d: %s -> %s", u.position, StateText(u.before).c_str(), StateText(u.after).c_str());
+						}
+					}
+				}
 			}
 			g_sdk->logger->Info(g_handle, "ui: end of the capture");
 			FreeRecordings();

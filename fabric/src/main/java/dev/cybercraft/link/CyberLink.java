@@ -307,6 +307,30 @@ public final class CyberLink {
 		s.set(JAVA_INT, OFF_MC_STATE + M_SEQ, base + 2); // even: done
 	}
 
+	/** Tells Cyberpunk the light emission of the blocks around the player: a box of Proto.EMISSION_SIZE_X x _Y x _Z blocks from the given corner, one byte per block (see EmissionHdr). */
+	public static void publishEmission(boolean valid, int originX, int originY, int originZ, int generation, byte[] grid) {
+		MemorySegment s = shm;
+		if (s == null) {
+			return;
+		}
+		int base = s.get(JAVA_INT, OFF_EMISSION + E_SEQ) & ~1;
+		s.set(JAVA_INT, OFF_EMISSION + E_SEQ, base + 1); // odd: write in progress
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_EMISSION + E_GEN, generation);
+		s.set(JAVA_INT, OFF_EMISSION + E_OX, originX);
+		s.set(JAVA_INT, OFF_EMISSION + E_OY, originY);
+		s.set(JAVA_INT, OFF_EMISSION + E_OZ, originZ);
+		s.set(JAVA_INT, OFF_EMISSION + E_FLAGS, valid ? E_VALID : 0);
+		s.set(JAVA_INT, OFF_EMISSION + E_SX, EMISSION_SIZE_X);
+		s.set(JAVA_INT, OFF_EMISSION + E_SY, EMISSION_SIZE_Y);
+		s.set(JAVA_INT, OFF_EMISSION + E_SZ, EMISSION_SIZE_Z);
+		if (valid && grid != null) {
+			MemorySegment.copy(MemorySegment.ofArray(grid), 0, s, OFF_EMISSION + EMISSION_HDR_BYTES, grid.length);
+		}
+		VarHandle.releaseFence();
+		s.set(JAVA_INT, OFF_EMISSION + E_SEQ, base + 2); // even: done
+	}
+
 	private static long worldFrame;
 
 	/** Tells Cyberpunk Minecraft's time of day and weather, and whether the player wants the game's to follow them (/ccsync). */

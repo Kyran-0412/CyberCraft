@@ -120,6 +120,33 @@ namespace cybercraft
 		seq.store(start + 2, std::memory_order_release);  // even: done
 	}
 
+	bool Link::ReadEmission(EmissionSnapshot& a_out, std::uint32_t a_have, std::vector<std::uint8_t>* a_bytes) const
+	{
+		if (!base_) {
+			return false;
+		}
+		auto* hdr = base_ + proto::kOffEmission;
+		auto* e = reinterpret_cast<proto::EmissionHdr*>(hdr);
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			const auto seq1 = Atomic(e->seq).load(std::memory_order_acquire);
+			if ((seq1 & 1) != 0) {
+				continue;  // Minecraft is writing it right now
+			}
+			const EmissionSnapshot copy{ e->generation, e->flags, e->originX, e->originY, e->originZ, e->sizeX, e->sizeY, e->sizeZ };
+			if (a_bytes && copy.generation != a_have && (copy.flags & proto::kEmissionValid) != 0 && copy.sizeX == proto::kEmissionSizeX && copy.sizeY == proto::kEmissionSizeY && copy.sizeZ == proto::kEmissionSizeZ) {
+				const std::size_t n = std::size_t(proto::kEmissionSizeX) * proto::kEmissionSizeY * proto::kEmissionSizeZ;
+				a_bytes->resize(n);
+				std::memcpy(a_bytes->data(), hdr + proto::kEmissionHdrBytes, n);
+			}
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (Atomic(e->seq).load(std::memory_order_relaxed) == seq1) {
+				a_out = copy;
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool Link::ReadMcWorld(McWorldSnapshot& a_out) const
 	{
 		if (!base_) {

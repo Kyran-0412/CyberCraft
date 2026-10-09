@@ -350,6 +350,55 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_DUMP, 0, "Writing the classes behind the collision boxes to CyberCraft.log.")));
 					return 1;
 				}))
+				// Looking for the game's volumetric fog (3D textures): /ccdebug fogview <0|1|2|3> [volume] shows a volume's colour (1) or transmittance (2) on the blocks instead of the blocks, applies the fog to the blocks (3), paints the blocks with bands of their own distance, repeating every metre, to check the depth (4), applies the fog to plain grey blocks (5), or shows each block's light level (6, white for 15; to check which blocks are light sources); 0 is off,
+				// /ccdebug fogrange <nearCm> <farM> sets the distances its first and last slice stand for, /ccdebug fogcurve <0|1> says whether the slices are spread evenly (0) or exponentially (1).
+				.then(ClientCommands.literal("fogview").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 6)).executes(c -> {
+					int mode = IntegerArgumentType.getInteger(c, "mode");
+					// Without a volume number: modes 1 and 2 look at volume 0, mode 3 (the fog applied to the blocks) picks the volume by behaviour.
+					int volume = mode >= 3 && mode != 4 && mode != 6 ? -1 : 0;
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_FOG_VIEW, mode, volume) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: fog view " + mode + (mode == 3 ? ": the game's fog applied to the blocks (volume picked by behaviour)." : mode == 5 ? ": the game's fog on plain grey blocks (volume picked by behaviour)." : ", volume 0: the log lists the game's fog volumes.")));
+					}
+					return 1;
+				}).then(ClientCommands.argument("volume", IntegerArgumentType.integer(0, 15)).executes(c -> {
+					int mode = IntegerArgumentType.getInteger(c, "mode"), volume = IntegerArgumentType.getInteger(c, "volume");
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_FOG_VIEW, mode, volume) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: fog view " + mode + ", volume " + volume + "."));
+					}
+					return 1;
+				}))))
+				.then(ClientCommands.literal("fogrange").then(ClientCommands.argument("nearCm", IntegerArgumentType.integer(1, 10000)).then(ClientCommands.argument("farM", IntegerArgumentType.integer(1, 5000)).executes(c -> {
+					int nearCm = IntegerArgumentType.getInteger(c, "nearCm"), farM = IntegerArgumentType.getInteger(c, "farM");
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_FOG_RANGE, nearCm, farM) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: the fog volume's slices run from " + nearCm + " cm to " + farM + " m."));
+					}
+					return 1;
+				}))))
+				// /ccdebug glowstart <percent>: how bright a pixel has to be (percent of full brightness, after undoing Minecraft's face shading) to count as light-emitting and get the glow boost. Default 70;
+				// raise it (about 90) so that sunlit pale blocks (sand, birch, quartz) don't glow at noon while glowstone and lanterns still do.
+				.then(ClientCommands.literal("glowstart").then(ClientCommands.argument("percent", IntegerArgumentType.integer(30, 99)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_GLOW_START, percent, "Pixels count as light-emitting from " + percent + "% of full brightness.")));
+					return 1;
+				})))
+				// /ccdebug fogglow <percent>: how much of the fog the glow of a block's brightest pixels feels (100 the physical amount, 0 none; default 0): the game's own emissives are so much
+				// brighter than a white surface that they still bloom through fog, ours are not, so their glow is held back less.
+				.then(ClientCommands.literal("fogglow").then(ClientCommands.argument("percent", IntegerArgumentType.integer(0, 150)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_FOG_GLOW, percent, "Glowing pixels feel the fog at " + percent + "% (100 is the physical amount, 0 none).")));
+					return 1;
+				})))
+				.then(ClientCommands.literal("fogcurve").then(ClientCommands.argument("exp", IntegerArgumentType.integer(0, 1)).executes(c -> {
+					int exp = IntegerArgumentType.getInteger(c, "exp");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_FOG_CURVE, exp, exp == 1 ? "The fog volume's slices are spread exponentially with distance." : "The fog volume's slices are spread evenly with distance.")));
+					return 1;
+				})))
 				// /ccdebug class <word>: the methods and fields of the game's classes with <word> (up to six letters) in their name; the shortest names first, at most four classes.
 				.then(ClientCommands.literal("class").then(ClientCommands.argument("word", StringArgumentType.word()).executes(c -> {
 					String word = StringArgumentType.getString(c, "word").toLowerCase();
@@ -426,6 +475,24 @@ public final class CyberCraftClient implements ClientModInitializer {
 				c.getSource().sendFeedback(Component.literal("CyberCraft: /ccweather <clear|sunny|lightclouds|cloudy|heavyclouds|rain|lightrain|fog|pollution|acid|sandstorm|reset>"));
 				return 1;
 			}));
+			// /ccemit status|on|off: which blocks give light, as read from Minecraft's world (so that light sources glow in Night City and a sunlit pale block doesn't).
+			dispatcher.register(ClientCommands.literal("ccemit")
+				.then(ClientCommands.literal("status").executes(c -> {
+					for (String line : EmissionGrid.status()) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: " + line));
+					}
+					return 1;
+				}))
+				.then(ClientCommands.literal("on").executes(c -> {
+					EmissionGrid.setEnabled(true);
+					c.getSource().sendFeedback(Component.literal("CyberCraft: the blocks' light levels are read from the world."));
+					return 1;
+				}))
+				.then(ClientCommands.literal("off").executes(c -> {
+					EmissionGrid.setEnabled(false);
+					c.getSource().sendFeedback(Component.literal("CyberCraft: the blocks' light levels are not read; glow goes by brightness again."));
+					return 1;
+				})));
 			// /ccterrain  turns aiming at Night City itself (to build on its streets and walls) off and on.
 			dispatcher.register(ClientCommands.literal("ccterrain").executes(c -> {
 				TerrainPick.setEnabled(!TerrainPick.enabled());
@@ -838,6 +905,7 @@ public final class CyberCraftClient implements ClientModInitializer {
 	private static void tick(Minecraft client) {
 		CyberLink.poll();
 		BlockColliders.tick(client);
+		EmissionGrid.tick(client); // which blocks are light sources (the blocks are drawn into the game's scene, and the light sources glow)
 
 		// How fast the Minecraft player is moving, from where it was a tick ago (one tick = 1/20 s). A jump of more than
 		// a few blocks in one tick is a teleport, not walking: it doesn't count.

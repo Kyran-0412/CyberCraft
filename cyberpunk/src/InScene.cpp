@@ -23,6 +23,7 @@
 
 #include "InScene.hpp"
 #include "Log.hpp"
+#include "Depth.hpp"
 #include "Overlay.hpp"
 
 #include <RED4ext/GpuApi/DeviceData.hpp>
@@ -98,12 +99,29 @@ namespace cybercraft::inscene
 			char kind;           // 'B' a barrier, 'S' a copy out of the scene texture, 'D' a copy into it
 			std::uint32_t a, b;  // the states a barrier moves between
 		};
+		struct VolTouch
+		{
+			ID3D12Resource* res;
+			std::uint32_t after;  // the state subresource 0 of a froxel volume is moved into
+		};
+		struct VolState
+		{
+			std::uint32_t state;
+			std::uint64_t seen;  // the insertion count when it was last moved
+			std::uint32_t uav = 0;  // how many times it was moved into the unordered access state (written by compute) since the last insertion
+		};
 		struct ListInfo
 		{
+			std::vector<VolTouch> volumes;  // what this recording does with the game's 3D fog textures, to be replayed in the order the GPU runs the lists
+			std::vector<std::uint32_t> depthStates;  // the states the game's main depth texture is moved into (all subresources), likewise
 			Tag tag;
 			std::vector<First> firsts;
 			std::vector<Touch> touches;  // what this recording does with the scene texture we last knew (for the report when drawing stops)
 		};
+		std::uint32_t g_depthState = 0;        // the state of the game's main depth texture as of the lists replayed so far (under g_mutex)
+		bool g_haveDepthState = false;
+		ID3D12Resource* g_depthResource = nullptr;
+		std::unordered_map<ID3D12Resource*, VolState> g_volStates;  // the game's 3D fog textures and the state each is in, as of the lists replayed so far (under g_mutex)
 		std::atomic<ID3D12Resource*> g_knownSource{ nullptr };  // the scene texture as last found
 		std::atomic<std::uint32_t> g_knownState{ 0 };           // the state it is in when the scene-copy list begins (learnt once, the same every frame)
 		std::atomic<bool> g_haveKnownState{ false };
@@ -162,6 +180,24 @@ VSOut VS(uint id : SV_VertexID)
 float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 )HLSL";
 
+		std::string StateName(std::uint32_t a_state)
+		{
+			if (a_state == 0) {
+				return "PRESENT/COMMON";
+			}
+			std::string text;
+			const struct { std::uint32_t v; const char* n; } bits[] = { { 0x1, "VERTEX/CBV" }, { 0x4, "RENDER_TARGET" }, { 0x8, "UAV" }, { 0x40, "NON_PIXEL_SRV" }, { 0x80, "PIXEL_SRV" }, { 0x400, "COPY_DEST" }, { 0x800, "COPY_SOURCE" } };
+			for (const auto& b : bits) {
+				if (a_state & b.v) {
+					text += text.empty() ? "" : "|";
+					text += b.n;
+				}
+			}
+			char hex[16];
+			std::snprintf(hex, sizeof(hex), " (0x%X)", a_state);
+			return text + hex;
+		}
+
 		bool IsOurs(const List* a_list)
 		{
 			for (const Slot& s : g_slots) {
@@ -206,6 +242,16 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 				}
 				if (!known && info.firsts.size() < 400) {
 					info.firsts.push_back({ res, static_cast<std::uint32_t>(b.Transition.StateBefore) });
+				}
+				if (b.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && res == depth::CandidateResource() && info.depthStates.size() < 32) {
+					info.depthStates.push_back(static_cast<std::uint32_t>(b.Transition.StateAfter));
+				}
+				// The game's volumetric fog lives in 3D textures of float colour (the screen divided by 8, 128 slices deep): their state is tracked so that one can be read safely.
+				if ((b.Transition.Subresource == 0 || b.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) && info.volumes.size() < 32) {
+					const D3D12_RESOURCE_DESC d = res->GetDesc();
+					if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && d.DepthOrArraySize >= 96 && d.Width >= 128) {
+						info.volumes.push_back({ res, static_cast<std::uint32_t>(b.Transition.StateAfter) });
+					}
 				}
 				if (res == g_knownSource.load(std::memory_order_relaxed) && info.touches.size() < 24) {
 					info.touches.push_back({ 'B', static_cast<std::uint32_t>(b.Transition.StateBefore), static_cast<std::uint32_t>(b.Transition.StateAfter) });
@@ -375,7 +421,7 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 		}
 
 		// Records our list for one frame: the scene texture to render target, the square, and back to the state it was in.
-		ID3D12CommandList* RecordSquare(const Tag& a_tag, Slot*& a_slotOut, bool& a_drew)
+		ID3D12CommandList* RecordSquare(const Tag& a_tag, Slot*& a_slotOut, bool& a_drew, std::uint32_t a_depthState, bool a_haveDepthState)
 		{
 			a_drew = false;
 			if (!InitGpu()) {
@@ -414,6 +460,14 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			const float colour[4] = { 1.0f * brightness[mode], 0.30f * brightness[mode], 0.05f * brightness[mode], 0.0f };
 
 			if (g_mode.load() == 4) {
+				// A fresh copy of the game's depth first: the end-of-frame capture is a frame old by the time the blocks are drawn (the main depth is written to after this point of the frame).
+				if (a_haveDepthState && depth::RecordSceneCapture(slot.list.Get(), a_depthState)) {
+					static bool noted = false;
+					if (!noted) {
+						noted = true;
+						g_sdk->logger->InfoF(g_handle, "inscene: copying the game's depth at the moment the scene is complete (it is in state 0x%X then), so the blocks are hidden by this frame's depth, not the last one's", a_depthState);
+					}
+				}
 				// The real thing: Minecraft's blocks, drawn by the overlay's own pipeline into the scene.
 				a_drew = overlay::DrawWorldIntoScene(slot.list.Get(), rtv, w, h);
 				if (!a_drew) {
@@ -455,6 +509,9 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			}
 			int found = -1;
 			Tag tag;
+			std::vector<overlay::FogVolume> atInsertion;  // the fog textures and their states when our list will run
+			std::uint32_t depthStateAtInsertion = 0;       // the state of the game's main depth texture when our list will run
+			bool haveDepthState = false;
 			{
 				std::lock_guard lock(g_mutex);
 				bool touching = false;
@@ -478,6 +535,50 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 							tag.haveState = true;
 						} else {
 							++g_noStateTags;
+						}
+					}
+				}
+				// Replay what these lists do to the fog textures, in the order the GPU runs them. The states as of just before the scene-copy list are kept: that is where our drawing goes.
+				{
+					auto replay = [&](UINT i) {
+						auto it = g_lists.find(static_cast<List*>(a_lists[i]));
+						if (it != g_lists.end()) {
+							for (const std::uint32_t s : it->second.depthStates) {
+								g_depthState = s;
+								g_haveDepthState = true;
+							}
+							for (const VolTouch& v : it->second.volumes) {
+								VolState& st = g_volStates[v.res];
+								st.state = v.after;
+								st.seen = g_inserted.load();
+								if (v.after & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+									++st.uav;
+								}
+							}
+						}
+					};
+					const UINT firstPart = found >= 0 ? static_cast<UINT>(found) : a_count;
+					if (depth::CandidateResource() != g_depthResource) {
+						g_depthResource = depth::CandidateResource();  // a different texture: what was known of the old one is no use
+						g_haveDepthState = false;
+					}
+					for (UINT i = 0; i < firstPart; ++i) {
+						replay(i);
+					}
+					if (found >= 0) {
+						depthStateAtInsertion = g_depthState;
+						haveDepthState = g_haveDepthState;
+						for (auto it = g_volStates.begin(); it != g_volStates.end();) {
+							if (g_inserted.load() > it->second.seen + 240) {
+								it = g_volStates.erase(it);  // not touched for a while: it may be gone
+							} else {
+								atInsertion.push_back({ it->first, it->second.state, it->second.uav });
+								it->second.uav = 0;  // counted again from here
+								++it;
+							}
+						}
+						for (UINT i = static_cast<UINT>(found); i < a_count; ++i) {
+							replay(i);
 						}
 					}
 				}
@@ -515,9 +616,29 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 				g_sdk->logger->InfoF(g_handle, "inscene: found the list that copies the scene: it copies %p into %p, and begins with the source in state 0x%X; our drawing goes in just before it",
 					static_cast<void*>(tag.source), static_cast<void*>(tag.destination), tag.state);
 			}
+			// The fog textures, in a stable order, for the overlay to show one of them on the blocks (see /ccdebug fogview).
+			std::sort(atInsertion.begin(), atInsertion.end(), [](const overlay::FogVolume& a, const overlay::FogVolume& b) {
+				return reinterpret_cast<std::uintptr_t>(a.resource) < reinterpret_cast<std::uintptr_t>(b.resource);
+			});
+			{
+				static std::vector<ID3D12Resource*> lastSet;
+				std::vector<ID3D12Resource*> now;
+				for (const auto& v : atInsertion) {
+					now.push_back(v.resource);
+				}
+				if (now != lastSet) {
+					lastSet = now;
+					g_sdk->logger->InfoF(g_handle, "inscene: %u froxel volumes (the game's volumetric fog textures) when the scene is complete:", static_cast<unsigned>(atInsertion.size()));
+					for (std::size_t i = 0; i < atInsertion.size(); ++i) {
+						g_sdk->logger->InfoF(g_handle, "inscene:   volume %u: %p, state %s, written by compute %u times since the last frame", static_cast<unsigned>(i), static_cast<void*>(atInsertion[i].resource),
+							StateName(atInsertion[i].state).c_str(), atInsertion[i].uavWrites);
+					}
+				}
+			}
+			overlay::SetFogVolumes(atInsertion);
 			Slot* slot = nullptr;
 			bool drew = false;
-			ID3D12CommandList* ours = RecordSquare(tag, slot, drew);
+			ID3D12CommandList* ours = RecordSquare(tag, slot, drew, depthStateAtInsertion, haveDepthState);
 			if (!ours) {
 				g_origExecute(a_queue, a_count, a_lists);
 				return;
@@ -595,8 +716,14 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 		g_screenH.store(a_height);
 	}
 
+	namespace
+	{
+		bool g_userChoice = false;  // the player has used /ccdebug scene: then the mode is theirs, and nothing starts it by itself
+	}
+
 	void SetMode(int a_mode)
 	{
+		g_userChoice = true;
 		a_mode = std::clamp(a_mode, 0, 4);
 		if (a_mode > 0 && g_gaveUp) {
 			g_sdk->logger->Warn(g_handle, "inscene: the hooks failed earlier; restart the game to try again");
@@ -605,6 +732,8 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 		{
 			std::lock_guard lock(g_mutex);
 			g_lists.clear();
+			g_volStates.clear();
+			g_haveDepthState = false;
 		}
 		g_mode.store(a_mode);
 		g_lastDrawMs.store(0);
@@ -612,6 +741,16 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 		g_armedAt = std::chrono::steady_clock::now();
 		g_foundLogged = false;
 		g_sdk->logger->InfoF(g_handle, "inscene: drawing into the game's scene: %s", a_mode == 0 ? "off" : a_mode == 1 ? "a dim square" : a_mode == 2 ? "a bright square" : a_mode == 3 ? "a very bright square" : "Minecraft's blocks");
+	}
+
+	void EnableByDefault()
+	{
+		if (g_userChoice || g_mode.load() != 0 || g_gaveUp) {
+			return;
+		}
+		SetMode(4);
+		g_userChoice = false;  // that was not the player's choice: /ccdebug scene 0 still turns it off for good
+		g_sdk->logger->Info(g_handle, "inscene: started by itself because Minecraft is sending frames (/ccdebug scene 0 turns it off)");
 	}
 
 	void OnPresent()

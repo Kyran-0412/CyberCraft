@@ -44,6 +44,14 @@ namespace cybercraft::depth
 	};
 	bool GetGameDepth(GameDepth& a_out);
 
+	// The texture the capture copies from (the game's main depth), or null if there isn't one yet.
+	ID3D12Resource* CandidateResource();
+
+	// Records into a_list a copy of the game's depth into the same texture the capture fills, for a_list to run at a moment when the depth texture is in the state a_state (all
+	// subresources). The end-of-frame capture comes too late for blocks drawn into the scene (the main depth is still written to after that point), so the in-scene list makes its own
+	// copy first. False if there is no capture to copy into.
+	bool RecordSceneCapture(ID3D12GraphicsCommandList* a_list, std::uint32_t a_state);
+
 	// The game's interface layer (HUD), copied each frame right after the game has drawn it (needs the depth tools on, which install the hook), for the
 	// overlay to draw back on top of Minecraft's blocks. Kept in the copy-destination state like the depth copy: move it to a readable state to use it
 	// and put it back. Its format is R8G8B8A8_TYPELESS: view it as R8G8B8A8_UNORM (the layer's own sRGB encoding is kept as it is).

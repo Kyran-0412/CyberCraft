@@ -2,6 +2,8 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
+#include <vector>
 #include <chrono>
 #include <cstdint>
 
@@ -82,6 +84,17 @@ namespace cybercraft
 			std::uint64_t frame = 0;
 		};
 		bool ReadMcWorld(McWorldSnapshot& a_out) const;
+
+		// The light emission of the blocks around the player (see EmissionHdr in the protocol).
+		struct EmissionSnapshot
+		{
+			std::uint32_t generation = 0;
+			std::uint32_t flags = 0;
+			std::int32_t originX = 0, originY = 0, originZ = 0;
+			std::uint32_t sizeX = 0, sizeY = 0, sizeZ = 0;
+		};
+		// Reads the header; if a_bytes is given and the generation is not a_have, also copies the grid into it. False if the memory isn't there or was being written (try again).
+		bool ReadEmission(EmissionSnapshot& a_out, std::uint32_t a_have, std::vector<std::uint8_t>* a_bytes) const;
 
 		// A one-off command from Minecraft (see McCommand in the protocol).
 		struct Command
