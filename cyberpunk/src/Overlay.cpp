@@ -15,6 +15,8 @@
 
 #include "Overlay.hpp"
 #include "Log.hpp"
+#include "UiProbe.hpp"
+#include "InScene.hpp"
 #include "Depth.hpp"
 #include "Input.hpp"
 #include "Link.hpp"
@@ -31,9 +33,11 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 
 using Microsoft::WRL::ComPtr;
 
@@ -69,6 +73,18 @@ namespace cybercraft::overlay
 		std::uint64_t g_hudDraws = 0;
 		std::uint64_t g_badgeDraws = 0;
 		int g_debugView = 0;
+		std::recursive_mutex g_gpuMutex;           // Draw (at Present) and DrawWorldIntoScene (from the game's queue submission) share the textures and descriptors
+		float g_sceneGain = 1.0f;                  // the blocks' brightness in the game's HDR scene (1 = a Minecraft white is 1.0 in the scene's units)
+		float g_sceneGlow = 3.0f;                  // how much the brightest pixels are boosted in the scene: up to (1 + this) times
+		const char* g_sceneWhy = "";                // why the last attempt to draw the blocks into the scene drew nothing
+		float g_sceneDelayMs = 0.0f;               // how far behind the newest published camera the blocks are aimed when drawn into the scene
+		std::atomic<std::uint64_t> g_sceneDrawn{ 0 };  // how many times the blocks were drawn into the scene
+		std::uint64_t g_sceneSeen = 0;
+		float g_uiScaleX = 1.0f;  // the game's interface layer is stretched by this much across, and by g_uiScaleY down, about the middle of the screen (and then shifted) before it is laid over the blocks
+		float g_uiScaleY = 1.0f;
+		float g_uiShiftX = 0.0f;  // pixels
+		float g_uiShiftY = 0.0f;
+		int g_uiMode = 0;  // the game's interface over the blocks: 0 off, 1 the layer is premultiplied alpha, 2 it is straight alpha, 3 show the layer alone
 		bool g_warpEnabled = true;
 		float g_warpDelayMs = 10.0f;
 		std::uint64_t g_warpDraws = 0;
@@ -88,15 +104,19 @@ cbuffer P : register(b0)
 	float flipY; float mode; float cursorOn; float layered;
 	float2 cursor; float zeroToOne; float haveGameDepth;
 	float mcA; float mcB; float gameNear; float biasAbs;
-	float biasRel; float debugView; float2 pad;
+	float biasRel; float debugView; float uiMode; float haveUi;
 	float4 warpR0; float4 warpR1; float4 warpR2;   // rows of the matrix from Minecraft's camera space to the current camera space
 	float4 warpT;                                  // xyz: where Minecraft's camera is, in the current camera space; w: 1 = re-aim
 	float4 tans;                                   // tan(half field of view): current x, y; Minecraft's x, y
+	float4 uiXform;                                // the interface layer: x: stretch across and w: stretch down, both about the middle of the screen; y, z: shift in pixels
+	float4 sceneParams;                            // x: 1 = draw into the game's HDR scene (linear, scaled by y, brightest pixels boosted by up to w); z: 1 = leave the blocks out (they were drawn into the scene)
+	float4 shadeX; float4 shadeY; float4 shadeZ;   // rows of the matrix from Minecraft's camera space to Minecraft's world (xyz), w of shadeX: 1 = valid: used to tell which way a face points
 };
 Texture2D tex : register(t0);          // the whole frame (plain mode), or the world's colour (layered)
 Texture2D mcDepthTex : register(t1);   // layered: the world's depth, as Minecraft wrote it
 Texture2D overlayTex : register(t2);   // layered: the hand, hotbar and screens
 Texture2D gameDepthTex : register(t3); // the game's own depth (a copy), when there is one
+Texture2D uiTex : register(t4);        // the game's interface layer (a copy), when there is one: its sRGB-encoded values as they are
 SamplerState samp : register(s0);
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut VS(uint id : SV_VertexID)
@@ -106,6 +126,46 @@ VSOut VS(uint id : SV_VertexID)
 	o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 	o.uv = uv;
 	return o;
+}
+// A place in Minecraft's picture, in Minecraft's camera space (x right, y up, z forward), from the picture's own depth.
+float3 McViewPos(float2 texUv)
+{
+	uint mw, mh;
+	mcDepthTex.GetDimensions(mw, mh);
+	uint2 px = clamp(uint2(texUv * float2(mw, mh)), uint2(0, 0), uint2(mw - 1, mh - 1));
+	float s = mcDepthTex.Load(int3(px, 0)).r;
+	float ndcz = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
+	float den = ndcz + mcA;
+	float zk = abs(den) > 1e-9 ? mcB / den : 1e9;
+	float2 tuv = flipY > 0.5 ? float2(texUv.x, 1.0 - texUv.y) : texUv;
+	float2 nm = float2(tuv.x * 2.0 - 1.0, 1.0 - tuv.y * 2.0);
+	return float3(nm * tans.zw, 1.0) * zk;
+}
+// How bright Minecraft made the face at this place: 1 for a top, 0.8 north and south, 0.6 east and west, 0.5 a bottom (1 if it can't tell). The way the face points comes
+// from the slope of the picture's depth there, and the camera's axes in Minecraft's world.
+float McShade(float2 texUv)
+{
+	if (shadeX.w < 0.5) { return 1.0; }
+	uint mw, mh;
+	mcDepthTex.GetDimensions(mw, mh);
+	float2 d = 1.0 / float2(mw, mh);
+	float3 pc = McViewPos(texUv);
+	if (pc.z <= 0.0 || pc.z > 48.0) { return 1.0; }
+	float3 pr = McViewPos(texUv + float2(d.x, 0));
+	float3 pl = McViewPos(texUv - float2(d.x, 0));
+	float3 pu = McViewPos(texUv + float2(0, d.y));
+	float3 pd = McViewPos(texUv - float2(0, d.y));
+	// The smaller step along each axis, so that the edge of a block doesn't make a normal from two different surfaces.
+	float3 dx = abs(pr.z - pc.z) < abs(pc.z - pl.z) ? pr - pc : pc - pl;
+	float3 dy = abs(pu.z - pc.z) < abs(pc.z - pd.z) ? pu - pc : pc - pd;
+	float3 n = cross(dx, dy);
+	float len = length(n);
+	if (len < 1e-12) { return 1.0; }
+	n /= len;
+	if (dot(n, pc) > 0.0) { n = -n; }   // facing the camera
+	float3 nw = float3(dot(shadeX.xyz, n), dot(shadeY.xyz, n), dot(shadeZ.xyz, n));
+	if (abs(nw.y) > 0.7) { return nw.y > 0.0 ? 1.0 : 0.5; }
+	return abs(nw.z) > abs(nw.x) ? 0.8 : 0.6;
 }
 float4 PS(VSOut i) : SV_Target
 {
@@ -119,6 +179,7 @@ float4 PS(VSOut i) : SV_Target
 		float4 w;
 		float zm = 1e9;
 		bool hidden = false;
+		float2 mcUv = uv;   // where in Minecraft's picture this pixel's block was taken from
 		uint mw, mh;
 		mcDepthTex.GetDimensions(mw, mh);
 		if (warpT.w > 0.5) {
@@ -147,6 +208,7 @@ float4 PS(VSOut i) : SV_Target
 			float2 tuv = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
 			float2 tex2 = flipY > 0.5 ? float2(tuv.x, 1.0 - tuv.y) : tuv;
 			w = ok ? tex.Sample(samp, tex2) : float4(0, 0, 0, 0);
+			mcUv = tex2;
 			zm = pc.z > 0.0 ? pc.z : 1e9;      // how far the block is along the current camera's view
 		} else {
 			w = tex.Sample(samp, uv);       // the world, premultiplied alpha
@@ -183,6 +245,37 @@ float4 PS(VSOut i) : SV_Target
 			return float4(g, g, g, 1);
 		}
 		if (hidden) { w = float4(0, 0, 0, 0); }
+		if (sceneParams.x > 0.5) {
+			// Into the game's HDR scene: Minecraft's colours are gamma encoded and premultiplied; the scene is linear.
+			float3 s = w.a > 1e-4 ? w.rgb / w.a : float3(0, 0, 0);
+			// Minecraft's whites are only 1.0, while the city's lights are many times that: the brightest pixels (lit white, glowstone, torch flames) are boosted, the way a texture pack
+			// with brighter light sources would, so that they glow when the game's bloom gets them.
+			// Minecraft dims faces by direction (a top is 100%, north and south 80%, east and west 60%, a bottom 50%), so a lit side face is never as bright as a top: undo that
+			// first, or only the tops would glow.
+			float peak = max(s.r, max(s.g, s.b)) / McShade(mcUv);
+			float hot = smoothstep(0.7, 1.0, saturate(peak));
+			float3 lin = pow(saturate(s), 2.2) * sceneParams.y * (1.0 + sceneParams.w * hot * hot);
+			return float4(lin * w.a, w.a);
+		}
+		if (sceneParams.z > 0.5) { w = float4(0, 0, 0, 0); }
+		if (uiMode > 0.5 && haveUi > 0.5) {
+			uint uw, uh;
+			uiTex.GetDimensions(uw, uh);
+			float2 usize = float2(uw, uh);
+			float2 uq = (i.pos.xy - usize * 0.5) / float2(uiXform.x, uiXform.w) + usize * 0.5 - uiXform.yz;   // where in the layer this pixel is, after the stretch and shift
+			float4 u = (all(uq >= 0.0) && all(uq < usize)) ? uiTex.SampleLevel(samp, uq / usize, 0) : float4(0, 0, 0, 0);
+			if (uiMode > 3.5) {
+				return float4(float3(1.0, 0.0, 1.0) * u.a * 0.6, u.a * 0.6);   // a magenta shadow of the layer over everything, to line it up with the real interface
+			}
+			if (uiMode > 2.5) {
+				return float4(u.rgb + float3(0.35, 0.0, 0.35) * (1.0 - u.a), 1.0);   // the layer alone; where it is transparent, magenta
+			}
+			if (w.a > 0.0) {
+				// The game's interface over the blocks (the picture underneath already has it on, so only pixels with blocks need this).
+				float3 ur = uiMode > 1.5 ? u.rgb * u.a : u.rgb;
+				w = float4(ur + w.rgb * (1.0 - u.a), u.a + w.a * (1.0 - u.a));
+			}
+		}
 		float4 o = overlayTex.Sample(samp, uv);
 		c = o + w * (1.0 - o.a);                // the overlay over the world, both premultiplied
 	} else {
@@ -209,6 +302,7 @@ float4 PS(VSOut i) : SV_Target
 			ComPtr<ID3D12CommandQueue> queue;
 			ComPtr<ID3D12RootSignature> rootSignature;
 			ComPtr<ID3D12PipelineState> pso;
+			ComPtr<ID3D12PipelineState> psoScene;  // the same shaders, drawing into the game's HDR scene (R16G16B16A16_FLOAT)
 			DXGI_FORMAT psoFormat = DXGI_FORMAT_UNKNOWN;
 			ComPtr<ID3DBlob> vs, ps;
 			ComPtr<ID3D12DescriptorHeap> rtvHeap;
@@ -237,6 +331,8 @@ float4 PS(VSOut i) : SV_Target
 			// The game's depth copy, as last bound to descriptor 3.
 			ID3D12Resource* boundGameDepth = nullptr;
 			UINT boundGameW = 0, boundGameH = 0;
+			ID3D12Resource* boundUi = nullptr;
+			UINT boundUiW = 0, boundUiH = 0;
 			DXGI_FORMAT boundGameFormat = DXGI_FORMAT_UNKNOWN;
 			ComPtr<ID3D12Resource> upload[kFrames];
 			UINT64 uploadSize[kFrames] = {};
@@ -357,7 +453,7 @@ float4 PS(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_HEAP_DESC srv{};
 			srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-			srv.NumDescriptors = 4;
+			srv.NumDescriptors = 5;
 			srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 			hr = g.device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&g.srvHeap));
 			if (FAILED(hr)) {
@@ -366,13 +462,13 @@ float4 PS(VSOut i) : SV_Target
 			}
 			g.srvInc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			{
-				// All four descriptors must be valid for the shader, even the ones a frame doesn't use: make them null ones.
+				// All five descriptors must be valid for the shader, even the ones a frame doesn't use: make them null ones.
 				D3D12_SHADER_RESOURCE_VIEW_DESC nullView{};
 				nullView.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				nullView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 				nullView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 				nullView.Texture2D.MipLevels = 1;
-				for (UINT i = 0; i < 4; ++i) {
+				for (UINT i = 0; i < 5; ++i) {
 					D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
 					h.ptr += SIZE_T(i) * g.srvInc;
 					g.device->CreateShaderResourceView(nullptr, &nullView, h);
@@ -401,7 +497,7 @@ float4 PS(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_RANGE range{};
 			range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-			range.NumDescriptors = 4;
+			range.NumDescriptors = 5;
 			range.BaseShaderRegister = 0;
 			range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -412,7 +508,7 @@ float4 PS(VSOut i) : SV_Target
 			params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 			params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 			params[1].Constants.ShaderRegister = 0;
-			params[1].Constants.Num32BitValues = 36;
+			params[1].Constants.Num32BitValues = 56;
 			params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 			D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -485,6 +581,43 @@ float4 PS(VSOut i) : SV_Target
 				return false;
 			}
 			g.psoFormat = a_format;
+			return true;
+		}
+
+		// The same shaders, drawing into the game's HDR scene texture: premultiplied alpha blending onto R16G16B16A16_FLOAT.
+		bool EnsureScenePipeline()
+		{
+			if (g.psoScene) {
+				return true;
+			}
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+			desc.pRootSignature = g.rootSignature.Get();
+			desc.VS = { g.vs->GetBufferPointer(), g.vs->GetBufferSize() };
+			desc.PS = { g.ps->GetBufferPointer(), g.ps->GetBufferSize() };
+			auto& blend = desc.BlendState.RenderTarget[0];
+			blend.BlendEnable = TRUE;
+			blend.SrcBlend = D3D12_BLEND_ONE;
+			blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+			blend.BlendOp = D3D12_BLEND_OP_ADD;
+			blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+			blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+			blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+			blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			desc.SampleMask = UINT_MAX;
+			desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+			desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			desc.RasterizerState.DepthClipEnable = TRUE;
+			desc.DepthStencilState.DepthEnable = FALSE;
+			desc.DepthStencilState.StencilEnable = FALSE;
+			desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			desc.NumRenderTargets = 1;
+			desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			desc.SampleDesc.Count = 1;
+			const HRESULT hr = g.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g.psoScene));
+			if (FAILED(hr)) {
+				LogError("creating the pipeline for the game's HDR scene", hr);
+				return false;
+			}
 			return true;
 		}
 
@@ -695,6 +828,7 @@ float4 PS(VSOut i) : SV_Target
 
 		void Draw(IDXGISwapChain* a_swapChain)
 		{
+			std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
 			auto& link = Link::Get();
 			if (!link.IsOpen()) {
 				return;
@@ -883,6 +1017,42 @@ float4 PS(VSOut i) : SV_Target
 				g.list->ResourceBarrier(1, &toRead);
 			}
 
+			// The game's interface layer, copied each frame by the depth hook: drawn back over the blocks, so the interface is in front of them.
+			depth::SetScreenSize(bb.Width, bb.Height);
+			inscene::SetScreenSize(bb.Width, bb.Height);
+			depth::SetUiWanted(g_uiMode > 0);
+			depth::GameUi gameUi;
+			bool useUi = false;
+			if (drawHud && g.layered && g_uiMode > 0) {
+				if (depth::GetGameUi(gameUi)) {
+					if (g.boundUi != gameUi.resource || g.boundUiW != gameUi.width || g.boundUiH != gameUi.height) {
+						WaitIdle();  // the descriptor may be in use by a frame still on the GPU
+						D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+						view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // the layer's values as they are stored (sRGB-encoded), blended the way Minecraft's are
+						view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+						view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+						view.Texture2D.MipLevels = 1;
+						D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+						h.ptr += SIZE_T(4) * g.srvInc;
+						g.device->CreateShaderResourceView(gameUi.resource, &view, h);
+						g.boundUi = gameUi.resource;
+						g.boundUiW = gameUi.width;
+						g.boundUiH = gameUi.height;
+						g_sdk->logger->InfoF(g_handle, "overlay: drawing the game's interface layer (%u x %u) over the blocks (mode %d)", gameUi.width, gameUi.height, g_uiMode);
+					}
+					useUi = true;
+					auto toReadUi = Transition(gameUi.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+					g.list->ResourceBarrier(1, &toReadUi);
+				} else {
+					static auto lastComplaint = std::chrono::steady_clock::time_point{};
+					const auto t = std::chrono::steady_clock::now();
+					if (t - lastComplaint > std::chrono::seconds(8)) {
+						lastComplaint = t;
+						g_sdk->logger->Info(g_handle, "overlay: the game's interface layer has not been captured (yet): it needs the depth capture on (blocks drawn) and the HUD showing");
+					}
+				}
+			}
+
 			// Draw onto the back buffer.
 			auto toTarget = Transition(backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			g.list->ResourceBarrier(1, &toTarget);
@@ -913,8 +1083,8 @@ float4 PS(VSOut i) : SV_Target
 				if (useGameDepth) {
 					++g_depthDraws;
 				}
-				float constants[36] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
-					g.mcA, g.mcB, 0.02f /* the game's near plane: its depth is 0.02 / distance */, 0.06f, 0.004f, float(g_debugView), 0.0f, 0.0f };
+				float constants[56] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, g.layered ? 1.0f : 0.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, useGameDepth ? 1.0f : 0.0f,
+					g.mcA, g.mcB, 0.02f /* the game's near plane: its depth is 0.02 / distance */, 0.06f, 0.004f, float(g_debugView), float(g_uiMode), useUi ? 1.0f : 0.0f };
 				// Re-aim the blocks (the world layer) at the game's camera as it is now, so the time the picture took to arrive isn't seen.
 				if (g.layered && g_warpEnabled) {
 					Link::CameraPose drawn;
@@ -926,6 +1096,16 @@ float4 PS(VSOut i) : SV_Target
 						constants[31] = 0.0f;
 					}
 				}
+				{
+					// If the blocks were drawn into the game's scene this frame, only the overlay (hand, hotbar, screens) is drawn here.
+					const std::uint64_t drawn = g_sceneDrawn.load();
+					constants[42] = (g.layered && drawn != g_sceneSeen) ? 1.0f : 0.0f;
+					g_sceneSeen = drawn;
+				}
+				constants[36] = g_uiScaleX;
+				constants[37] = g_uiShiftX;
+				constants[38] = g_uiShiftY;
+				constants[39] = g_uiScaleY;
 				if (input::CursorVisible()) {
 					// The cursor lives in the HUD's pixels; the HUD is stretched over the screen.
 					float cx = 0.0f;
@@ -935,18 +1115,22 @@ float4 PS(VSOut i) : SV_Target
 					constants[4] = g.texW ? cx * float(bb.Width) / float(g.texW) : cx;
 					constants[5] = g.texH ? cy * float(bb.Height) / float(g.texH) : cy;
 				}
-				g.list->SetGraphicsRoot32BitConstants(1, 36, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 56, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			} else if (badge) {
 				++g_badgeDraws;
 				D3D12_RECT scissor{ 8, 8, 72, 72 };  // the test square
 				g.list->RSSetScissorRects(1, &scissor);
-				float constants[36] = {};
+				float constants[56] = {};
 				constants[1] = 1.0f;
-				g.list->SetGraphicsRoot32BitConstants(1, 36, constants, 0);
+				g.list->SetGraphicsRoot32BitConstants(1, 56, constants, 0);
 				g.list->DrawInstanced(3, 1, 0, 0);
 			}
 
+			if (useUi) {
+				auto uiBack = Transition(gameUi.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+				g.list->ResourceBarrier(1, &uiBack);
+			}
 			if (useGameDepth) {
 				// The capture's next copy into this texture assumes it is waiting in the copy-destination state.
 				auto toCopyDest = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -999,6 +1183,10 @@ float4 PS(VSOut i) : SV_Target
 			++g_presents;
 			LogStatus();
 			cybercraft::depth::Report();
+			if (a_swapChain == g_gameSwapChain) {
+				cybercraft::uiprobe::OnPresent(a_swapChain);
+				cybercraft::inscene::OnPresent();
+			}
 			if (!g_inHook && a_swapChain == g_gameSwapChain && (a_flags & DXGI_PRESENT_TEST) == 0) {
 				g_inHook = true;
 				Draw(a_swapChain);
@@ -1011,6 +1199,10 @@ float4 PS(VSOut i) : SV_Target
 		{
 			++g_presents;
 			LogStatus();
+			if (static_cast<IDXGISwapChain*>(a_swapChain) == g_gameSwapChain) {
+				cybercraft::uiprobe::OnPresent(static_cast<IDXGISwapChain*>(a_swapChain));
+				cybercraft::inscene::OnPresent();
+			}
 			if (!g_inHook && static_cast<IDXGISwapChain*>(a_swapChain) == g_gameSwapChain && (a_flags & DXGI_PRESENT_TEST) == 0) {
 				g_inHook = true;
 				Draw(a_swapChain);
@@ -1105,6 +1297,141 @@ float4 PS(VSOut i) : SV_Target
 	{
 		g_warpEnabled = a_enabled;
 		g_warpDelayMs = std::clamp(a_delayMs, 0.0f, 150.0f);
+	}
+
+	bool DrawWorldIntoScene(ID3D12GraphicsCommandList* a_list, D3D12_CPU_DESCRIPTOR_HANDLE a_rtv, UINT a_width, UINT a_height)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		if (!g.ready || g.failed || !g.srvHeap || !g.rootSignature || !g.device) {
+			g_sceneWhy = "the overlay is not ready (or failed)";
+			return false;
+		}
+		if (!g.haveFrame || !g.texture || !g.texDepth) {
+			g_sceneWhy = "no Minecraft frame has arrived yet";
+			return false;
+		}
+		if (!g.layered) {
+			g_sceneWhy = "the last Minecraft frame was not a layered one (a menu or a plain frame)";
+			return false;
+		}
+		depth::GameDepth gameDepth;
+		if (!depth::GetGameDepth(gameDepth)) {
+			g_sceneWhy = "there is no copy of the game's depth (the depth capture is off or restarting)";
+			return false;  // without the game's depth the blocks can't be hidden behind the world: draw nothing
+		}
+		if (!EnsureScenePipeline()) {
+			g_sceneWhy = "the pipeline for the scene could not be made";
+			return false;
+		}
+		if (g.boundGameDepth != gameDepth.resource || g.boundGameW != gameDepth.width || g.boundGameH != gameDepth.height || g.boundGameFormat != gameDepth.srvFormat) {
+			WaitIdle();  // the descriptor may be in use by a frame still on the GPU
+			D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+			view.Format = gameDepth.srvFormat;
+			view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			view.Texture2D.MipLevels = 1;
+			view.Texture2D.PlaneSlice = 0;
+			D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+			h.ptr += SIZE_T(3) * g.srvInc;
+			g.device->CreateShaderResourceView(gameDepth.resource, &view, h);
+			g.boundGameDepth = gameDepth.resource;
+			g.boundGameW = gameDepth.width;
+			g.boundGameH = gameDepth.height;
+			g.boundGameFormat = gameDepth.srvFormat;
+		}
+		auto toRead = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		a_list->ResourceBarrier(1, &toRead);
+
+		a_list->OMSetRenderTargets(1, &a_rtv, FALSE, nullptr);
+		ID3D12DescriptorHeap* heaps[] = { g.srvHeap.Get() };
+		a_list->SetDescriptorHeaps(1, heaps);
+		a_list->SetGraphicsRootSignature(g.rootSignature.Get());
+		a_list->SetPipelineState(g.psoScene.Get());
+		a_list->SetGraphicsRootDescriptorTable(0, g.srvHeap->GetGPUDescriptorHandleForHeapStart());
+		a_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(a_width), float(a_height), 0.0f, 1.0f };
+		a_list->RSSetViewports(1, &viewport);
+		D3D12_RECT scissor{ 0, 0, LONG(a_width), LONG(a_height) };
+		a_list->RSSetScissorRects(1, &scissor);
+
+		float constants[56] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, 1.0f,
+			g.mcA, g.mcB, 0.02f /* the game's near plane */, 0.06f, 0.004f, 0.0f, 0.0f, 0.0f };
+		auto& link = Link::Get();
+		bool warped = false;
+		Link::CameraPose drawn;
+		const bool haveDrawn = link.CameraPoseForFrame(g.cameraFrame, drawn);
+		if (g_warpEnabled) {
+			Link::CameraPose target;
+			const auto aim = std::chrono::steady_clock::now() - std::chrono::microseconds(static_cast<long long>(g_sceneDelayMs * 1000.0f));
+			warped = haveDrawn && link.CameraPoseAt(aim, target) && BuildWarp(drawn, target, &constants[16]);
+		}
+		if (haveDrawn) {
+			// Minecraft's camera axes in Minecraft's world, as the rows of the matrix from camera space to world space: used to tell which way a face points.
+			const Axes m = AxesOf(drawn);
+			for (int row = 0; row < 3; ++row) {
+				for (int col = 0; col < 3; ++col) {
+					constants[44 + row * 4 + col] = static_cast<float>(m.v[col][row]);
+				}
+			}
+			constants[47] = 1.0f;  // valid
+		}
+		if (!warped) {
+			constants[31] = 0.0f;
+		}
+		constants[40] = 1.0f;          // into the scene
+		constants[41] = g_sceneGain;
+		constants[43] = g_sceneGlow;
+		a_list->SetGraphicsRoot32BitConstants(1, 56, constants, 0);
+		a_list->DrawInstanced(3, 1, 0, 0);
+
+		auto back = Transition(gameDepth.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+		a_list->ResourceBarrier(1, &back);
+		++g_sceneDrawn;
+		return true;
+	}
+
+	const char* SceneBlockedReason()
+	{
+		return g_sceneWhy;
+	}
+
+	void SetSceneGlow(float a_percent)
+	{
+		g_sceneGlow = std::clamp(a_percent, 0.0f, 3000.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: the brightest pixels of the blocks drawn into the game's scene are boosted by up to %.0f%%", g_sceneGlow * 100.0f);
+	}
+
+	void SetSceneGain(float a_percent)
+	{
+		g_sceneGain = std::clamp(a_percent, 5.0f, 2000.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: the blocks drawn into the game's scene are %.0f%% as bright as a Minecraft white would be in the scene's units", g_sceneGain * 100.0f);
+	}
+
+	void SetSceneDelay(float a_ms)
+	{
+		g_sceneDelayMs = std::clamp(a_ms, 0.0f, 150.0f);
+		g_sdk->logger->InfoF(g_handle, "overlay: the blocks drawn into the game's scene are aimed %.0f ms behind the newest published camera", g_sceneDelayMs);
+	}
+
+	void SetUiTransform(float a_scaleXPercent, float a_scaleYPercent, float a_shiftX, float a_shiftY, bool a_setScale)
+	{
+		if (a_setScale) {
+			g_uiScaleX = std::clamp(a_scaleXPercent, 50.0f, 200.0f) / 100.0f;
+			g_uiScaleY = std::clamp(a_scaleYPercent, 50.0f, 200.0f) / 100.0f;
+		} else {
+			g_uiShiftX = std::clamp(a_shiftX, -400.0f, 400.0f);
+			g_uiShiftY = std::clamp(a_shiftY, -400.0f, 400.0f);
+		}
+		g_sdk->logger->InfoF(g_handle, "overlay: the game's interface layer is stretched to %.1f%% across and %.1f%% down about the middle, and shifted by (%.1f, %.1f) pixels", g_uiScaleX * 100.0f, g_uiScaleY * 100.0f, g_uiShiftX, g_uiShiftY);
+	}
+
+	void SetUiLayerMode(int a_mode)
+	{
+		a_mode = std::clamp(a_mode, 0, 4);
+		if (a_mode != g_uiMode) {
+			g_uiMode = a_mode;
+			g_sdk->logger->InfoF(g_handle, "overlay: the game's interface over the blocks: %s", a_mode == 0 ? "off" : a_mode == 1 ? "on (premultiplied alpha)" : a_mode == 2 ? "on (straight alpha)" : a_mode == 3 ? "showing the captured layer alone" : "showing a magenta shadow of the captured layer over everything, to line it up");
+		}
 	}
 
 	void SetDebugView(int a_view)

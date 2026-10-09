@@ -1,6 +1,7 @@
 package dev.cybercraft.client;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.cybercraft.CyberCraft;
 import dev.cybercraft.link.CyberLink;
@@ -237,6 +238,9 @@ public final class CyberCraftClient implements ClientModInitializer {
 			// /ccdebug log on|off | dump | find <word>   tools for working on the mod (they write to Cyberpunk's CyberCraft.log):
 			//   log: detailed statistics every few seconds (camera accuracy, depth capture, ground scan, input counts); the log is quiet without it
 			//   dump: the classes behind the collision boxes, to check them after a game update
+			//   uilayer <0-3>: draw the game's interface (HUD) back over the blocks so that it is in front of them (3: show the captured layer alone, to check it)
+			//   ui [from]: record four frames of the game's drawing and summarise the last whole one, to find where its interface starts (for drawing blocks behind it);
+			//       from = the number of the first command list to print in full
 			//   find: every class, enum and global function in the game whose name contains the word (the first six letters count)
 			dispatcher.register(ClientCommands.literal("ccdebug")
 				.then(ClientCommands.literal("log")
@@ -248,6 +252,72 @@ public final class CyberCraftClient implements ClientModInitializer {
 						c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_LOG, 0, "Detailed logging off.")));
 						return 1;
 					})))
+				.then(ClientCommands.literal("ui")
+					.executes(c -> {
+						c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_UI, 0, "Capturing the next frames' drawing: the summary is in CyberCraft.log (lines starting with ui:).")));
+						return 1;
+					})
+					.then(ClientCommands.argument("from", IntegerArgumentType.integer(0, 500)).executes(c -> {
+						int from = IntegerArgumentType.getInteger(c, "from");
+						c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_UI, from + 1, "Capturing the next frames' drawing; the command lists from number " + from + " on will be printed in full in CyberCraft.log (lines starting with ui:).")));
+						return 1;
+					})))
+				// /ccdebug uilayer <0-3>: the game's own interface (health bar, minimap, quest text) drawn back over Minecraft's blocks, so it is in front of them:
+				// 0 off, 1 on (the captured layer is premultiplied alpha), 2 on (straight alpha), 3 show the captured layer alone (transparent parts magenta)
+				.then(ClientCommands.literal("uilayer").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 4)).executes(c -> {
+					int mode = IntegerArgumentType.getInteger(c, "mode");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_UI_LAYER, mode, "The game's interface over the blocks: mode " + mode + (mode == 3 ? " (showing the captured layer alone)." : mode == 4 ? " (a magenta shadow of the layer over everything: use /ccdebug uiscale and uishift to line it up with the real interface)." : mode == 0 ? " (off)." : "."))));
+					return 1;
+				})))
+				// /ccdebug uiscale <across%> [down%] and /ccdebug uishift <x> <y>: where the game's interface layer is laid over the blocks (the game stretches it about the middle of the screen,
+				// by different amounts across and down: with one number both are the same).
+				.then(ClientCommands.literal("uiscale").then(ClientCommands.argument("across", IntegerArgumentType.integer(50, 200)).executes(c -> {
+					int across = IntegerArgumentType.getInteger(c, "across");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_UI_SCALE, across, "The interface layer is stretched to " + across + "% across and " + across + "% down about the middle of the screen.")));
+					return 1;
+				}).then(ClientCommands.argument("down", IntegerArgumentType.integer(50, 200)).executes(c -> {
+					int across = IntegerArgumentType.getInteger(c, "across"), down = IntegerArgumentType.getInteger(c, "down");
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_UI_SCALE, across, down) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: the interface layer is stretched to " + across + "% across and " + down + "% down about the middle of the screen."));
+					}
+					return 1;
+				}))))
+				.then(ClientCommands.literal("uishift").then(ClientCommands.argument("x", IntegerArgumentType.integer(-400, 400)).then(ClientCommands.argument("y", IntegerArgumentType.integer(-400, 400)).executes(c -> {
+					int x = IntegerArgumentType.getInteger(c, "x"), y = IntegerArgumentType.getInteger(c, "y");
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_UI_SHIFT, x, y) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: the interface layer is shifted by (" + x + ", " + y + ") pixels."));
+					}
+					return 1;
+				}))))
+				// /ccdebug scene <0-3>: proof of concept for drawing blocks into the game's own HDR scene: a dim (1), bright (2) or very bright (3) square in the middle of the screen is
+				// drawn into the scene just before the game's post-processing, so bloom, tone mapping and the game's interface apply to it. 0 off. (Needs DLSS off.)
+				.then(ClientCommands.literal("scene").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 4)).executes(c -> {
+					int mode = IntegerArgumentType.getInteger(c, "mode");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE, mode, mode == 0 ? "Drawing into the game's scene: off." : mode == 4 ? "Drawing Minecraft's blocks into the game's scene (they now get bloom, tone mapping, colour grading, and the game's interface over them)." : "Drawing a square into the game's scene (mode " + mode + "): look for it in the middle of the screen; see CyberCraft.log (lines starting with inscene:).")));
+					return 1;
+				})))
+				// /ccdebug scenegain <percent>: how bright the blocks are in the game's scene (100: a Minecraft white is 1.0 in the scene's units; try 50 to 300).
+				.then(ClientCommands.literal("scenegain").then(ClientCommands.argument("percent", IntegerArgumentType.integer(5, 2000)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_GAIN, percent, "The blocks drawn into the game's scene are " + percent + "% as bright as before.")));
+					return 1;
+				})))
+				// /ccdebug sceneglow <percent>: how much the brightest pixels (lit whites, glowstone, torch flames) are boosted in the game's scene so that they glow with the game's bloom (0 off; default 300: up to 4 times).
+				.then(ClientCommands.literal("sceneglow").then(ClientCommands.argument("percent", IntegerArgumentType.integer(0, 3000)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_GLOW, percent, "The brightest pixels of the blocks in the game's scene are boosted by up to " + percent + "%.")));
+					return 1;
+				})))
+				// /ccdebug scenedelay <ms>: how far behind the newest published camera the blocks are aimed when drawn into the scene (if they swim when you turn, try 0 to 30).
+				.then(ClientCommands.literal("scenedelay").then(ClientCommands.argument("ms", IntegerArgumentType.integer(0, 150)).executes(c -> {
+					int ms = IntegerArgumentType.getInteger(c, "ms");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_DELAY, ms, "The blocks drawn into the game's scene are aimed " + ms + " ms behind the newest camera.")));
+					return 1;
+				})))
 				.then(ClientCommands.literal("dump").executes(c -> {
 					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_DUMP, 0, "Writing the classes behind the collision boxes to CyberCraft.log.")));
 					return 1;

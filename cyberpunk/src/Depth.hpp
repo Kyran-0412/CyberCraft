@@ -44,6 +44,20 @@ namespace cybercraft::depth
 	};
 	bool GetGameDepth(GameDepth& a_out);
 
+	// The game's interface layer (HUD), copied each frame right after the game has drawn it (needs the depth tools on, which install the hook), for the
+	// overlay to draw back on top of Minecraft's blocks. Kept in the copy-destination state like the depth copy: move it to a readable state to use it
+	// and put it back. Its format is R8G8B8A8_TYPELESS: view it as R8G8B8A8_UNORM (the layer's own sRGB encoding is kept as it is).
+	struct GameUi
+	{
+		ID3D12Resource* resource = nullptr;
+		UINT width = 0;
+		UINT height = 0;
+		bool ready = false;
+	};
+	void SetUiWanted(bool a_wanted);
+	void SetScreenSize(UINT a_width, UINT a_height);  // the back buffer's size: the interface layer is the screen-sized texture
+	bool GetGameUi(GameUi& a_out);                    // false if there is no fresh copy
+
 	// Call once per presented frame: sets up the capture when it can, and logs every few seconds while a tool is on.
 	void Report();
 

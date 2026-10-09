@@ -267,6 +267,14 @@ namespace cybercraft::proto
 	{
 		kDebugDump = 0,   // write the classes behind the collision boxes to the log
 		kDebugLog = 1,    // y: 1 detailed logging on, 0 off
+		kDebugUi = 2,     // capture the next frame's drawing into the back buffer and summarise it in the log (where does the game draw its interface?)
+		kDebugUiLayer = 3,  // y: the game's interface (HUD) over Minecraft's blocks: 0 off, 1 premultiplied alpha, 2 straight alpha, 3 show the captured layer alone, 4 a magenta shadow of it over everything
+		kDebugUiScale = 4,  // y: the interface layer's stretch across, about the middle of the screen, in percent; z: its stretch down (0: the same as across)
+		kDebugUiShift = 5,  // y, z: the interface layer's shift in pixels (x, y)
+		kDebugScene = 6,    // y: 0 off, 1 to 3: draw a dim, bright or very bright square into the game's own HDR scene (the proof of concept), 4: draw Minecraft's blocks into it
+		kDebugSceneGain = 7,   // y: the blocks' brightness in the game's HDR scene, in percent (100: a Minecraft white is 1.0 in the scene's units)
+		kDebugSceneDelay = 8,  // y: how many milliseconds behind the newest published camera the blocks are aimed when they are drawn into the scene
+		kDebugSceneGlow = 10,  // y: how much the brightest pixels of the blocks are boosted in the game's HDR scene, in percent of their brightness (300: up to four times as bright)
 		kDebugFind = 9,   // y: up to six letters packed into the number; list the game's classes, enums and global functions with that in their name
 	};
 

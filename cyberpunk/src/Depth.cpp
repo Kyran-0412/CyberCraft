@@ -195,6 +195,91 @@ namespace cybercraft::depth
 
 		// Records, into the game's command list right after the barrier that made the texture readable as a copy source:
 		// a copy of the whole texture into ours, and a few single-texel copies of it into the buffer the plugin reads.
+		// ---- the game's interface layer ------------------------------------------------------------------------------------------
+		// The game draws its HUD (health, minimap, quest text) into a texture of its own: screen-sized, R8G8B8A8_UNORM_SRGB, with a chain of smaller
+		// levels for blurring, cleared and then drawn into with a few dozen quads; later passes lay it over the scene (found with /ccdebug ui). To draw
+		// Minecraft's blocks *behind* it, the overlay draws this layer back on top of the blocks, so each frame it is copied right after its drawing is
+		// done: when the game moves its first level from render target to shader resource, which happens once, before the blur passes read it.
+		std::atomic<bool> g_candidateStale{ false };  // the texture the capture copies from was replaced by another one at the same address
+		std::atomic<bool> g_uiWanted{ false };
+		std::atomic<UINT> g_screenW{ 0 };
+		std::atomic<UINT> g_screenH{ 0 };
+		Microsoft::WRL::ComPtr<ID3D12Resource> g_uiCopy;
+		std::atomic<ID3D12Resource*> g_uiCopyPtr{ nullptr };
+		UINT g_uiCopyW = 0;
+		UINT g_uiCopyH = 0;
+		std::atomic<std::uint64_t> g_uiCopiesTotal{ 0 };
+		std::atomic<std::int64_t> g_uiLastCopyMs{ 0 };
+		std::atomic<ID3D12Resource*> g_uiSource{ nullptr };
+
+		void Bury(Microsoft::WRL::ComPtr<ID3D12Resource>& a_resource);  // defined below
+
+		std::int64_t NowMs()
+		{
+			return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
+
+		void RecordUiCapture(ID3D12GraphicsCommandList* a_list, ID3D12Resource* a_source, UINT a_subresource, D3D12_RESOURCE_STATES a_state, const D3D12_RESOURCE_DESC& a_desc)
+		{
+			if (!g_uiCopy || g_uiCopyW != a_desc.Width || g_uiCopyH != a_desc.Height) {
+				auto* data = RED4ext::GpuApi::GetDeviceData();
+				if (!data || !data->device) {
+					return;
+				}
+				D3D12_HEAP_PROPERTIES heap{};
+				heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+				heap.CreationNodeMask = 1;
+				heap.VisibleNodeMask = 1;
+				D3D12_RESOURCE_DESC desc{};
+				desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+				desc.Width = a_desc.Width;
+				desc.Height = a_desc.Height;
+				desc.DepthOrArraySize = 1;
+				desc.MipLevels = 1;
+				desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;  // the same family as the game's sRGB layer, so that it can be copied into; viewed as plain UNORM to read
+				desc.SampleDesc.Count = 1;
+				desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+				Microsoft::WRL::ComPtr<ID3D12Resource> copy;
+				if (FAILED(data->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&copy)))) {
+					g_sdk->logger->Error(g_handle, "depth: the interface layer's copy could not be made");
+					g_uiWanted.store(false);
+					return;
+				}
+				g_uiCopyPtr.store(nullptr);
+				Bury(g_uiCopy);
+				g_uiCopy = copy;
+				g_uiCopyW = static_cast<UINT>(a_desc.Width);
+				g_uiCopyH = a_desc.Height;
+				g_uiCopiesTotal.store(0);
+				g_uiCopyPtr.store(g_uiCopy.Get());
+				g_sdk->logger->InfoF(g_handle, "depth: the game's interface layer found: texture %p, %u x %u, %u levels; copying it each frame right after it is drawn", static_cast<void*>(a_source),
+					g_uiCopyW, g_uiCopyH, static_cast<unsigned>(a_desc.MipLevels));
+			}
+			D3D12_RESOURCE_BARRIER lift{};
+			lift.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			lift.Transition.pResource = a_source;
+			lift.Transition.Subresource = a_subresource;
+			lift.Transition.StateBefore = a_state;
+			lift.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			g_original(a_list, 1, &lift);
+			D3D12_TEXTURE_COPY_LOCATION dst{};
+			dst.pResource = g_uiCopy.Get();
+			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dst.SubresourceIndex = 0;
+			D3D12_TEXTURE_COPY_LOCATION src{};
+			src.pResource = a_source;
+			src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			src.SubresourceIndex = 0;  // the full-size level
+			a_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			D3D12_RESOURCE_BARRIER drop = lift;
+			drop.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			drop.Transition.StateAfter = a_state;
+			g_original(a_list, 1, &drop);
+			g_uiSource.store(a_source);
+			g_uiCopiesTotal.fetch_add(1, std::memory_order_relaxed);
+			g_uiLastCopyMs.store(NowMs(), std::memory_order_relaxed);
+		}
+
 		void RecordCapture(ID3D12GraphicsCommandList* a_list, D3D12_RESOURCE_STATES a_sourceState)
 		{
 			ID3D12Resource* source = g_candidate.load(std::memory_order_acquire);
@@ -271,6 +356,36 @@ namespace cybercraft::depth
 						const bool leaving = (before & D3D12_RESOURCE_STATE_DEPTH_WRITE) != 0;
 						if (entering || leaving) {
 							if (Entry* e = Find(b.Transition.pResource, true)) {
+								// The game frees and remakes its render textures now and then (switching path tracing on and off does it), and a new texture can get the address of an old one: then
+								// the numbers collected for that address belong to a texture that is gone, and would keep it the top candidate for ever. Start the entry again if the texture
+								// at this address is not the one it described.
+								const D3D12_RESOURCE_DESC seen = b.Transition.pResource->GetDesc();
+								if (seen.Width != e->width || seen.Height != e->height || seen.Format != e->format || seen.Dimension != e->dimension || seen.Flags != e->flags) {
+									e->width = seen.Width;
+									e->height = seen.Height;
+									e->depthOrArray = seen.DepthOrArraySize;
+									e->mips = seen.MipLevels;
+									e->format = seen.Format;
+									e->flags = seen.Flags;
+									e->dimension = seen.Dimension;
+									e->enter = 0;
+									e->leave = 0;
+									e->alias = 0;
+									e->copySrcAll = 0;
+									e->copySrcPart = 0;
+									e->copySrcAllTotal = 0;
+									e->finalLeave = 0;
+									e->finalLeaveTotal = 0;
+									e->activityTotal = 0;
+									for (Pair& p : e->pairs) {
+										p.before = 0xFFFFFFFFu;
+										p.after = 0;
+										p.count = 0;
+									}
+									if (b.Transition.pResource == g_candidate.load(std::memory_order_acquire)) {
+										g_candidateStale.store(true);
+									}
+								}
 								(entering ? e->enter : e->leave).fetch_add(1, std::memory_order_relaxed);
 								e->activityTotal.fetch_add(1, std::memory_order_relaxed);
 								NotePair(*e, before, after);
@@ -306,6 +421,27 @@ namespace cybercraft::depth
 				}
 			}
 			g_original(a_list, a_count, a_barriers);
+
+			// The interface layer: its full-size level moved from render target to shader resource (both kinds), once a frame, after the HUD is drawn.
+			if (g_uiWanted.load(std::memory_order_relaxed) && a_barriers && g_screenW.load(std::memory_order_relaxed) != 0) {
+				for (UINT i = 0; i < a_count; ++i) {
+					const D3D12_RESOURCE_BARRIER& b = a_barriers[i];
+					if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource || (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) {
+						continue;
+					}
+					const auto both = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+					if (b.Transition.StateBefore != D3D12_RESOURCE_STATE_RENDER_TARGET || (b.Transition.StateAfter & both) != both ||
+						(b.Transition.Subresource != 0 && b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)) {
+						continue;
+					}
+					const D3D12_RESOURCE_DESC desc = b.Transition.pResource->GetDesc();
+					if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Width == g_screenW.load(std::memory_order_relaxed) && desc.Height == g_screenH.load(std::memory_order_relaxed) &&
+						desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && desc.MipLevels >= 3 && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+						RecordUiCapture(a_list, b.Transition.pResource, b.Transition.Subresource, b.Transition.StateAfter, desc);
+						break;
+					}
+				}
+			}
 
 			// The capture: right after the candidate texture was moved out of depth write into a plain shader-readable state (all of it at once,
 			// so a whole-texture copy is valid), which happens once a frame, after the last depth pass.
@@ -632,6 +768,11 @@ namespace cybercraft::depth
 			g_graveyard.erase(std::remove_if(g_graveyard.begin(), g_graveyard.end(), [&](const Graveyard& g) { return now - g.since > std::chrono::seconds(4); }),
 				g_graveyard.end());
 
+			if (g_candidateStale.exchange(false) && g_copyReady.load()) {
+				g_sdk->logger->Info(g_handle, "depth: capture: the game replaced the texture being copied with another one at the same address; choosing again");
+				StopCapture();
+				return;
+			}
 			if (!g_captureWanted || g_captureGaveUp || g_copyReady.load() || !g_active.load()) {
 				return;
 			}
@@ -765,6 +906,33 @@ namespace cybercraft::depth
 		}
 		a_out.ready = a_out.resource != nullptr;
 		return a_out.ready;
+	}
+
+	void SetUiWanted(bool a_wanted)
+	{
+		g_uiWanted.store(a_wanted);
+	}
+
+	void SetScreenSize(UINT a_width, UINT a_height)
+	{
+		g_screenW.store(a_width);
+		g_screenH.store(a_height);
+	}
+
+	bool GetGameUi(GameUi& a_out)
+	{
+		a_out = GameUi{};
+		if (g_uiCopiesTotal.load(std::memory_order_relaxed) == 0 || !g_uiCopyPtr.load(std::memory_order_acquire)) {
+			return false;
+		}
+		if (NowMs() - g_uiLastCopyMs.load(std::memory_order_relaxed) > 500) {
+			return false;  // the HUD has not been drawn for a while (a loading screen, or it was switched off)
+		}
+		a_out.resource = g_uiCopyPtr.load(std::memory_order_acquire);
+		a_out.width = g_uiCopyW;
+		a_out.height = g_uiCopyH;
+		a_out.ready = true;
+		return true;
 	}
 
 	bool CaptureWanted()

@@ -9,6 +9,8 @@
 #include "Camera.hpp"
 #include "Collision.hpp"
 #include "Log.hpp"
+#include "UiProbe.hpp"
+#include "InScene.hpp"
 #include "Depth.hpp"
 #include "Ground.hpp"
 #include "Input.hpp"
@@ -181,7 +183,44 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
 
     if (aCommand.kind == cybercraft::proto::kCmdDebug)
     {
-        cybercraft::collision::Command(static_cast<int>(aCommand.x), aCommand.y);
+        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneGlow)
+        {
+            cybercraft::overlay::SetSceneGlow(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneGain)
+        {
+            cybercraft::overlay::SetSceneGain(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneDelay)
+        {
+            cybercraft::overlay::SetSceneDelay(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugScene)
+        {
+            cybercraft::inscene::SetMode(static_cast<int>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugUiScale)
+        {
+            // y: the stretch across in percent, z: the stretch down (0: the same as across)
+            cybercraft::overlay::SetUiTransform(static_cast<float>(aCommand.y), aCommand.z > 0.0 ? static_cast<float>(aCommand.z) : static_cast<float>(aCommand.y), 0.0f, 0.0f, true);
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugUiShift)
+        {
+            cybercraft::overlay::SetUiTransform(100.0f, 100.0f, static_cast<float>(aCommand.y), static_cast<float>(aCommand.z), false);
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugUiLayer)
+        {
+            cybercraft::overlay::SetUiLayerMode(static_cast<int>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugUi)
+        {
+            // y: 0 = the usual summary, N + 1 = the lists from position N on in full
+            cybercraft::uiprobe::Request(aCommand.y >= 1.0 ? static_cast<int>(aCommand.y) - 1 : -1);
+        }
+        else
+        {
+            cybercraft::collision::Command(static_cast<int>(aCommand.x), aCommand.y);
+        }
         link.AckCommand(aCommand.seq, true);
         return;
     }
@@ -639,6 +678,8 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         cybercraft::camera::Init(aHandle, aSdk);
         cybercraft::depth::Init(aHandle, aSdk);
         cybercraft::collision::Init(aHandle, aSdk);
+        cybercraft::uiprobe::Init(aHandle, aSdk);
+        cybercraft::inscene::Init(aHandle, aSdk);
         cybercraft::mapping::Load();
         aSdk->logger->InfoF(aHandle, "vertical offset between the game and Minecraft: %.3f", cybercraft::mapping::Offset());
 

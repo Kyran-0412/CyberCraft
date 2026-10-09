@@ -410,6 +410,11 @@ public final class CyberLink {
 
 	/** Sends a debug command to the plugin (action: one of the DEBUG_ constants, arg: its argument). Returns the command's number (0: link down). */
 	public static int sendDebug(int action, double arg) {
+		return sendDebug(action, arg, 0.0);
+	}
+
+	/** The same, with a second argument. */
+	public static int sendDebug(int action, double arg, double arg2) {
 		MemorySegment s = shm;
 		if (s == null) {
 			return 0;
@@ -420,7 +425,7 @@ public final class CyberLink {
 		s.set(JAVA_INT, OFF_MC_COMMAND + C_KIND, CMD_DEBUG);
 		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_X, (double) action);
 		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Y, arg);
-		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Z, 0.0);
+		s.set(JAVA_DOUBLE, OFF_MC_COMMAND + C_Z, arg2);
 		VarHandle.releaseFence();
 		s.set(JAVA_INT, OFF_MC_COMMAND + C_SEQ, base + 2);
 		return base + 2;

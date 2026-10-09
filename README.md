@@ -112,6 +112,43 @@ buildings yet (no depth test), and blocks are lit by Minecraft's own light.
   `verbose-log.txt` next to the plugin for the plugin to start with it on. The measuring keeps running either way. Also: `/ccdebug find <word>` lists every class, enum and
   global function in the game whose name contains the word (the first six letters count), which is how most of the game's inner workings were found, and `/ccdebug dump`
   writes the classes behind the collision boxes to the log, to check them after a game update.
+  `/ccdebug ui [from]` (the start of the work on drawing blocks *behind* the game's interface) records every command list the game records over four frames, with the order the queues
+  run them in, and writes a summary of the last whole frame between two presents to the log (with `from`, the command lists from that position on are printed in full and the earlier ones only get their line) (lines starting with `ui:`; run it twice, the second time the render targets are resolved to textures, because the first run is what starts watching them): one line per command list (draws, pipelines, dispatches, copies, viewports),
+  and for the lists that matter the screen-sized textures they move, the copies between them and their draws grouped into runs with the same pipeline. The first capture showed that
+  the list that puts the picture on the back buffer is tiny (one full-screen triangle), so the interface is drawn earlier, into another texture; this finds it, since the blocks will
+  have to be drawn into the game's own command list at the point where the interface starts.
+* **The game's interface in front of the blocks** (`/ccdebug uilayer <0-4>`, off by default; **unfinished**: the copy of the layer did not line up with the game's own HUD (top elements lower and bottom ones higher by some offset, not a stretch), and the work stopped there because drawing into the game's scene (below) would make it unnecessary). The depth hook also copies the game's HUD layer each frame
+  (the screen-sized `R8G8B8A8_UNORM_SRGB` texture with a chain of smaller levels, copied when its full-size level goes from render target to shader resource, which is after the HUD is drawn
+  and before the blur passes read it). The overlay draws that copy back over the pixels where there are blocks, so the interface is in front of them: mode 1 treats the layer as
+  premultiplied alpha, mode 2 as straight alpha, mode 3 shows the captured layer alone (transparent parts magenta) to check that it is the right texture. Pixels without blocks are left as the
+  game drew them, and partly transparent block pixels get the interface applied twice, which is the one inexactness. Needs the depth capture (it uses the same hook).
+  The game seems to stretch this layer a little about the middle of the screen when it lays it over the picture (our copy, drawn 1:1, looked smaller and pulled in toward the middle):
+  `/ccdebug uilayer 4` shows a magenta shadow of the captured layer over everything, and `/ccdebug uiscale <across%> [down%]` (the game stretches it by different amounts across and down) and `/ccdebug uishift <x> <y>` place it, so it can be lined up by eye
+  with the real interface; the numbers that line up go into the code as the defaults.
+* **Drawing into the game's own scene** (`/ccdebug scene <0-3>`, proof of concept; DLSS off and path tracing off). The aim: draw the blocks into the HDR scene texture just before the game's
+  post-processing, so bloom, exposure, tone mapping, colour grading and the game's own interface (laid over them by the game) apply to the blocks too. The captures show the list that follows the
+  last scene drawing begins by copying the scene's HDR texture (a screen-sized R16G16B16A16_FLOAT) into a second one and does no drawing itself. `InScene.cpp` notices that list while the game
+  records it (and the state the scene texture is in when it begins), and when the game hands it to the queue, slots a small list of our own in just before it: it moves the scene to render target,
+  draws, and moves it back. The proof of concept (modes 1 to 3: a dim, bright and very bright square) worked: it glowed, was tone mapped, lit the wet road in the game's reflections, and had the game's HUD over it.
+  Mode 4 draws Minecraft's actual blocks the same way: the overlay's own pipeline (depth test against the game's depth, re-aiming at the camera) with a second pipeline for the HDR scene format and a shader
+  output that turns Minecraft's gamma-encoded premultiplied colour into linear scene units (`/ccdebug scenegain <percent>` sets the brightness, `/ccdebug scenedelay <ms>` the aim). The draw at Present then leaves
+  the blocks out and draws only the hand, hotbar and screens.
+  The brightest pixels (lit whites, glowstone, torch flames) are boosted in the shader (`/ccdebug sceneglow <percent>`, default 300) because a Minecraft white is only 1.0 in scene units while the city's lights are many times that. Minecraft dims faces by direction (top 100%, north and south 80%, east and west 60%, bottom 50%), so the shader works out which way each face points (from the slope of the block layer's depth and the camera's axes in Minecraft's world) and undoes that shading before deciding what glows; otherwise only the tops would. The log says
+  `inscene: STOPPED drawing into the game's scene: <why>` if drawing into the scene stops (and `drawing ... again` when it resumes), with how many copies of the scene and how many scene-copy lists without a
+  known state were seen since, and then describes, for the first batch of command lists that touches the scene texture, what each list does with it. (First real-world finding: after about 6 minutes the game stopped
+  being seen copying the scene; the likely cause is that the copy, which exists for glass and refraction, is not done every frame. The scene texture's state when the copy list begins (0x8C0) is now remembered, so a
+  missing barrier is survived, but a missing copy would need a different anchor, which the report is meant to reveal.)
+  Known limitation of this first version: the game's depth copy that hides the blocks behind the world is taken at the end of the *previous* frame's depth passes (the main depth is still
+  written to by later lists, so its final copy comes after the point where the blocks are drawn), so while turning fast, silhouettes of hidden blocks can be a frame late. The fix is to copy the
+  main depth inside the in-scene list, which needs the depth's state at that point (to be learnt by replaying the barriers in the order the lists are run).
+* **Surviving the game remaking its textures.** Switching path tracing on and off made the game free and remake its render textures; the depth module's table (keyed by address) then kept the old depth texture's
+  numbers for whatever new texture got that address, kept choosing it, and captured garbage (a 520 x 512 and then a 960 x 540 colour texture), so the blocks lost their depth and the in-scene drawing stopped
+  (`there is no copy of the game's depth`). Now, when a depth barrier names a texture whose size, format or flags differ from the entry's, the entry is started again, and if it was the one being copied the
+  capture is stopped and chosen again at once.
+* **Where the game draws its interface (found with `/ccdebug ui`).** The last command list of the frame does bloom and post-processing, then moves a *separate* 1920 x 1080
+  `R8G8B8A8_UNORM_SRGB` texture into the render target state, clears it, and draws the interface into it (quads, text and icons, about 40 draws). A short list after it
+  reads one finished `R8G8B8A8_TYPELESS` 1920 x 1080 texture with a full-screen triangle and writes it to the back buffer. So the scene exists without the interface until a compose step
+  after those draws, and the blocks can be added to the scene just before it. (The game re-uses about 60 command lists and runs about 65 per frame; some are not recorded each frame.)
 * **Building on Night City** (`/ccterrain`, on by default). Night City isn't made of blocks, so Minecraft can't aim at it. `TerrainPick` marches the
   camera's ray over the same smooth ground surface and obstacle squares that the player collides with, and answers with the hit Minecraft would
   get from a real block: a point, a face, and the empty cell just outside the surface, which Minecraft then fills when you place a block. Nothing

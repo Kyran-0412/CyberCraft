@@ -70,6 +70,14 @@ public final class Proto {
 	public static final int CMD_DEBUG = 3; // a debug command: x = the DEBUG_ action, y = its argument
 	public static final int DEBUG_DUMP = 0; // write the classes behind the collision boxes to the plugin's log
 	public static final int DEBUG_LOG = 1; // y: 1 detailed logging on, 0 off
+	public static final int DEBUG_UI = 2; // capture the next frame's drawing into the back buffer and summarise it in the log
+	public static final int DEBUG_UI_LAYER = 3; // y: the game's interface over the blocks: 0 off, 1 premultiplied alpha, 2 straight alpha, 3 show the captured layer alone
+	public static final int DEBUG_UI_SCALE = 4; // y: the interface layer's stretch across, about the middle of the screen, in percent; z: its stretch down (0: the same as across)
+	public static final int DEBUG_UI_SHIFT = 5; // y, z: the interface layer's shift in pixels (x, y)
+	public static final int DEBUG_SCENE = 6; // y: 0 off, 1 to 3: a dim, bright or very bright square drawn into the game's HDR scene (proof of concept)
+	public static final int DEBUG_SCENE_GAIN = 7; // y: the blocks' brightness in the game's HDR scene, in percent
+	public static final int DEBUG_SCENE_DELAY = 8; // y: milliseconds behind the newest published camera that the blocks are aimed at when drawn into the scene
+	public static final int DEBUG_SCENE_GLOW = 10; // y: how much the brightest pixels of the blocks are boosted in the game's HDR scene, in percent
 	public static final int DEBUG_FIND = 9; // y: up to six letters packed into the number; list the game's classes, enums and functions with that in their name
 
 	public static final int RESULT_NONE = 0;
