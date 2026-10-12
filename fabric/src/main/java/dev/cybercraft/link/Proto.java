@@ -98,6 +98,17 @@ public final class Proto {
 	public static final int DEBUG_FOG_CURVE = 18; // y: 1 exponential, 0 even
 	public static final int DEBUG_FOG_GLOW = 19; // y: how much of the fog the glow of the blocks' brightest pixels feels, in percent
 	public static final int DEBUG_GLOW_START = 20; // y: how bright a pixel has to be to count as light-emitting, in percent (default 70)
+	public static final int DEBUG_ADAPT = 21; // y: how much the blocks' gain follows the city's brightness, in percent; z: the power, in percent
+	public static final int DEBUG_ADAPT_REF = 22; // the city's brightness now is the one the gain is right for
+	public static final int DEBUG_SCENE_TIMELINE = 23; // log the next frame's timeline of what happens to the scene texture
+	public static final int DEBUG_SCENE_FALLBACK = 24; // y: 1 draws at the scene copy's place in the frame when the game made no copy, 0 off
+	public static final int DEBUG_GBUF_PROBE = 25; // write the G-buffer probe's report for one frame to the log (read-only)
+	public static final int DEBUG_GBUF_VIEW = 26; // y: layer * 10 + channel, z: the scale in percent
+	public static final int DEBUG_GBUF_READ = 27; // log the raw G-buffer values at five points of the screen, once
+	public static final int DEBUG_GBUF_BLOCKS = 28; // y: on (0 or 1) + 10 * roughness in percent, z: the colour exponent in percent
+	public static final int DEBUG_GBUF_EXACT = 29; // y: 1 exact depth for block faces on a block boundary (default), 0 the search's depth
+	public static final int DEBUG_GBUF_VEL = 30; // y: the motion vector written for the blocks, in percent (0 none)
+	public static final int DEBUG_GBUF_EMIT = 31; // y: the emissive value written for light-emitting blocks, in percent of their light level / 15 (default 100; 0 none)
 	public static final int DEBUG_FIND = 9; // y: up to six letters packed into the number; list the game's classes, enums and functions with that in their name
 
 	public static final int RESULT_NONE = 0;

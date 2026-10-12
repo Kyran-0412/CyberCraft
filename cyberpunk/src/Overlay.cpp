@@ -133,6 +133,14 @@ Texture2D mcDepthTex : register(t1);   // layered: the world's depth, as Minecra
 Texture2D overlayTex : register(t2);   // layered: the hand, hotbar and screens
 Texture2D gameDepthTex : register(t3); // the game's own depth (a copy), when there is one
 Texture2D uiTex : register(t4);        // the game's interface layer (a copy), when there is one: its sRGB-encoded values as they are
+Texture2D sceneTex : register(t8);      // the game's HDR scene, while its brightness is being measured
+Texture2D smallTex : register(t9);      // the scene's log brightness in a grid of 16 x 9 cells
+Texture2D adaptPrevTex : register(t10); // last frame's result: r: the smoothed log brightness, g: the gain multiplier, b: the reference log brightness
+Texture2D adaptTex : register(t11);     // this frame's
+Texture2D gbufTex0 : register(t12);     // the G-buffer layers as they were copied before the lighting (for the viewer)
+Texture2D gbufTex1 : register(t13);
+Texture2D gbufTex2 : register(t14);
+Texture2D gbufTex3 : register(t15);
 Texture3D emitTex : register(t7);       // the light emission level (0 to 15) of every block around the player, one byte each: which blocks are light sources
 Texture3D fogTex : register(t6);       // one of the game's volumetric fog textures (the screen divided by 8 across, 128 slices deep), when one is being looked at
 Texture2D blockDepthTex : register(t5); // how far the nearest block is at each place on the screen, as seen from the current camera (0: none); made by the scene's first pass
@@ -220,7 +228,8 @@ float EmissionAt(float2 texUv)
 // Ambient occlusion where a block meets the game's world. Points are taken in 3D on the side of the surface at P that faces N (spread over a hemisphere, turned a little at every
 // pixel), each is projected onto the screen, and it counts as hidden if the game's depth there is in front of it (the point is inside, or behind, the game's geometry) and the
 // game's surface is near P in depth. Taking the points in 3D rather than around the pixel on the screen matters: a road seen at a shallow angle is only a few pixels tall on the
-// screen however far it is in the world, so a disk of screen pixels would miss it at a distance. About 0 to 0.5: half the points are inside the ground at the foot of a wall.
+)HLSL"
+R"HLSL(// screen however far it is in the world, so a disk of screen pixels would miss it at a distance. About 0 to 0.5: half the points are inside the ground at the foot of a wall.
 float SceneAO(float2 pix, float3 P, float3 N)
 {
 	uint gw, gh;
@@ -234,8 +243,7 @@ float SceneAO(float2 pix, float3 P, float3 N)
 	float3 T = normalize(cross(up, N));
 	float3 B = cross(N, T);
 	float bias = 0.02 + 0.004 * P.z;
-)HLSL"
-R"HLSL(	float occ = 0.0;
+	float occ = 0.0;
 	[unroll] for (int k = 0; k < 16; ++k) {
 		float u = (float(k) + 0.5) / 16.0;
 		float phi = (float(k) + noise) * 2.39996323;     // the golden angle: an even spread that is turned a little at every pixel
@@ -310,6 +318,12 @@ bool FindSource(float2 ndc, uint mw, uint mh, out float2 nm, out float zHit)
 		float dn = nz + mcA;
 		zHit = abs(dn) > 1e-9 ? mcB / dn : 1e9;
 		if (zHit <= 0.0) { zHit = 1e9; }
+		if (zHit < 1e8) {
+			// The distance along the current camera's view of the point Minecraft's picture shows here (its own distance is along Minecraft's axis: they differ when the camera has turned).
+			float3 pm = float3(nm * tans.zw, 1.0) * zHit;
+			float3 pc = float3(dot(warpR0.xyz, pm), dot(warpR1.xyz, pm), dot(warpR2.xyz, pm)) + warpT.xyz;
+			zHit = pc.z > 0.0 ? pc.z : 1e9;
+		}
 		return true;
 	}
 	float focal = 0.5 * float(mh) / tans.w;                   // pixels of Minecraft's picture per unit of tangent
@@ -352,8 +366,38 @@ bool FindSource(float2 ndc, uint mw, uint mh, out float2 nm, out float zHit)
 	}
 	return false;
 }
+// One texel of a G-buffer layer copy (layer 1 to 4), by the position on the screen.
+float4 GbufSample(uint layer, float2 uv)
+{
+	uint w = 1, h = 1;
+	float4 v = float4(0.0, 0.0, 0.0, 1.0);
+	if (layer == 1) { gbufTex0.GetDimensions(w, h); v = gbufTex0.Load(int3(min(uint2(uv * float2(w, h)), uint2(max(w, 1) - 1, max(h, 1) - 1)), 0)); }
+	else if (layer == 2) { gbufTex1.GetDimensions(w, h); v = gbufTex1.Load(int3(min(uint2(uv * float2(w, h)), uint2(max(w, 1) - 1, max(h, 1) - 1)), 0)); }
+	else if (layer == 3) { gbufTex2.GetDimensions(w, h); v = gbufTex2.Load(int3(min(uint2(uv * float2(w, h)), uint2(max(w, 1) - 1, max(h, 1) - 1)), 0)); }
+)HLSL"
+R"HLSL(	else if (layer == 4) { gbufTex3.GetDimensions(w, h); v = gbufTex3.Load(int3(min(uint2(uv * float2(w, h)), uint2(max(w, 1) - 1, max(h, 1) - 1)), 0)); }
+	return v;
+}
 float4 PS(VSOut i) : SV_Target
 {
+	if (sceneParams.x < 0.5 && fogParams.x > 0.5) {
+		// The G-buffer viewer (only the Present path comes here: its sceneParams.x is 0): fogParams.x is the layer 1 to 4, y the channel (0 all three colours, 1 r, 2 g, 3 b, 4 a), z the scale.
+		uint layer = uint(fogParams.x + 0.5);
+		uint ch = uint(fogParams.y + 0.5);
+		float4 v = GbufSample(layer, i.uv);
+		float scale = max(fogParams.z, 0.0);
+		float3 c;
+		if (layer == 4) {
+			// Motion vectors (two floats): no motion is grey.
+			float2 m = v.rg * scale * 8.0;
+			float one = ch == 2 ? m.y : m.x;
+			c = ch == 0 ? float3(0.5 + m.x, 0.5 + m.y, 0.5) : float3(0.5 + one, 0.5 + one, 0.5 + one);
+		} else {
+			c = ch == 0 ? v.rgb : ch == 1 ? v.rrr : ch == 2 ? v.ggg : ch == 3 ? v.bbb : v.aaa;
+			c *= scale;
+		}
+		return float4(saturate(c), 1.0);
+	}
 	if (mode > 0.5) {
 		return float4(0.0, 0.5, 0.6, 0.6);   // the test square: cyan at 60%, premultiplied
 	}
@@ -394,8 +438,7 @@ float4 PS(VSOut i) : SV_Target
 			return float4((w.a > 0.01 && zm < 1e6) ? zm : 0.0, 0.0, 0.0, 0.0);
 		}
 		float zg = 1e9;
-)HLSL"
-R"HLSL(		if (haveGameDepth > 0.5) {
+		if (haveGameDepth > 0.5) {
 			// The game's world at this place on the screen: its depth is gameNear / distance (reversed, no far plane).
 			uint gw, gh;
 			gameDepthTex.GetDimensions(gw, gh);
@@ -429,12 +472,20 @@ R"HLSL(		if (haveGameDepth > 0.5) {
 		}
 		if (hidden) { w = float4(0, 0, 0, 0); }
 		if (sceneParams.x > 0.5) {
+			// How much the city's brightness (measured and smoothed by the passes before) scales the blocks' ordinary light; 1 if there is no measurement.
+			float adaptM = adaptTex.Load(int3(0, 0, 0)).g;
+			if (adaptM <= 0.0) { adaptM = 1.0; }
 			float fogT = 1.0;
 			float3 fogC = float3(0.0, 0.0, 0.0);
 			bool plainBlocks = fogParams.x > 4.5;   // mode 5: flat grey blocks with only the game's fog on them
 			if (fogParams.x > 0.5) {
 				// The game's volumetric fog where this block is: shown instead of the block (to find out which volume is the fog the scene uses, and how distance maps to its slices),
 				// or applied to it (the light the fog adds, and how much of the block shows through).
+				if (fogParams.x > 6.5) {
+					// The gain multiplier from the city's brightness: grey for 1, darker below, white at 4.
+					float g = saturate(adaptM * 0.25);
+					return float4(g, g, g, 1.0) * w.a;
+				}
 				if (fogParams.x > 5.5) {
 					// The light level of the block, white for 15 and black for none, magenta where there is no grid: to check that the right pixels are found to be light sources.
 					float e = EmissionAt(mcUv);
@@ -470,13 +521,14 @@ R"HLSL(		if (haveGameDepth > 0.5) {
 			if (emit < 0.0) {
 				float peak = max(s.r, max(s.g, s.b)) / McShade(mcUv);
 				// Outside the grid (further than about 32 blocks from the player) only the very brightest pixels count, so that far sunlit pale blocks don't glow.
-				float start = uiXform.w > 0.5 ? max(aoParams.z, 0.9) : aoParams.z;   // aoParams.z is the glow threshold in the blocks' pass (the terrain's occlusion strength in its own)
+)HLSL"
+R"HLSL(				float start = uiXform.w > 0.5 ? max(aoParams.z, 0.9) : aoParams.z;   // aoParams.z is the glow threshold in the blocks' pass (the terrain's occlusion strength in its own)
 				hot = smoothstep(start, 1.0, saturate(peak));
 			}
 			// Ordinary light and the light sources' own light are separate: a block's colour times the gain (so that ordinary blocks can sit at the brightness of the street, where bloom ignores them),
 			// and, for a light source, its colour times the glow, however low the gain is (the game's own emissives are ten to twenty times a white surface, which is what makes them bloom).
 			float3 lin0 = pow(saturate(s), 2.2);
-			float3 baseLin = lin0 * sceneParams.y;
+			float3 baseLin = lin0 * sceneParams.y * adaptM;
 			float3 glowLin = lin0 * (sceneParams.w * hot * hot);
 			if (abs(aoParams.x) > 0.001 && haveGameDepth > 0.5 && zm < 1e6 && w.a > 0.01) {
 				float3 Nm = McNormal(mcUv);
@@ -518,8 +570,7 @@ R"HLSL(		if (haveGameDepth > 0.5) {
 				return float4(u.rgb + float3(0.35, 0.0, 0.35) * (1.0 - u.a), 1.0);   // the layer alone; where it is transparent, magenta
 			}
 			if (w.a > 0.0) {
-)HLSL"
-R"HLSL(				// The game's interface over the blocks (the picture underneath already has it on, so only pixels with blocks need this).
+				// The game's interface over the blocks (the picture underneath already has it on, so only pixels with blocks need this).
 				float3 ur = uiMode > 1.5 ? u.rgb * u.a : u.rgb;
 				w = float4(ur + w.rgb * (1.0 - u.a), u.a + w.a * (1.0 - u.a));
 			}
@@ -603,6 +654,152 @@ float4 PSTerrain(VSOut i) : SV_Target
 	float ao = 1.0 - saturate((occ / 16.0) * 1.6 * abs(aoParams.z));
 	return float4(ao, ao, ao, 1.0);
 }
+// The engine-lit blocks (the G-buffer pass): the same re-aiming as the scene pass, but the block is written into the engine's own G-buffer instead of being coloured and lit here. Layer 1 is the
+// albedo, layer 2 the world-space normal stored as n / max(|n|) * 0.5 + 0.5, layer 3 metalness, roughness, material class (85: the ordinary one) and emissive, layer 4 the motion vector; the depth
+// is the engine's reverse-Z (0.02 / distance). sceneParams.y is the roughness and .z the exponent applied to the colour (1: as Minecraft has it). Pixels with no block are not written.
+struct GbufOut
+{
+)HLSL"
+R"HLSL(	float4 albedo : SV_Target0;
+	float4 normal : SV_Target1;
+	float4 material : SV_Target2;
+	float2 velocity : SV_Target3;
+	float depth : SV_Depth;
+};
+GbufOut PSGbufBlocks(VSOut i)
+{
+	GbufOut o;
+	o.albedo = float4(0.0, 0.0, 0.0, 0.0);
+	o.normal = float4(0.5, 0.5, 1.0, 0.0);
+	o.material = float4(0.0, 0.0, 0.0, 0.0);
+	o.velocity = float2(0.0, 0.0);
+	o.depth = 0.0;
+	float2 uv = i.uv;
+	if (flipY > 0.5) { uv.y = 1.0 - uv.y; }
+	float4 w;
+	float zm = 1e9;
+	float2 mcUv = uv;
+	uint mw, mh;
+	mcDepthTex.GetDimensions(mw, mh);
+	if (warpT.w > 0.5) {
+		float2 ndc = float2(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
+		float2 nm;
+		float zHit;
+		bool ok = FindSource(ndc, mw, mh, nm, zHit);
+		float2 tuv = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);
+		float2 tex2 = flipY > 0.5 ? float2(tuv.x, 1.0 - tuv.y) : tuv;
+		w = ok ? tex.Sample(samp, tex2) : float4(0, 0, 0, 0);
+		mcUv = tex2;
+		zm = ok ? zHit : 1e9;
+	} else {
+		w = tex.Sample(samp, uv);
+		if (w.a > 0.0) {
+			float s = mcDepthTex.Load(int3(min(uint2(uv * float2(mw, mh)), uint2(mw - 1, mh - 1)), 0)).r;
+			float ndc = zeroToOne > 0.5 ? s : s * 2.0 - 1.0;
+			float den = ndc + mcA;
+			zm = abs(den) > 1e-9 ? mcB / den : 1e9;
+			if (zm <= 0.0) { zm = 1e9; }
+		}
+	}
+	if (w.a < 0.5 || zm > 1e6) { discard; }
+	// The colour without Minecraft's face shading (the engine lights it itself).
+	float3 c = saturate(w.rgb / max(w.a, 0.001) / max(McShade(mcUv), 0.5));
+	o.albedo = float4(pow(c, max(sceneParams.z, 0.1)), 0.0);
+	// The face's normal: from the picture's depth, turned into Minecraft's world, snapped to the nearest axis (the blocks are cubes), then into the game's world (x, y, z) = (x, -z, y) of Minecraft's.
+	float3 nc = McNormalWithin(mcUv, 400.0);
+	float3 snapped = float3(0.0, 1.0, 0.0);
+	if (shadeX.w > 0.5 && dot(nc, nc) > 0.5) {
+		float3 nw = float3(dot(shadeX.xyz, nc), dot(shadeY.xyz, nc), dot(shadeZ.xyz, nc));
+		float3 a3 = abs(nw);
+		snapped = (a3.x >= a3.y && a3.x >= a3.z) ? float3(nw.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0) : (a3.y >= a3.z) ? float3(0.0, nw.y >= 0.0 ? 1.0 : -1.0, 0.0) : float3(0.0, 0.0, nw.z >= 0.0 ? 1.0 : -1.0);
+	}
+	float3 ng = float3(snapped.x, -snapped.z, snapped.y);
+	o.normal = float4(ng * 0.5 + 0.5, 0.0);
+	// A light-emitting block (Minecraft's light level of the block this pixel shows, from the grid it publishes) writes its level / 15, times a scale, as the emissive value: layer 3's alpha is what the
+	// engine takes as self-illumination (it read 0.57 on some lit road paint), so the engine's own bloom, exposure and fog then treat it as a light source. No grid or an unknown pixel: none.
+	float emit = EmissionAt(mcUv);
+	float glow = emit > 0.0 ? saturate(emit * sceneParams.x) : 0.0;
+	o.material = float4(0.0, saturate(sceneParams.y), 85.0 / 255.0, glow);
+	float2 ndcP = float2(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
+	// An exact depth for a face that lies on a block boundary (every cube's does, at a whole number in Minecraft's world): the search's depth is good to about a centimetre and jitters from
+	// pixel to pixel when the camera moves, which the engine's shadow lookup turns into dark diagonal lines on the faces the sun skims (shadow acne). So: where the point the search found is within
+	// 3 cm of a whole number along the face's axis, intersect this pixel's own line of sight with that plane. (A slab's top, a torch and the like are not on a boundary: they keep the search's depth.)
+	// uiXform.xyz is the camera's place relative to the emission grid's corner (a whole number of blocks: its fractional part is the camera's place within its block); sceneParams.w: 1 = on.
+	if (sceneParams.w > 0.5 && warpT.w > 0.5 && shadeX.w > 0.5 && dot(nc, nc) > 0.5) {
+		float3 dc = float3(ndcP * tans.xy, 1.0);
+		float3 dir = warpR0.xyz * dc.x + warpR1.xyz * dc.y + warpR2.xyz * dc.z;
+		float3 ctr = -(warpR0.xyz * warpT.x + warpR1.xyz * warpT.y + warpR2.xyz * warpT.z);
+		float3 dirW = float3(dot(shadeX.xyz, dir), dot(shadeY.xyz, dir), dot(shadeZ.xyz, dir));
+		float3 ctrW = float3(dot(shadeX.xyz, ctr), dot(shadeY.xyz, ctr), dot(shadeZ.xyz, ctr));
+		float3 hitW = ctrW + zm * dirW;
+		float3 camFrac = frac(uiXform.xyz);
+		int axis = abs(snapped.x) > 0.5 ? 0 : (abs(snapped.y) > 0.5 ? 1 : 2);
+		float coord = camFrac[axis] + hitW[axis];
+		float plane = round(coord);
+		if (abs(coord - plane) < 0.03 && abs(dirW[axis]) > 1e-4) {
+			float t = (plane - camFrac[axis] - ctrW[axis]) / dirW[axis];
+			if (abs(t - zm) < 0.05) { zm = t; }
+		}
+	}
+	// The motion vector a static surface here would have: where this point was in the previous frame's camera, minus where it is now, in -1 to 1 with y down (what the engine stores: the log
+	// showed its vectors to be exactly this, in those units). The previous camera's place relative to the current one comes as a matrix and a vector in constants this pass has no other use for:
+	// aoParams.xyz, aoParams.w with fogParams.xy, and fogParams.z with cursor, are its three rows; biasAbs, biasRel and debugView its translation; uiMode the scale and haveUi 1 = valid.
+	if (haveUi > 0.5 && uiMode > 0.0 && warpT.w > 0.5) {
+		float3x3 Rp = float3x3(aoParams.x, aoParams.y, aoParams.z, aoParams.w, fogParams.x, fogParams.y, fogParams.z, cursor.x, cursor.y);
+		float3 Pc = float3(ndcP.x * tans.x * zm, ndcP.y * tans.y * zm, zm);
+		float3 Pp = mul(Rp, Pc) + float3(biasAbs, biasRel, debugView);
+		if (Pp.z > 0.01) {
+			float2 ndcPrev = float2(Pp.x / (Pp.z * tans.x), Pp.y / (Pp.z * tans.y));
+			float2 d = ndcPrev - ndcP;
+			o.velocity = float2(d.x, -d.y) * uiMode;
+		}
+	}
+	o.depth = saturate(0.02 / zm);
+	return o;
+}
+
+// Measuring the city's brightness, pass one: this pixel of a 16 x 9 target is the average log brightness of its share of the scene, from 8 x 8 samples.
+float4 PSMeasure1(VSOut i) : SV_Target
+{
+	uint sw, sh;
+	sceneTex.GetDimensions(sw, sh);
+	float2 size = float2(sw, sh);
+	float2 cell = size / float2(16.0, 9.0);
+	float2 origin = floor(i.pos.xy) * cell;
+	float acc = 0.0;
+	[unroll] for (int y = 0; y < 8; ++y) {
+		[unroll] for (int x = 0; x < 8; ++x) {
+			float2 p = origin + (float2(x, y) + 0.5) / 8.0 * cell;
+			float3 c = sceneTex.Load(int3(min(uint2(p), uint2(sw - 1, sh - 1)), 0)).rgb;
+			float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+			acc += log(clamp(lum, 1e-4, 8.0));
+		}
+	}
+	return float4(acc / 64.0, 0.0, 0.0, 1.0);
+}
+// Pass two (a 1 x 1 target): the average of the 144 cells, smoothed over time with last frame's, and what that means for the blocks' gain. Its settings come in the same constants as
+// everything else: sceneParams: x 1 on the first frame, y the seconds since the last frame, z the time the smoothing takes, w 1 to take the brightness now as the reference;
+// fogParams: x the power, y and z the smallest and largest multiplier; aoParams: x the reference brightness to start from, z the strength (0 to 1).
+float4 PSMeasure2(VSOut i) : SV_Target
+{
+	float acc = 0.0;
+	[unroll] for (int y = 0; y < 9; ++y) {
+		[unroll] for (int x = 0; x < 16; ++x) {
+			acc += smallTex.Load(int3(x, y, 0)).r;
+		}
+	}
+	float cur = acc / 144.0;
+	float4 prev = adaptPrevTex.Load(int3(0, 0, 0));
+	bool first = sceneParams.x > 0.5;
+	float k = 1.0 - exp(-sceneParams.y / max(sceneParams.z, 0.05));
+	float smoothed = first ? cur : lerp(prev.r, cur, k);
+	float refLog = first ? log(max(aoParams.x, 1e-4)) : prev.b;
+	if (sceneParams.w > 0.5) { refLog = smoothed; }
+	float m = clamp(exp((smoothed - refLog) * fogParams.x), fogParams.y, fogParams.z);
+	m = lerp(1.0, m, saturate(aoParams.z));
+	return float4(smoothed, m, refLog, 1.0);
+}
+
 )HLSL";
 
 		struct Gpu
@@ -620,6 +817,8 @@ float4 PSTerrain(VSOut i) : SV_Target
 			ComPtr<ID3D12DescriptorHeap> rtvHeap;
 			ComPtr<ID3D12DescriptorHeap> sceneRtvHeap;  // one render target view: for the block depth
 			ComPtr<ID3DBlob> psTerrain;
+			ComPtr<ID3DBlob> psMeasure1, psMeasure2;
+			ComPtr<ID3D12PipelineState> psoMeasure1, psoMeasure2;
 			ComPtr<ID3D12Resource> blockDepth;           // the nearest block's distance at each place on the screen (R32_FLOAT, screen sized), made by the scene's first pass
 			UINT blockDepthW = 0, blockDepthH = 0;
 			ComPtr<ID3D12PipelineState> psoDepth, psoTerrain, psoTerrainView;
@@ -771,7 +970,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 
 			D3D12_DESCRIPTOR_HEAP_DESC srv{};
 			srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-			srv.NumDescriptors = 8;
+			srv.NumDescriptors = 16;
 			srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 			hr = g.device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&g.srvHeap));
 			if (FAILED(hr)) {
@@ -804,6 +1003,11 @@ float4 PSTerrain(VSOut i) : SV_Target
 						h.ptr += SIZE_T(i) * g.srvInc;
 						g.device->CreateShaderResourceView(nullptr, &null3d, h);
 					}
+					for (UINT i = 8; i < 16; ++i) {
+						D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+						h.ptr += SIZE_T(i) * g.srvInc;
+						g.device->CreateShaderResourceView(nullptr, &nullView, h);   // the measuring passes' textures, then the G-buffer copies
+					}
 				}
 			}
 
@@ -835,10 +1039,21 @@ float4 PSTerrain(VSOut i) : SV_Target
 				}
 				return false;
 			}
+			for (int pass = 1; pass <= 2; ++pass) {
+				errors.Reset();
+				hr = ::D3DCompile(kShaderSource, std::strlen(kShaderSource), nullptr, nullptr, nullptr, pass == 1 ? "PSMeasure1" : "PSMeasure2", "ps_5_0", 0, 0, pass == 1 ? &g.psMeasure1 : &g.psMeasure2, &errors);
+				if (FAILED(hr)) {
+					LogError("compiling the pixel shader that measures the city's brightness", hr);
+					if (errors) {
+						g_sdk->logger->Error(g_handle, static_cast<const char*>(errors->GetBufferPointer()));
+					}
+					return false;
+				}
+			}
 
 			D3D12_DESCRIPTOR_RANGE range{};
 			range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-			range.NumDescriptors = 8;
+			range.NumDescriptors = 16;
 			range.BaseShaderRegister = 0;
 			range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -999,6 +1214,19 @@ float4 PSTerrain(VSOut i) : SV_Target
 					return false;
 				}
 			}
+			// The two passes that measure the city's brightness: plain output, no blending.
+			for (int pass = 1; pass <= 2; ++pass) {
+				D3D12_GRAPHICS_PIPELINE_STATE_DESC d = desc;
+				d.PS = pass == 1 ? D3D12_SHADER_BYTECODE{ g.psMeasure1->GetBufferPointer(), g.psMeasure1->GetBufferSize() } : D3D12_SHADER_BYTECODE{ g.psMeasure2->GetBufferPointer(), g.psMeasure2->GetBufferSize() };
+				d.BlendState.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC{};
+				d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+				d.RTVFormats[0] = pass == 1 ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+				hr = g.device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(pass == 1 ? &g.psoMeasure1 : &g.psoMeasure2));
+				if (FAILED(hr)) {
+					LogError("creating the pipeline that measures the city's brightness", hr);
+					return false;
+				}
+			}
 			return true;
 		}
 
@@ -1130,6 +1358,344 @@ float4 PSTerrain(VSOut i) : SV_Target
 				g_sdk->logger->InfoF(g_handle, "overlay: Minecraft's light emission grid arrived: %u x %u x %u blocks from (%d, %d, %d)", sx, sy, sz, info.originX, info.originY, info.originZ);
 			}
 			g_emit.valid = true;
+		}
+
+		// ---- the city's brightness, measured to scale the blocks' gain ---------------------------------------------------------------------------------------------
+		// Two small passes before our drawing, while the game's scene is still readable: a 16 x 9 texture of the scene's log brightness, then a single pixel that averages it, smooths it
+		// over time with last frame's, and turns it into the gain multiplier the blocks use (see PSMeasure2). The single pixel (r: smoothed log brightness, g: multiplier, b: reference)
+		// is copied to a second texture, which the next frame's pass reads as its history.
+		struct AdaptState
+		{
+			ComPtr<ID3D12Resource> cells, cur, prev;  // (not called small: that is a macro in the Windows headers)
+			ComPtr<ID3D12DescriptorHeap> rtvHeap;  // two views: small, cur
+			UINT rtvInc = 0;
+			ID3D12Resource* boundScene = nullptr;  // the scene texture the view in slot 8 is of
+			bool ready = false;
+			bool failed = false;
+			bool reset = true;                     // the next measurement starts the history again
+			bool calibrate = false;                // the next measurement takes the brightness it finds as the reference
+			std::chrono::steady_clock::time_point last{};
+		};
+		AdaptState g_adapt;
+		float g_adaptStrength = 0.0f;              // 0: the gain is what /ccdebug scenegain says; 1: it follows the city's brightness fully
+		float g_adaptPower = 0.0f;                 // the multiplier is (brightness now / reference) to this power (negative: a lower gain when the city is brighter)
+		float g_adaptTau = 1.5f;                   // seconds the smoothing takes
+		constexpr float kAdaptStartReference = 0.12f;  // the brightness (linear) taken as the reference before one is set with /ccdebug adaptref
+
+		bool EnsureAdapt()
+		{
+			if (g_adapt.ready) {
+				return true;
+			}
+			if (g_adapt.failed) {
+				return false;
+			}
+			const D3D12_HEAP_PROPERTIES heap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+			auto make = [&](UINT a_w, UINT a_h, DXGI_FORMAT a_format, bool a_target, ComPtr<ID3D12Resource>& a_out) {
+				D3D12_RESOURCE_DESC d{};
+				d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+				d.Width = a_w;
+				d.Height = a_h;
+				d.DepthOrArraySize = 1;
+				d.MipLevels = 1;
+				d.Format = a_format;
+				d.SampleDesc.Count = 1;
+				d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+				d.Flags = a_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE;
+				D3D12_CLEAR_VALUE clear{};
+				clear.Format = a_format;
+				return SUCCEEDED(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, a_target ? &clear : nullptr, IID_PPV_ARGS(&a_out)));
+			};
+			if (!make(16, 9, DXGI_FORMAT_R16_FLOAT, true, g_adapt.cells) || !make(1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, true, g_adapt.cur) || !make(1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, false, g_adapt.prev)) {
+				g_adapt.failed = true;
+				g_sdk->logger->Error(g_handle, "overlay: could not make the textures that measure the city's brightness");
+				return false;
+			}
+			D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
+			rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			rtvDesc.NumDescriptors = 2;
+			if (FAILED(g.device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&g_adapt.rtvHeap)))) {
+				g_adapt.failed = true;
+				return false;
+			}
+			g_adapt.rtvInc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+			D3D12_RENDER_TARGET_VIEW_DESC rv{};
+			rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+			rv.Format = DXGI_FORMAT_R16_FLOAT;
+			D3D12_CPU_DESCRIPTOR_HANDLE h = g_adapt.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+			g.device->CreateRenderTargetView(g_adapt.cells.Get(), &rv, h);
+			rv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			h.ptr += g_adapt.rtvInc;
+			g.device->CreateRenderTargetView(g_adapt.cur.Get(), &rv, h);
+			auto srv = [&](UINT a_slot, ID3D12Resource* a_resource, DXGI_FORMAT a_format) {
+				D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+				v.Format = a_format;
+				v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				v.Texture2D.MipLevels = 1;
+				D3D12_CPU_DESCRIPTOR_HANDLE c = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+				c.ptr += SIZE_T(a_slot) * g.srvInc;
+				g.device->CreateShaderResourceView(a_resource, &v, c);
+			};
+			srv(9, g_adapt.cells.Get(), DXGI_FORMAT_R16_FLOAT);
+			srv(10, g_adapt.prev.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+			srv(11, g_adapt.cur.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+			g_adapt.ready = true;
+			g_adapt.reset = true;
+			g_sdk->logger->Info(g_handle, "overlay: the textures that measure the city's brightness are ready");
+			return true;
+		}
+
+		// ---- the G-buffer viewer and reader ----------------------------------------------------------------------------------------------------------------
+		// The G-buffer layers are copied into textures of ours just before the engine's lighting pass reads them (the queue hook inserts a list for that: see InScene.cpp), so they can be
+		// shown on the screen as raw colour at Present (/ccdebug gbufview) and single texels logged (/ccdebug gbufread). Nothing about how the game draws is changed.
+		constexpr int kGbufLayers = 4;
+		constexpr int kGbufPoints = 5;
+		constexpr UINT64 kGbufStride = 512;  // a placed footprint's alignment
+		struct GbufState
+		{
+			ComPtr<ID3D12Resource> tex[kGbufLayers];  // copies: waiting in the copy-destination state between uses
+			D3D12_RESOURCE_DESC desc[kGbufLayers] = {};
+			bool copied[kGbufLayers] = {};
+			ComPtr<ID3D12Resource> readback;
+			std::uint8_t* readbackData = nullptr;
+			int readCountdown = 0;                    // Presents until the GPU has surely finished the copy of the texels
+			UINT points[kGbufPoints][2] = {};
+			DXGI_FORMAT formats[kGbufLayers] = {};
+			int channel = 0;
+			float scale = 1.0f;
+			bool havePose = false;                    // the camera as it is and as it was a frame before, when a read was recorded (to predict the motion vectors)
+			Link::CameraPose poseCur, posePrev;
+			double dt = 0.0;
+			bool predictPending = false;              // the read has been logged: the prediction follows (it needs the camera's axes, defined further down)
+			UINT screenW = 0, screenH = 0;
+		};
+		GbufState g_gbuf;
+		double g_frameDtSec = 1.0 / 60.0;              // how long a frame takes, smoothed (from the Present hook)
+		std::atomic<std::int64_t> g_gbufReadNotBeforeMs{ 0 };  // a read asked for with a delay waits until then (steady clock, in milliseconds)
+		std::int64_t SteadyMs()
+		{
+			return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
+		std::atomic<int> g_gbufViewLayer{ 0 };       // 0 off, 1 to 4 the layer shown over the whole screen
+		std::atomic<bool> g_gbufReadArmed{ false };  // the next snapshot also copies the texels at five points of the screen
+
+		bool EnsureGbufTexture(int a_layer, ID3D12Resource* a_source)
+		{
+			const D3D12_RESOURCE_DESC src = a_source->GetDesc();
+			if (g_gbuf.tex[a_layer]) {
+				const D3D12_RESOURCE_DESC& cur = g_gbuf.desc[a_layer];
+				if (cur.Width == src.Width && cur.Height == src.Height && cur.Format == src.Format) {
+					return true;
+				}
+				WaitIdle();  // the old copy may be in use by a frame on the GPU
+				g_gbuf.tex[a_layer].Reset();
+				g_gbuf.copied[a_layer] = false;
+			}
+			D3D12_RESOURCE_DESC d = src;
+			d.Alignment = 0;
+			d.Flags = D3D12_RESOURCE_FLAG_NONE;
+			const D3D12_HEAP_PROPERTIES heap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+			if (FAILED(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_gbuf.tex[a_layer])))) {
+				g_sdk->logger->ErrorF(g_handle, "overlay: could not make the copy of G-buffer layer %d", a_layer + 1);
+				return false;
+			}
+			g_gbuf.desc[a_layer] = d;
+			g_gbuf.formats[a_layer] = d.Format;
+			D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+			v.Format = d.Format;
+			v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			v.Texture2D.MipLevels = 1;
+			D3D12_CPU_DESCRIPTOR_HANDLE c = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+			c.ptr += SIZE_T(12 + a_layer) * g.srvInc;
+			g.device->CreateShaderResourceView(g_gbuf.tex[a_layer].Get(), &v, c);
+			g_sdk->logger->InfoF(g_handle, "overlay: G-buffer layer %d is %llu x %u, format %d", a_layer + 1, static_cast<unsigned long long>(d.Width), d.Height, static_cast<int>(d.Format));
+			return true;
+		}
+
+		bool EnsureGbufReadback()
+		{
+			if (g_gbuf.readback && g_gbuf.readbackData) {
+				return true;
+			}
+			const D3D12_HEAP_PROPERTIES heap = HeapProps(D3D12_HEAP_TYPE_READBACK);
+			D3D12_RESOURCE_DESC d{};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			d.Width = 32 * kGbufStride;
+			d.Height = 1;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.Format = DXGI_FORMAT_UNKNOWN;
+			d.SampleDesc.Count = 1;
+			d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			if (FAILED(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_gbuf.readback)))) {
+				return false;
+			}
+			void* mapped = nullptr;
+			if (FAILED(g_gbuf.readback->Map(0, nullptr, &mapped)) || !mapped) {
+				g_gbuf.readback.Reset();
+				return false;
+			}
+			g_gbuf.readbackData = static_cast<std::uint8_t*>(mapped);
+			return true;
+		}
+
+		float HalfToFloat(std::uint16_t h)
+		{
+			const std::uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+			float value;
+			if (exponent == 0) {
+				value = std::ldexp(static_cast<float>(mantissa), -24);
+			} else if (exponent == 31) {
+				value = mantissa ? NAN : INFINITY;
+			} else {
+				value = std::ldexp(static_cast<float>(mantissa | 0x400), static_cast<int>(exponent) - 25);
+			}
+			return sign ? -value : value;
+		}
+
+		void DescribeTexel(const std::uint8_t* a_data, DXGI_FORMAT a_format, char* a_out, std::size_t a_size)
+		{
+			if (a_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+				std::uint32_t v;
+				std::memcpy(&v, a_data, 4);
+				const std::uint32_t r = v & 1023, gg = (v >> 10) & 1023, b = (v >> 20) & 1023, aa = v >> 30;
+				std::snprintf(a_out, a_size, "R10G10B10A2 r=%u g=%u b=%u a=%u  (%.3f %.3f %.3f)", r, gg, b, aa, r / 1023.0f, gg / 1023.0f, b / 1023.0f);
+			} else if (a_format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+				std::snprintf(a_out, a_size, "R8G8B8A8 r=%u g=%u b=%u a=%u  (%.3f %.3f %.3f %.3f)", a_data[0], a_data[1], a_data[2], a_data[3], a_data[0] / 255.0f, a_data[1] / 255.0f, a_data[2] / 255.0f, a_data[3] / 255.0f);
+			} else if (a_format == DXGI_FORMAT_R16G16_FLOAT) {
+				std::uint16_t h[2];
+				std::memcpy(h, a_data, 4);
+				std::snprintf(a_out, a_size, "R16G16_FLOAT x=%.5f y=%.5f", HalfToFloat(h[0]), HalfToFloat(h[1]));
+			} else {
+				std::snprintf(a_out, a_size, "format %d bytes %02X %02X %02X %02X", static_cast<int>(a_format), a_data[0], a_data[1], a_data[2], a_data[3]);
+			}
+		}
+
+		// A moment after the snapshot that asked for texels was recorded, the GPU has finished with it: write what it read.
+		void PollGbufRead()
+		{
+			if (g_gbuf.readCountdown <= 0 || --g_gbuf.readCountdown > 0 || !g_gbuf.readbackData) {
+				return;
+			}
+			const char* names[kGbufPoints] = { "the centre of the screen", "160 pixels left of the centre", "160 pixels right of the centre", "160 pixels above the centre", "160 pixels below the centre" };
+			g_sdk->logger->Info(g_handle, "overlay: G-BUFFER READ: raw values at five points (layers 1 to 4 are the G-buffer layers in the order the engine writes them, the depth is the main depth texture's, distance = 0.02 / depth)");
+			for (int p = 0; p < kGbufPoints; ++p) {
+				g_sdk->logger->InfoF(g_handle, "overlay: G-BUFFER READ: %s (pixel %u, %u):", names[p], g_gbuf.points[p][0], g_gbuf.points[p][1]);
+				for (int L = 0; L < kGbufLayers; ++L) {
+					if (!g_gbuf.tex[L]) {
+						continue;
+					}
+					char text[160];
+					DescribeTexel(g_gbuf.readbackData + (UINT64(L) * kGbufPoints + p) * kGbufStride, g_gbuf.formats[L], text, sizeof(text));
+					g_sdk->logger->InfoF(g_handle, "overlay: G-BUFFER READ:     layer %d: %s", L + 1, text);
+				}
+				float depthValue = 0.0f;
+				std::memcpy(&depthValue, g_gbuf.readbackData + (20 + UINT64(p)) * kGbufStride, 4);
+				const unsigned stencil = g_gbuf.readbackData[(25 + UINT64(p)) * kGbufStride];
+				if (depthValue > 1e-9f) {
+					g_sdk->logger->InfoF(g_handle, "overlay: G-BUFFER READ:     depth %.7f (distance %.3f m), stencil %u (0x%02X)", depthValue, 0.02f / depthValue, stencil, stencil);
+				} else {
+					g_sdk->logger->InfoF(g_handle, "overlay: G-BUFFER READ:     depth %.7f (nothing: the sky), stencil %u (0x%02X)", depthValue, stencil, stencil);
+				}
+			}
+			g_gbuf.predictPending = true;
+		}
+
+		// ---- the engine-lit blocks ---------------------------------------------------------------------------------------------------------------------------
+		// The blocks are written into the G-buffer (the four layers and the main depth with its stencil) at a moment between the engine's geometry and its decals, so that the decals, the ambient
+		// occlusion, the reflections and the lighting all see them (see InScene.cpp for where). A pixel of the pass is a block pixel found by the same re-aiming as the scene pass.
+		struct GbufBlocksGpu
+		{
+			ComPtr<ID3DBlob> ps;
+			ComPtr<ID3D12PipelineState> pso;
+			ComPtr<ID3D12DescriptorHeap> rtvHeap;  // the four layers
+			ComPtr<ID3D12DescriptorHeap> dsvHeap;  // the main depth
+			UINT rtvInc = 0;
+			bool failed = false;
+		};
+		GbufBlocksGpu g_gbb;
+		std::atomic<bool> g_gbufBlocksOn{ true };    // the default: the blocks are written into the G-buffer (and drawn into the scene if that does not happen in a frame)
+		std::atomic<std::uint64_t> g_gbufBlocksDrawn{ 0 };
+		bool g_gbufExact = true;    // the exact depth for faces on a block boundary (see PSGbufBlocks)
+		float g_gbufEmit = 1.0f;    // the emissive value written for a light-emitting block is its light level / 15 times this (0: none)
+		float g_gbufVelScale = 0.0f;  // the motion vector written: 0 none, 1 the camera's own motion as the engine stores it (previous minus current, -1 to 1, y down)
+		float g_gbufRough = 0.55f;  // the roughness written for every block (the street reads 0.5 to 0.6, a wall 0.43)
+		float g_gbufGamma = 1.0f;   // the exponent applied to Minecraft's colours before they are written as albedo (1: as they are; 2.2 if the engine keeps its albedo linear)
+
+		bool EnsureGbufBlocksPipeline()
+		{
+			if (g_gbb.pso) {
+				return true;
+			}
+			if (g_gbb.failed) {
+				return false;
+			}
+			ComPtr<ID3DBlob> errors;
+			HRESULT hr = ::D3DCompile(kShaderSource, std::strlen(kShaderSource), nullptr, nullptr, nullptr, "PSGbufBlocks", "ps_5_0", 0, 0, &g_gbb.ps, &errors);
+			if (FAILED(hr)) {
+				g_gbb.failed = true;
+				LogError("compiling the pixel shader that writes the blocks into the G-buffer", hr);
+				if (errors) {
+					g_sdk->logger->Error(g_handle, static_cast<const char*>(errors->GetBufferPointer()));
+				}
+				return false;
+			}
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+			d.pRootSignature = g.rootSignature.Get();
+			d.VS = { g.vs->GetBufferPointer(), g.vs->GetBufferSize() };
+			d.PS = { g_gbb.ps->GetBufferPointer(), g_gbb.ps->GetBufferSize() };
+			for (int k = 0; k < 4; ++k) {
+				d.BlendState.RenderTarget[k].BlendEnable = FALSE;
+				d.BlendState.RenderTarget[k].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			}
+			d.SampleMask = UINT_MAX;
+			d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+			d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			d.RasterizerState.DepthClipEnable = TRUE;
+			// The engine's depth is reverse-Z (0.02 / distance: larger is nearer), so a block wins where its depth is at least the game's. The stencil is written as 0, like the buildings.
+			d.DepthStencilState.DepthEnable = TRUE;
+			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+			d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+			d.DepthStencilState.StencilEnable = TRUE;
+			d.DepthStencilState.StencilReadMask = 0xFF;
+			d.DepthStencilState.StencilWriteMask = 0xFF;
+			D3D12_DEPTH_STENCILOP_DESC op{};
+			op.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+			op.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+			op.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+			op.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+			d.DepthStencilState.FrontFace = op;
+			d.DepthStencilState.BackFace = op;
+			d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			d.NumRenderTargets = 4;
+			d.RTVFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+			d.RTVFormats[1] = DXGI_FORMAT_R10G10B10A2_UNORM;
+			d.RTVFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
+			d.RTVFormats[3] = DXGI_FORMAT_R16G16_FLOAT;
+			d.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+			d.SampleDesc.Count = 1;
+			hr = g.device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&g_gbb.pso));
+			if (FAILED(hr)) {
+				g_gbb.failed = true;
+				LogError("creating the pipeline that writes the blocks into the G-buffer", hr);
+				return false;
+			}
+			D3D12_DESCRIPTOR_HEAP_DESC rtv{};
+			rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			rtv.NumDescriptors = 4;
+			D3D12_DESCRIPTOR_HEAP_DESC dsv{};
+			dsv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+			dsv.NumDescriptors = 1;
+			if (FAILED(g.device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&g_gbb.rtvHeap))) || FAILED(g.device->CreateDescriptorHeap(&dsv, IID_PPV_ARGS(&g_gbb.dsvHeap)))) {
+				g_gbb.failed = true;
+				g_gbb.pso.Reset();
+				return false;
+			}
+			g_gbb.rtvInc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+			g_sdk->logger->Info(g_handle, "overlay: the pipeline that writes the blocks into the G-buffer is ready");
+			return true;
 		}
 
 		// The block depth texture (screen sized) and its views, made again if the screen's size changes.
@@ -1391,6 +1957,97 @@ float4 PSTerrain(VSOut i) : SV_Target
 			a_out[18] = static_cast<float>(tanHalfM * a_mc.aspect);
 			a_out[19] = static_cast<float>(tanHalfM);
 			return true;
+		}
+
+		// A pose a fraction of the way from a towards b (angles the short way round).
+		Link::CameraPose LerpPose(const Link::CameraPose& a_a, const Link::CameraPose& a_b, double a_t)
+		{
+			Link::CameraPose r = a_a;
+			r.x = a_a.x + (a_b.x - a_a.x) * a_t;
+			r.y = a_a.y + (a_b.y - a_a.y) * a_t;
+			r.z = a_a.z + (a_b.z - a_a.z) * a_t;
+			auto angle = [a_t](float a_from, float a_to) {
+				const float d = std::fmod(a_to - a_from + 540.0f, 360.0f) - 180.0f;
+				return a_from + d * static_cast<float>(a_t);
+			};
+			r.yaw = angle(a_a.yaw, a_b.yaw);
+			r.pitch = angle(a_a.pitch, a_b.pitch);
+			r.roll = angle(a_a.roll, a_b.roll);
+			return r;
+		}
+
+		void NoteFrameTime()
+		{
+			static auto last = std::chrono::steady_clock::time_point{};
+			const auto t = std::chrono::steady_clock::now();
+			if (last.time_since_epoch().count() != 0) {
+				const double dt = std::chrono::duration<double>(t - last).count();
+				if (dt > 0.001 && dt < 0.2) {
+					g_frameDtSec += (dt - g_frameDtSec) * 0.05;
+				}
+			}
+			last = t;
+		}
+
+		// After a read has been logged: for each point of it, the motion vector that the camera's own motion since the frame before would give, next to what the engine wrote, so that the engine's units
+		// and sign can be read off the ratio (for static geometry the vector is only the camera's motion). The point's place and depth come from the read; the camera now and a frame ago from the plugin's history.
+		void LogGbufPrediction()
+		{
+			if (!g_gbuf.predictPending || !g_gbuf.readbackData) {
+				return;
+			}
+			g_gbuf.predictPending = false;
+			if (!g_gbuf.havePose || g_gbuf.screenW == 0 || g_gbuf.screenH == 0) {
+				g_sdk->logger->Info(g_handle, "overlay: G-BUFFER READ: no camera history, so no predicted motion vectors");
+				return;
+			}
+			const Link::CameraPose& cur = g_gbuf.poseCur;
+			const Link::CameraPose& prev = g_gbuf.posePrev;
+			const Axes ac = AxesOf(cur);
+			const Axes ap = AxesOf(prev);
+			const double cx = cur.x - prev.x, cy = cur.y - prev.y, cz = cur.z - prev.z;
+			const double moved = std::sqrt(cx * cx + cy * cy + cz * cz);
+			g_sdk->logger->InfoF(g_handle, "overlay: G-BUFFER READ: the camera moved %.2f cm since the frame before (a frame takes %.2f ms: %.2f m/s). For each point: the engine's motion vector, then the one predicted from that movement as a fraction of the screen (0 to 1 across, y down) and as -1 to 1 (y up), then engine / predicted",
+				moved * 100.0, g_gbuf.dt * 1000.0, g_gbuf.dt > 0.0 ? moved / g_gbuf.dt : 0.0);
+			constexpr double kRad = 3.14159265358979323846 / 180.0;
+			const double tanY = std::tan(cur.vfov * 0.5 * kRad);
+			const double tanX = tanY * (double(g_gbuf.screenW) / double(g_gbuf.screenH));
+			for (int p = 0; p < kGbufPoints; ++p) {
+				float depthValue = 0.0f;
+				std::memcpy(&depthValue, g_gbuf.readbackData + (20 + UINT64(p)) * kGbufStride, 4);
+				if (depthValue <= 1e-9f) {
+					continue;  // the sky
+				}
+				const double z = 0.02 / depthValue;
+				const double nx = ((g_gbuf.points[p][0] + 0.5) / g_gbuf.screenW) * 2.0 - 1.0;
+				const double ny = 1.0 - ((g_gbuf.points[p][1] + 0.5) / g_gbuf.screenH) * 2.0;
+				const double xc = nx * tanX * z, yc = ny * tanY * z;
+				// the point's offset from the camera now, in the world's axes, and from the camera a frame ago
+				const double qx = ac.v[0][0] * xc + ac.v[1][0] * yc + ac.v[2][0] * z + cx;
+				const double qy = ac.v[0][1] * xc + ac.v[1][1] * yc + ac.v[2][1] * z + cy;
+				const double qz = ac.v[0][2] * xc + ac.v[1][2] * yc + ac.v[2][2] * z + cz;
+				const double xp = ap.v[0][0] * qx + ap.v[0][1] * qy + ap.v[0][2] * qz;
+				const double yp = ap.v[1][0] * qx + ap.v[1][1] * qy + ap.v[1][2] * qz;
+				const double zp = ap.v[2][0] * qx + ap.v[2][1] * qy + ap.v[2][2] * qz;
+				if (zp <= 0.01) {
+					continue;
+				}
+				const double dndcX = xp / (zp * tanX) - nx;  // where it was minus where it is, in -1 to 1 (y up)
+				const double dndcY = yp / (zp * tanY) - ny;
+				const double du = dndcX * 0.5, dv = -dndcY * 0.5;  // the same as a fraction of the screen, y down
+				std::uint16_t half[2];
+				std::memcpy(half, g_gbuf.readbackData + (3 * UINT64(kGbufPoints) + p) * kGbufStride, 4);
+				const double ex = HalfToFloat(half[0]), ey = HalfToFloat(half[1]);
+				char ratio[160] = "(too small to compare)";
+				if (std::fabs(du) > 2e-6 && std::fabs(dv) > 2e-6) {
+					std::snprintf(ratio, sizeof(ratio), "x %.3f, y %.3f against the screen fractions (y down), y %.3f against -1 to 1 (y up)", ex / du, ey / dv, ey / dndcY);
+				} else if (std::fabs(du) > 2e-6) {
+					std::snprintf(ratio, sizeof(ratio), "x %.3f against the screen fraction", ex / du);
+				} else if (std::fabs(dv) > 2e-6) {
+					std::snprintf(ratio, sizeof(ratio), "y %.3f against the screen fraction (y down), %.3f against -1 to 1 (y up)", ey / dv, ey / dndcY);
+				}
+				g_sdk->logger->InfoF(g_handle, "overlay: G-BUFFER READ:     point %d (%.2f m away): engine (%.6f, %.6f); predicted (%.6f, %.6f) as screen fractions, (%.6f, %.6f) as -1 to 1; ratio %s", p, z, ex, ey, du, dv, dndcX, dndcY, ratio);
+			}
 		}
 
 		void Draw(IDXGISwapChain* a_swapChain)
@@ -1698,6 +2355,27 @@ float4 PSTerrain(VSOut i) : SV_Target
 				g.list->DrawInstanced(3, 1, 0, 0);
 			}
 
+			// The G-buffer viewer: one layer, copied before the lighting, over the whole screen as raw colour (see /ccdebug gbufview). The copies wait in the copy-destination state.
+			PollGbufRead();
+			LogGbufPrediction();
+			{
+				const int layer = g_gbufViewLayer.load();
+				if (layer >= 1 && layer <= kGbufLayers && g_gbuf.tex[layer - 1] && g_gbuf.copied[layer - 1]) {
+					auto toRead = Transition(g_gbuf.tex[layer - 1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+					g.list->ResourceBarrier(1, &toRead);
+					D3D12_RECT scissor{ 0, 0, LONG(bb.Width), LONG(bb.Height) };
+					g.list->RSSetScissorRects(1, &scissor);
+					float constants[63] = {};
+					constants[60] = static_cast<float>(layer);        // fogParams.x
+					constants[61] = static_cast<float>(g_gbuf.channel);  // .y
+					constants[62] = g_gbuf.scale;                      // .z
+					g.list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
+					g.list->DrawInstanced(3, 1, 0, 0);
+					auto toDest = Transition(g_gbuf.tex[layer - 1].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+					g.list->ResourceBarrier(1, &toDest);
+				}
+			}
+
 			if (useUi) {
 				auto uiBack = Transition(gameUi.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 				g.list->ResourceBarrier(1, &uiBack);
@@ -1752,6 +2430,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 		HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* a_swapChain, UINT a_sync, UINT a_flags)
 		{
 			++g_presents;
+			NoteFrameTime();
 			LogStatus();
 			cybercraft::depth::Report();
 			if (a_swapChain == g_gameSwapChain) {
@@ -1769,6 +2448,7 @@ float4 PSTerrain(VSOut i) : SV_Target
 		HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* a_swapChain, UINT a_sync, UINT a_flags, const DXGI_PRESENT_PARAMETERS* a_params)
 		{
 			++g_presents;
+			NoteFrameTime();
 			LogStatus();
 			if (static_cast<IDXGISwapChain*>(a_swapChain) == g_gameSwapChain) {
 				cybercraft::uiprobe::OnPresent(static_cast<IDXGISwapChain*>(a_swapChain));
@@ -1868,6 +2548,440 @@ float4 PSTerrain(VSOut i) : SV_Target
 	{
 		g_warpEnabled = a_enabled;
 		g_warpDelayMs = std::clamp(a_delayMs, 0.0f, 150.0f);
+	}
+
+	bool GbufWanted()
+	{
+		return g_gbufViewLayer.load() > 0 || (g_gbufReadArmed.load() && SteadyMs() >= g_gbufReadNotBeforeMs.load());
+	}
+
+	bool GbufBlocksOn()
+	{
+		return g_gbufBlocksOn.load();
+	}
+
+	std::uint64_t GbufBlocksDrawn()
+	{
+		return g_gbufBlocksDrawn.load();
+	}
+
+	void SetGbufEmit(float a_percent)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_gbufEmit = std::clamp(a_percent, 0.0f, 400.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: emissive value written for light-emitting blocks: their light level / 15 times %.2f (0 writes none)", g_gbufEmit);
+	}
+
+	void SetGbufExact(bool a_on)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_gbufExact = a_on;
+		g_sdk->logger->InfoF(g_handle, "overlay: exact depth for block faces on a block boundary: %s", a_on ? "on" : "off (the search's depth, good to about a centimetre)");
+	}
+
+	void SetGbufVelocity(float a_percent)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_gbufVelScale = std::clamp(a_percent, 0.0f, 400.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: motion vector written for the blocks: %s", g_gbufVelScale > 0.0f ? "the camera's own motion as the engine stores it, times the scale" : "none (zero)");
+		if (g_gbufVelScale > 0.0f) {
+			g_sdk->logger->InfoF(g_handle, "overlay: motion vector scale %.2f (1 is the engine's unit as read from the log: previous minus current, -1 to 1, y down)", g_gbufVelScale);
+		}
+	}
+
+	void SetGbufBlocks(bool a_on, float a_roughnessPercent, float a_gammaPercent)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_gbufRough = std::clamp(a_roughnessPercent, 1.0f, 100.0f) / 100.0f;
+		g_gbufGamma = std::clamp(a_gammaPercent, 20.0f, 400.0f) / 100.0f;
+		g_gbufBlocksOn.store(a_on);
+		g_sdk->logger->InfoF(g_handle, "overlay: blocks written into the engine's G-buffer (lit by the engine): %s (roughness %.2f, colour exponent %.2f: 1 keeps Minecraft's colours as they are, 2.2 makes them linear)", a_on ? "on" : "off", g_gbufRough, g_gbufGamma);
+		if (a_on) {
+			g_sdk->logger->Info(g_handle, "overlay: while this is on the blocks are not drawn into the scene or at Present, only into the G-buffer (needs the scene hook running and the G-buffer found: see the 'found the G-buffer' line)");
+		}
+	}
+
+	void SetGbufView(int a_layer, int a_channel, float a_scalePercent)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_gbuf.channel = std::clamp(a_channel, 0, 4);
+		g_gbuf.scale = std::clamp(a_scalePercent, 1.0f, 100000.0f) / 100.0f;
+		g_gbufViewLayer.store(std::clamp(a_layer, 0, kGbufLayers));
+		if (a_layer <= 0) {
+			g_sdk->logger->Info(g_handle, "overlay: G-buffer viewer off");
+		} else {
+			const char* channels[] = { "all three colours", "channel r", "channel g", "channel b", "channel a" };
+			g_sdk->logger->InfoF(g_handle, "overlay: G-buffer viewer: layer %d, %s, scale %.2f (the layers are copied when the engine's lighting is about to read them)", a_layer, channels[g_gbuf.channel], g_gbuf.scale);
+		}
+	}
+
+	void RequestGbufRead(float a_delaySeconds)
+	{
+		const float delay = std::clamp(a_delaySeconds, 0.0f, 60.0f);
+		g_gbufReadNotBeforeMs.store(SteadyMs() + static_cast<std::int64_t>(delay * 1000.0f));
+		g_gbufReadArmed.store(true);
+		if (delay > 0.0f) {
+			g_sdk->logger->InfoF(g_handle, "overlay: G-buffer reader: in %.0f seconds the raw values at five points of the screen will be written to the log", delay);
+		} else {
+			g_sdk->logger->Info(g_handle, "overlay: G-buffer reader: the next frame's raw values at five points of the screen will be written to the log");
+		}
+	}
+
+	// Writes the blocks into the G-buffer: the four layers (in the states a_layers give) and the main depth (in a_depthState) as render targets and depth-stencil for one full-screen pass, then
+	// puts them back exactly as they were. False if it could not (nothing is recorded then).
+	bool RecordGbufBlocks(ID3D12GraphicsCommandList* a_list, const GbufSource* a_layers, std::uint32_t a_depthState, bool a_haveDepth)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		if (!g_gbufBlocksOn.load() || !a_list || !a_layers || !a_haveDepth) {
+			return false;
+		}
+		for (int L = 0; L < kGbufLayers; ++L) {
+			if (!a_layers[L].res) {
+				return false;
+			}
+		}
+		if (!g.ready || g.failed || !g.srvHeap || !g.rootSignature || !g.device || !g.haveFrame || !g.texture || !g.texDepth || !g.layered) {
+			return false;
+		}
+		ID3D12Resource* depthResource = depth::CandidateResource();
+		if (!depthResource) {
+			return false;
+		}
+		const DXGI_FORMAT want[kGbufLayers] = { DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16_FLOAT };
+		const D3D12_RESOURCE_DESC d0 = a_layers[0].res->GetDesc();
+		for (int L = 0; L < kGbufLayers; ++L) {
+			if (a_layers[L].res->GetDesc().Format != want[L]) {
+				static bool noted = false;
+				if (!noted) {
+					noted = true;
+					g_sdk->logger->InfoF(g_handle, "overlay: the G-buffer layer %d is not in the format the blocks are written in (%d instead of %d): not writing the blocks", L + 1, static_cast<int>(a_layers[L].res->GetDesc().Format), static_cast<int>(want[L]));
+				}
+				return false;
+			}
+		}
+		if (!EnsureGbufBlocksPipeline()) {
+			return false;
+		}
+
+		// The same constants as the scene pass: the re-aiming from the camera the picture was drawn through to the camera now, and Minecraft's camera axes (for the face's direction).
+		float constants[63] = { g.flipY ? 1.0f : 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, g.zeroToOne ? 1.0f : 0.0f, 0.0f, g.mcA, g.mcB, 0.02f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+		auto& link = Link::Get();
+		bool warped = false;
+		Link::CameraPose drawn;
+		Link::CameraPose target;
+		const bool haveDrawn = link.CameraPoseForFrame(g.cameraFrame, drawn);
+		const auto aim = std::chrono::steady_clock::now() - std::chrono::microseconds(static_cast<long long>(g_sceneDelayMs * 1000.0f));
+		if (g_warpEnabled) {
+			warped = haveDrawn && link.CameraPoseAt(aim, target) && BuildWarp(drawn, target, &constants[16]);
+		}
+		if (haveDrawn) {
+			const Axes m = AxesOf(drawn);
+			for (int row = 0; row < 3; ++row) {
+				for (int col = 0; col < 3; ++col) {
+					constants[44 + row * 4 + col] = static_cast<float>(m.v[col][row]);
+				}
+			}
+			constants[47] = 1.0f;
+			// The camera's place relative to the emission grid's corner (a whole number of blocks, so its fractional part is the camera's place within its block, which the exact depth uses), and whether
+			// there is a grid (for the light sources): as the scene pass passes it. Without a grid, the camera's own place.
+			const bool grid = g_emit.valid && g_emit.ready;
+			constants[36] = static_cast<float>(drawn.x - (grid ? g_emit.originX : 0));
+			constants[37] = static_cast<float>(drawn.y - (grid ? g_emit.originY : 0));
+			constants[38] = static_cast<float>(drawn.z - (grid ? g_emit.originZ : 0));
+			constants[39] = grid ? 1.0f : 0.0f;
+		}
+		if (!warped) {
+			constants[31] = 0.0f;
+		}
+		constants[40] = g_gbufEmit;    // sceneParams.x: the scale of the emissive value written for light-emitting blocks
+		constants[41] = g_gbufRough;   // .y
+		constants[42] = g_gbufGamma;   // .z
+		constants[43] = (g_gbufExact && haveDrawn) ? 1.0f : 0.0f;  // .w: the exact depth on block boundaries
+		// The motion vector: where the previous camera is relative to the current one, as a matrix and a vector (the slots are ones this pass has no other use for: see PSGbufBlocks). The previous camera
+		// is a third of the way back to the camera three frames ago, not the one a frame ago: a single frame's pose came out about half as far again as the engine's own on one read in two.
+		if (g_gbufVelScale > 0.0f && warped) {
+			Link::CameraPose past;
+			if (link.CameraPoseAt(aim - std::chrono::microseconds(static_cast<long long>(g_frameDtSec * 3.0e6)), past)) {
+				const Link::CameraPose prev = LerpPose(target, past, 1.0 / 3.0);
+				const Axes ac = AxesOf(target);
+				const Axes ap = AxesOf(prev);
+				double r[3][3];
+				for (int i = 0; i < 3; ++i) {
+					for (int j = 0; j < 3; ++j) {
+						r[i][j] = ap.v[i][0] * ac.v[j][0] + ap.v[i][1] * ac.v[j][1] + ap.v[i][2] * ac.v[j][2];
+					}
+				}
+				const double cx = target.x - prev.x, cy = target.y - prev.y, cz = target.z - prev.z;
+				constants[56] = static_cast<float>(r[0][0]);
+				constants[57] = static_cast<float>(r[0][1]);
+				constants[58] = static_cast<float>(r[0][2]);
+				constants[59] = static_cast<float>(r[1][0]);
+				constants[60] = static_cast<float>(r[1][1]);
+				constants[61] = static_cast<float>(r[1][2]);
+				constants[62] = static_cast<float>(r[2][0]);
+				constants[4] = static_cast<float>(r[2][1]);
+				constants[5] = static_cast<float>(r[2][2]);
+				constants[11] = static_cast<float>(ap.v[0][0] * cx + ap.v[0][1] * cy + ap.v[0][2] * cz);
+				constants[12] = static_cast<float>(ap.v[1][0] * cx + ap.v[1][1] * cy + ap.v[1][2] * cz);
+				constants[13] = static_cast<float>(ap.v[2][0] * cx + ap.v[2][1] * cy + ap.v[2][2] * cz);
+				constants[14] = g_gbufVelScale;
+				constants[15] = 1.0f;
+			}
+		}
+
+		// Views of the four layers and of the main depth.
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_gbb.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtvStart = rtv;
+		for (int L = 0; L < kGbufLayers; ++L) {
+			D3D12_RENDER_TARGET_VIEW_DESC rv{};
+			rv.Format = want[L];
+			rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+			g.device->CreateRenderTargetView(a_layers[L].res, &rv, rtv);
+			rtv.ptr += g_gbb.rtvInc;
+		}
+		D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
+		dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+		dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+		const D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_gbb.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+		g.device->CreateDepthStencilView(depthResource, &dv, dsv);
+
+		// The layers and the depth in the states a pass writing them needs (at the moment this is meant for they already are: nothing to move), and back afterwards.
+		D3D12_RESOURCE_BARRIER pre[kGbufLayers];
+		D3D12_RESOURCE_BARRIER post[kGbufLayers];
+		UINT moved = 0;
+		for (int L = 0; L < kGbufLayers; ++L) {
+			const auto state = static_cast<D3D12_RESOURCE_STATES>(a_layers[L].state);
+			if (state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+				pre[moved] = Transition(a_layers[L].res, state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+				post[moved] = Transition(a_layers[L].res, D3D12_RESOURCE_STATE_RENDER_TARGET, state);
+				++moved;
+			}
+		}
+		if (moved) {
+			a_list->ResourceBarrier(moved, pre);
+		}
+		const bool moveDepth = a_depthState != static_cast<std::uint32_t>(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		if (moveDepth) {
+			depth::RecordCandidateBarrier(a_list, a_depthState, static_cast<std::uint32_t>(D3D12_RESOURCE_STATE_DEPTH_WRITE));
+		}
+
+		ID3D12DescriptorHeap* heaps[] = { g.srvHeap.Get() };
+		a_list->SetDescriptorHeaps(1, heaps);
+		a_list->SetGraphicsRootSignature(g.rootSignature.Get());
+		a_list->SetGraphicsRootDescriptorTable(0, g.srvHeap->GetGPUDescriptorHandleForHeapStart());
+		a_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		a_list->OMSetRenderTargets(kGbufLayers, &rtvStart, TRUE, &dsv);
+		D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(d0.Width), float(d0.Height), 0.0f, 1.0f };
+		a_list->RSSetViewports(1, &viewport);
+		D3D12_RECT scissor{ 0, 0, LONG(d0.Width), LONG(d0.Height) };
+		a_list->RSSetScissorRects(1, &scissor);
+		a_list->SetPipelineState(g_gbb.pso.Get());
+		a_list->OMSetStencilRef(0);
+		a_list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
+		a_list->DrawInstanced(3, 1, 0, 0);
+
+		if (moveDepth) {
+			depth::RecordCandidateBarrier(a_list, static_cast<std::uint32_t>(D3D12_RESOURCE_STATE_DEPTH_WRITE), a_depthState);
+		}
+		if (moved) {
+			a_list->ResourceBarrier(moved, post);
+		}
+		++g_gbufBlocksDrawn;
+		++g_sceneDrawn;  // so that the Present-time draw leaves the blocks out this frame
+		return true;
+	}
+
+	bool RecordGbufSnapshot(ID3D12GraphicsCommandList* a_list, const GbufSource* a_layers, std::uint32_t a_depthState, bool a_haveDepth)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		if (!a_list || !a_layers || !g.ready || g.failed || !g.device || !g.srvHeap) {
+			return false;
+		}
+		const bool readDue = g_gbufReadArmed.load() && SteadyMs() >= g_gbufReadNotBeforeMs.load();
+		const bool wantRead = readDue && EnsureGbufReadback();
+		if (!wantRead && g_gbufViewLayer.load() <= 0) {
+			return false;  // nothing to look at or read: no copies
+		}
+		bool any = false;
+		for (int L = 0; L < kGbufLayers; ++L) {
+			ID3D12Resource* src = a_layers[L].res;
+			if (!src || !EnsureGbufTexture(L, src)) {
+				continue;
+			}
+			if (L == 0 && wantRead) {
+				const D3D12_RESOURCE_DESC d = src->GetDesc();
+				g_gbuf.screenW = static_cast<UINT>(d.Width);
+				g_gbuf.screenH = d.Height;
+				const UINT cx = static_cast<UINT>(d.Width / 2), cy = d.Height / 2;
+				const UINT pts[kGbufPoints][2] = { { cx, cy }, { cx - 160, cy }, { cx + 160, cy }, { cx, cy - 160 }, { cx, cy + 160 } };
+				std::memcpy(g_gbuf.points, pts, sizeof(pts));
+			}
+			const auto state = static_cast<D3D12_RESOURCE_STATES>(a_layers[L].state);
+			const bool lift = (state & D3D12_RESOURCE_STATE_COPY_SOURCE) == 0;
+			if (lift) {
+				auto toSource = Transition(src, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				a_list->ResourceBarrier(1, &toSource);
+			}
+			a_list->CopyResource(g_gbuf.tex[L].Get(), src);
+			if (wantRead) {
+				for (int p = 0; p < kGbufPoints; ++p) {
+					D3D12_TEXTURE_COPY_LOCATION dst{};
+					dst.pResource = g_gbuf.readback.Get();
+					dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+					dst.PlacedFootprint.Offset = (UINT64(L) * kGbufPoints + p) * kGbufStride;
+					dst.PlacedFootprint.Footprint.Format = g_gbuf.formats[L];
+					dst.PlacedFootprint.Footprint.Width = 1;
+					dst.PlacedFootprint.Footprint.Height = 1;
+					dst.PlacedFootprint.Footprint.Depth = 1;
+					dst.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+					D3D12_TEXTURE_COPY_LOCATION from{};
+					from.pResource = src;
+					from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					from.SubresourceIndex = 0;
+					D3D12_BOX box{ g_gbuf.points[p][0], g_gbuf.points[p][1], 0, g_gbuf.points[p][0] + 1, g_gbuf.points[p][1] + 1, 1 };
+					a_list->CopyTextureRegion(&dst, 0, 0, 0, &from, &box);
+				}
+			}
+			if (lift) {
+				auto back = Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+				a_list->ResourceBarrier(1, &back);
+			}
+			g_gbuf.copied[L] = true;
+			any = true;
+		}
+		if (wantRead) {
+			if (a_haveDepth) {
+				depth::RecordTexelReadback(a_list, a_depthState, g_gbuf.readback.Get(), 20 * kGbufStride, 25 * kGbufStride, kGbufStride, g_gbuf.points, kGbufPoints);
+			}
+			g_gbuf.readCountdown = 8;
+			g_gbufReadArmed.store(false);
+			// The camera now and a frame ago, for the predicted motion vectors.
+			const auto now = std::chrono::steady_clock::now();
+			auto& link = Link::Get();
+			g_gbuf.dt = g_frameDtSec;
+			g_gbuf.havePose = link.CameraPoseAt(now, g_gbuf.poseCur) && link.CameraPoseAt(now - std::chrono::microseconds(static_cast<long long>(g_frameDtSec * 1.0e6)), g_gbuf.posePrev);
+		}
+		return any;
+	}
+
+	bool MeasureScene(ID3D12GraphicsCommandList* a_list, ID3D12Resource* a_scene, std::uint32_t a_sceneState)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		if (!a_list || !a_scene || !g.ready || g.failed || !g.srvHeap || !g.rootSignature || !g.device) {
+			return false;
+		}
+		if (g_adaptStrength <= 0.0f && !g_adapt.ready) {
+			return false;  // never used: no cost
+		}
+		if (!EnsureScenePipeline() || !EnsureAdapt() || !g.psoMeasure1 || !g.psoMeasure2) {
+			return false;
+		}
+		if (g_adapt.boundScene != a_scene) {
+			if (g_adapt.boundScene) {
+				WaitIdle();  // the descriptor may be in use by a frame still on the GPU
+			}
+			D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+			v.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			v.Texture2D.MipLevels = 1;
+			D3D12_CPU_DESCRIPTOR_HANDLE c = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+			c.ptr += SIZE_T(8) * g.srvInc;
+			g.device->CreateShaderResourceView(a_scene, &v, c);
+			g_adapt.boundScene = a_scene;
+			g_adapt.reset = true;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		float dt = g_adapt.last.time_since_epoch().count() == 0 ? 0.016f : std::chrono::duration<float>(now - g_adapt.last).count();
+		dt = std::clamp(dt, 0.001f, 0.5f);
+		g_adapt.last = now;
+
+		// The scene is readable as it is if its state has the pixel shader resource bit (the state our list is inserted at has it: 0x8C0); if not, lift it for the passes.
+		const auto sceneState = static_cast<D3D12_RESOURCE_STATES>(a_sceneState);
+		const bool lift = (sceneState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) == 0;
+		if (lift) {
+			auto toRead = Transition(a_scene, sceneState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			a_list->ResourceBarrier(1, &toRead);
+		}
+
+		ID3D12DescriptorHeap* heaps[] = { g.srvHeap.Get() };
+		a_list->SetDescriptorHeaps(1, heaps);
+		a_list->SetGraphicsRootSignature(g.rootSignature.Get());
+		a_list->SetGraphicsRootDescriptorTable(0, g.srvHeap->GetGPUDescriptorHandleForHeapStart());
+		a_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		float constants[63] = {};
+		D3D12_CPU_DESCRIPTOR_HANDLE smallRtv = g_adapt.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+		D3D12_CPU_DESCRIPTOR_HANDLE curRtv = smallRtv;
+		curRtv.ptr += g_adapt.rtvInc;
+
+		// Pass one: the scene's log brightness in 16 x 9 cells.
+		auto smallToTarget = Transition(g_adapt.cells.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		a_list->ResourceBarrier(1, &smallToTarget);
+		a_list->OMSetRenderTargets(1, &smallRtv, FALSE, nullptr);
+		D3D12_VIEWPORT viewport1{ 0.0f, 0.0f, 16.0f, 9.0f, 0.0f, 1.0f };
+		D3D12_RECT scissor1{ 0, 0, 16, 9 };
+		a_list->RSSetViewports(1, &viewport1);
+		a_list->RSSetScissorRects(1, &scissor1);
+		a_list->SetPipelineState(g.psoMeasure1.Get());
+		a_list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
+		a_list->DrawInstanced(3, 1, 0, 0);
+		auto smallToRead = Transition(g_adapt.cells.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		a_list->ResourceBarrier(1, &smallToRead);
+
+		// Pass two: the average, smoothed with last frame's, as the gain multiplier.
+		auto curToTarget = Transition(g_adapt.cur.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		a_list->ResourceBarrier(1, &curToTarget);
+		a_list->OMSetRenderTargets(1, &curRtv, FALSE, nullptr);
+		D3D12_VIEWPORT viewport2{ 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+		D3D12_RECT scissor2{ 0, 0, 1, 1 };
+		a_list->RSSetViewports(1, &viewport2);
+		a_list->RSSetScissorRects(1, &scissor2);
+		a_list->SetPipelineState(g.psoMeasure2.Get());
+		constants[40] = g_adapt.reset ? 1.0f : 0.0f;       // sceneParams.x: no history yet
+		constants[41] = dt;                                 // sceneParams.y
+		constants[42] = g_adaptTau;                         // sceneParams.z
+		constants[43] = g_adapt.calibrate ? 1.0f : 0.0f;    // sceneParams.w: take the brightness now as the reference
+		constants[56] = kAdaptStartReference;               // aoParams.x
+		constants[58] = g_adaptStrength;                    // aoParams.z
+		constants[60] = g_adaptPower;                       // fogParams.x
+		constants[61] = 0.25f;                              // fogParams.y: the smallest multiplier
+		constants[62] = 4.0f;                               // fogParams.z: the largest
+		a_list->SetGraphicsRoot32BitConstants(1, 63, constants, 0);
+		a_list->DrawInstanced(3, 1, 0, 0);
+
+		// The result is this frame's (read by the blocks, so it ends in the readable state), and a copy of it is next frame's history.
+		auto curToCopy = Transition(g_adapt.cur.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		auto prevToCopy = Transition(g_adapt.prev.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+		D3D12_RESOURCE_BARRIER toCopy[] = { curToCopy, prevToCopy };
+		a_list->ResourceBarrier(2, toCopy);
+		a_list->CopyResource(g_adapt.prev.Get(), g_adapt.cur.Get());
+		auto curToRead = Transition(g_adapt.cur.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		auto prevToRead = Transition(g_adapt.prev.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		D3D12_RESOURCE_BARRIER toRead[] = { curToRead, prevToRead };
+		a_list->ResourceBarrier(2, toRead);
+
+		if (lift) {
+			auto back = Transition(a_scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, sceneState);
+			a_list->ResourceBarrier(1, &back);
+		}
+		g_adapt.reset = false;
+		g_adapt.calibrate = false;
+		return true;
+	}
+
+	void SetAdapt(float a_strengthPercent, float a_powerPercent)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_adaptStrength = std::clamp(a_strengthPercent, 0.0f, 100.0f) / 100.0f;
+		g_adaptPower = std::clamp(a_powerPercent, -150.0f, 150.0f) / 100.0f;
+		g_sdk->logger->InfoF(g_handle, "overlay: the blocks' gain follows the city's brightness at %.0f%%, to the power %.2f (the multiplier is (brightness now / reference) to that power, kept between 0.25 and 4)", g_adaptStrength * 100.0f, g_adaptPower);
+	}
+
+	void CalibrateAdapt()
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_gpuMutex);
+		g_adapt.calibrate = true;
+		g_sdk->logger->Info(g_handle, "overlay: the city's brightness now is taken as the reference the gain is right for");
 	}
 
 	bool DrawWorldIntoScene(ID3D12GraphicsCommandList* a_list, D3D12_CPU_DESCRIPTOR_HANDLE a_rtv, UINT a_width, UINT a_height)
@@ -2051,8 +3165,8 @@ float4 PSTerrain(VSOut i) : SV_Target
 				a_list->DrawInstanced(3, 1, 0, 0);
 			}
 		}
-		if (g_fogView == 6) {
-			constants[60] = 6.0f;  // the light level view needs no fog volume
+		if (g_fogView >= 6) {
+			constants[60] = float(g_fogView);  // the light level and gain views need no fog volume
 		}
 		// The blocks themselves, over all of that.
 		a_list->OMSetRenderTargets(1, &a_rtv, FALSE, nullptr);
@@ -2090,9 +3204,9 @@ float4 PSTerrain(VSOut i) : SV_Target
 
 	void SetFogView(int a_mode, int a_index)
 	{
-		g_fogView = std::clamp(a_mode, 0, 6);
+		g_fogView = std::clamp(a_mode, 0, 7);
 		g_fogIndex = a_index;
-		g_sdk->logger->InfoF(g_handle, "overlay: fog on the blocks: %s (volume %s)", g_fogView == 0 ? "off" : g_fogView == 1 ? "showing the fog's light instead of the blocks" : g_fogView == 2 ? "showing the fog's transmittance instead of the blocks" : g_fogView == 3 ? "applied to the blocks" : g_fogView == 4 ? "showing the blocks' own distance as colour bands (a metre, four metres and twenty-five)" : g_fogView == 5 ? "applied to plain grey blocks (no texture, shading, occlusion or glow)" : "showing the blocks' light level (white: 15, black: none, magenta: no grid)",
+		g_sdk->logger->InfoF(g_handle, "overlay: fog on the blocks: %s (volume %s)", g_fogView == 0 ? "off" : g_fogView == 1 ? "showing the fog's light instead of the blocks" : g_fogView == 2 ? "showing the fog's transmittance instead of the blocks" : g_fogView == 3 ? "applied to the blocks" : g_fogView == 4 ? "showing the blocks' own distance as colour bands (a metre, four metres and twenty-five)" : g_fogView == 5 ? "applied to plain grey blocks (no texture, shading, occlusion or glow)" : g_fogView == 6 ? "showing the blocks' light level (white: 15, black: none, magenta: no grid)" : "showing the gain multiplier from the city's brightness (grey: 1, white: 4, dark: below 1)",
 			a_index < 0 ? "picked by behaviour" : std::to_string(a_index).c_str());
 	}
 

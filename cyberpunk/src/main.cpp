@@ -184,7 +184,53 @@ void HandleCommand(const cybercraft::Link::Command& aCommand, RED4ext::Handle<RE
 
     if (aCommand.kind == cybercraft::proto::kCmdDebug)
     {
-        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGlowStart)
+        if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGbufView)
+        {
+            const int packed = static_cast<int>(aCommand.y);
+            cybercraft::overlay::SetGbufView(packed / 10, packed % 10, static_cast<float>(aCommand.z));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGbufRead)
+        {
+            cybercraft::overlay::RequestGbufRead(static_cast<float>(aCommand.y));  // y: seconds to wait first
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGbufEmit)
+        {
+            cybercraft::overlay::SetGbufEmit(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGbufExact)
+        {
+            cybercraft::overlay::SetGbufExact(aCommand.y > 0.5);
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGbufVel)
+        {
+            cybercraft::overlay::SetGbufVelocity(static_cast<float>(aCommand.y));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGbufBlocks)
+        {
+            const int packed = static_cast<int>(aCommand.y);
+            cybercraft::overlay::SetGbufBlocks((packed % 10) != 0, static_cast<float>(packed / 10), static_cast<float>(aCommand.z));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGbufProbe)
+        {
+            cybercraft::inscene::RequestGbufProbe();
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneTimeline)
+        {
+            cybercraft::inscene::RequestTimeline();
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugSceneFallback)
+        {
+            cybercraft::inscene::SetFallback(aCommand.y > 0.5);
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugAdapt)
+        {
+            cybercraft::overlay::SetAdapt(static_cast<float>(aCommand.y), static_cast<float>(aCommand.z));
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugAdaptRef)
+        {
+            cybercraft::overlay::CalibrateAdapt();
+        }
+        else if (static_cast<int>(aCommand.x) == cybercraft::proto::kDebugGlowStart)
         {
             cybercraft::overlay::SetGlowStart(static_cast<float>(aCommand.y));
         }

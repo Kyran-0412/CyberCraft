@@ -955,6 +955,70 @@ namespace cybercraft::depth
 		return true;
 	}
 
+	bool RecordCandidateBarrier(ID3D12GraphicsCommandList* a_list, std::uint32_t a_before, std::uint32_t a_after)
+	{
+		ID3D12Resource* source = g_candidate.load(std::memory_order_acquire);
+		if (!a_list || !source || !g_original || a_before == a_after) {
+			return false;
+		}
+		D3D12_RESOURCE_BARRIER b{};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = source;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(a_before);
+		b.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(a_after);
+		g_original(a_list, 1, &b);
+		return true;
+	}
+
+	bool RecordTexelReadback(ID3D12GraphicsCommandList* a_list, std::uint32_t a_state, ID3D12Resource* a_readback, UINT64 a_depthOffset, UINT64 a_stencilOffset, UINT64 a_stride, const UINT (*a_pixels)[2], int a_count)
+	{
+		ID3D12Resource* source = g_candidate.load(std::memory_order_acquire);
+		if (!a_list || !source || !a_readback || !a_pixels || a_count <= 0 || !g_original) {
+			return false;
+		}
+		const auto state = static_cast<D3D12_RESOURCE_STATES>(a_state);
+		const bool lift = (state & D3D12_RESOURCE_STATE_COPY_SOURCE) == 0;
+		if (lift) {
+			D3D12_RESOURCE_BARRIER b{};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = source;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = state;
+			b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			g_original(a_list, 1, &b);  // (not through the hooked entry)
+		}
+		for (int i = 0; i < a_count; ++i) {
+			for (int plane = 0; plane < 2; ++plane) {
+				D3D12_TEXTURE_COPY_LOCATION dst{};
+				dst.pResource = a_readback;
+				dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				dst.PlacedFootprint.Offset = (plane == 0 ? a_depthOffset : a_stencilOffset) + UINT64(i) * a_stride;
+				dst.PlacedFootprint.Footprint.Format = plane == 0 ? g_planeFormat : DXGI_FORMAT_R8_TYPELESS;
+				dst.PlacedFootprint.Footprint.Width = 1;
+				dst.PlacedFootprint.Footprint.Height = 1;
+				dst.PlacedFootprint.Footprint.Depth = 1;
+				dst.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+				D3D12_TEXTURE_COPY_LOCATION src{};
+				src.pResource = source;
+				src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				src.SubresourceIndex = plane;  // 0 the depth plane, 1 the stencil plane (one mip, one slice)
+				D3D12_BOX box{ a_pixels[i][0], a_pixels[i][1], 0, a_pixels[i][0] + 1, a_pixels[i][1] + 1, 1 };
+				a_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+			}
+		}
+		if (lift) {
+			D3D12_RESOURCE_BARRIER b{};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = source;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			b.Transition.StateAfter = state;
+			g_original(a_list, 1, &b);
+		}
+		return true;
+	}
+
 	bool CaptureWanted()
 	{
 		return g_captureWanted && g_active.load();

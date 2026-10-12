@@ -52,6 +52,15 @@ namespace cybercraft::depth
 	// copy first. False if there is no capture to copy into.
 	bool RecordSceneCapture(ID3D12GraphicsCommandList* a_list, std::uint32_t a_state);
 
+	// Records into a_list copies of single texels of the game's main depth texture (both planes: the depth, and the stencil) into a_readback (a buffer in a readback heap), at the pixels
+	// a_pixels[i] = { x, y }: the depth of pixel i at a_depthOffset + i * a_stride (a float), its stencil at a_stencilOffset + i * a_stride (a byte). a_state is the state the depth texture is
+	// in when a_list runs. For the G-buffer reader: nothing is changed in the texture.
+	// Records a transition of the game's main depth texture (all subresources) into a_list WITHOUT going through the hooked barrier entry: the capture treats the texture leaving depth write as the
+	// cue to copy it, and a pass of ours that writes depth (the engine-lit blocks) must not trigger that. False if there is no such texture.
+	bool RecordCandidateBarrier(ID3D12GraphicsCommandList* a_list, std::uint32_t a_before, std::uint32_t a_after);
+
+	bool RecordTexelReadback(ID3D12GraphicsCommandList* a_list, std::uint32_t a_state, ID3D12Resource* a_readback, UINT64 a_depthOffset, UINT64 a_stencilOffset, UINT64 a_stride, const UINT (*a_pixels)[2], int a_count);
+
 	// The game's interface layer (HUD), copied each frame right after the game has drawn it (needs the depth tools on, which install the hook), for the
 	// overlay to draw back on top of Minecraft's blocks. Kept in the copy-destination state like the depth copy: move it to a readable state to use it
 	// and put it back. Its format is R8G8B8A8_TYPELESS: view it as R8G8B8A8_UNORM (the layer's own sRGB encoding is kept as it is).

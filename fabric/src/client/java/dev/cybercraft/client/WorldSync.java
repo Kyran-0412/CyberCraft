@@ -16,10 +16,10 @@ import java.util.Set;
  * are chosen, and everything that was considered is kept for /ccsync status, which prints it in chat. If nothing fits, the values stay at zero and nothing else breaks.
  */
 final class WorldSync {
-	/** The game's time of day follows Minecraft's (/ccsync time). */
-	static volatile boolean syncTime = false;
-	/** The game's weather follows Minecraft's (/ccsync weather). */
-	static volatile boolean syncWeather = false;
+	/** The game's time of day follows Minecraft's (/ccsync time): on by default. */
+	static volatile boolean syncTime = true;
+	/** The game's weather follows Minecraft's (/ccsync weather): on by default. */
+	static volatile boolean syncWeather = true;
 
 	static long dayTime;
 	static float rain;

@@ -313,6 +313,17 @@ namespace cybercraft::proto
 		kDebugFogCurve = 18,  // y: 1 the volume's slices are spread exponentially with distance, 0 evenly
 		kDebugFogGlow = 19,   // y: how much of the fog the glow of the blocks' brightest pixels feels, in percent (100: the physical amount, 0: none; default 50)
 		kDebugGlowStart = 20, // y: how bright a pixel has to be to count as light-emitting, in percent of full brightness (default 70)
+		kDebugAdapt = 21,     // y: how much the blocks' gain follows the city's brightness, in percent (0 off); z: the power, in percent (-150 to 150)
+		kDebugAdaptRef = 22,  // the city's brightness now is the one the gain is right for
+		kDebugSceneTimeline = 23, // log the next frame's timeline of what happens to the scene texture
+		kDebugSceneFallback = 24, // y: 1 draws at the scene copy's place in the frame when the game made no copy, 0 off
+		kDebugGbufProbe = 25,     // write the G-buffer probe's report for one frame to the log (read-only)
+		kDebugGbufView = 26,      // y: layer * 10 + channel (layer 0 off, 1 to 4 a G-buffer layer; channel 0 all colours, 1 r, 2 g, 3 b, 4 a); z: the scale in percent
+		kDebugGbufRead = 27,      // log the raw G-buffer values (and depth and stencil) at five points of the screen, once
+		kDebugGbufBlocks = 28,    // y: on (0 or 1) + 10 * the roughness written for every block, in percent; z: the exponent applied to Minecraft's colours, in percent (100: as they are)
+		kDebugGbufExact = 29,     // y: 1 gives block faces on a block boundary an exact depth (default), 0 the search's depth
+		kDebugGbufVel = 30,       // y: the motion vector written for the blocks, in percent of the camera's own motion as the engine stores it (0: none)
+		kDebugGbufEmit = 31,      // y: the emissive value written for light-emitting blocks (layer 3's alpha) is their light level / 15 times this percent / 100 (default 100; 0 none)
 		kDebugFind = 9,   // y: up to six letters packed into the number; list the game's classes, enums and global functions with that in their name
 	};
 

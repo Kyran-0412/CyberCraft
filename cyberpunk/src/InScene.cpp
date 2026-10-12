@@ -110,8 +110,33 @@ namespace cybercraft::inscene
 			std::uint64_t seen;  // the insertion count when it was last moved
 			std::uint32_t uav = 0;  // how many times it was moved into the unordered access state (written by compute) since the last insertion
 		};
+		// A state change of a texture that could be part of the G-buffer (a render target, compute output or depth buffer of at least a quarter of the screen each way, or any depth buffer),
+		// copied when it was recorded: the texture may be gone by the time the probe's report is written.
+		struct GbufTouch
+		{
+			ID3D12Resource* res;
+			D3D12_RESOURCE_DESC desc;
+			char name[72];  // the name the engine gave the texture, if it gave one
+			std::uint32_t before, after, sub;
+		};
+		struct GbufEvent
+		{
+			GbufTouch t;
+			std::uint32_t batch, list;  // where in the frame, in the order the GPU runs the lists
+		};
+		// A state change of a screen-sized texture that can be a render target or a compute output: kept for every recording, so that the state of any of them at any point of the frame is known
+		// (the G-buffer layers are found among them, and copied at a moment their state has to be right).
+		struct ScreenTouch
+		{
+			ID3D12Resource* res;
+			std::uint32_t before, after;
+			DXGI_FORMAT format;
+			bool rt;  // it can be a render target
+		};
 		struct ListInfo
 		{
+			std::vector<ScreenTouch> screen;
+			std::vector<GbufTouch> gbuf;  // for the G-buffer probe, while it is recording
 			std::vector<VolTouch> volumes;  // what this recording does with the game's 3D fog textures, to be replayed in the order the GPU runs the lists
 			std::vector<std::uint32_t> depthStates;  // the states the game's main depth texture is moved into (all subresources), likewise
 			Tag tag;
@@ -134,6 +159,40 @@ namespace cybercraft::inscene
 		std::mutex g_mutex;
 		std::unordered_map<List*, ListInfo> g_lists;
 
+		// ---- when the game does not copy the scene (it only does when something in view needs refraction: glass, water), there is nothing to anchor on ----------------------
+		// The timeline logs what happens to the scene texture over one whole frame, to see what the game does instead; the fallback (opt-in) inserts at the point of the frame
+		// where the scene-copy list sits in a normal frame, found by counting how many times the scene has been moved into the render target before it.
+		std::atomic<bool> g_fallbackOn{ true };
+		std::atomic<bool> g_insertedThisFrame{ false };
+		int g_rtSeen = 0;                             // under g_mutex: the same count so far in the frame being recorded
+		std::atomic<std::uint64_t> g_fallbackInserts{ 0 };
+		std::atomic<int> g_timelineWant{ 0 };         // frames of timeline still wanted
+		std::atomic<int> g_autoTimelines{ 0 };
+		std::atomic<const char*> g_timelineLabel{ "requested" };
+		bool g_timelineOpen = false;                  // under g_mutex: lines are being collected for the frame now running
+		std::uint32_t g_timelineBatch = 0;
+		bool g_timelineSawCopy = false;
+		bool g_timelineUsedFallback = false;
+		bool g_timelineInserted = false;
+		std::vector<std::string> g_timeline;
+
+		// The G-buffer probe: read-only. For one whole frame, every state change of every texture that could be part of the G-buffer, in the order the GPU runs them.
+		std::atomic<bool> g_gbufRecord{ false };      // lists being recorded now keep their G-buffer candidates
+		std::atomic<int> g_gbufWait{ 0 };             // frames to wait (for lists recorded before the probe was asked for to be gone) before collecting one
+		bool g_gbufOpen = false;                      // under g_mutex: the frame now running is being collected
+		std::uint32_t g_gbufBatch = 0;
+		std::vector<GbufEvent> g_gbufEvents;
+
+		void ArmTimeline(const char* a_label)
+		{
+			if (g_autoTimelines.load() >= 4) {
+				return;
+			}
+			++g_autoTimelines;
+			g_timelineLabel.store(a_label);
+			g_timelineWant.store(1);
+		}
+
 		// ---- our own lists ---------------------------------------------------------------------------------------------------------
 		constexpr int kSlots = 3;
 		struct Slot
@@ -143,6 +202,18 @@ namespace cybercraft::inscene
 			std::uint64_t fenceValue = 0;
 		};
 		Slot g_slots[kSlots];
+		constexpr int kGbSlots = 6;  // two lists a frame at most (the blocks and the copy), three frames in flight
+		Slot g_gbSlots[kGbSlots];    // the lists that write the blocks into the G-buffer and copy it
+		int g_gbSlotIndex = 0;
+		struct GbufFound
+		{
+			ID3D12Resource* res[4] = {};  // the layers of this frame, in the order the engine writes them
+			bool valid = false;
+		};
+		GbufFound g_gb;                                                    // under g_mutex: found again every frame
+		std::unordered_map<ID3D12Resource*, std::uint32_t> g_screenState;  // under g_mutex: the state each screen-sized texture is in, as of the lists handed to the queue so far this frame
+		bool g_gbSnapThisFrame = false;                                    // under g_mutex
+		bool g_blkThisFrame = false;                                       // under g_mutex: the blocks were written into the G-buffer this frame
 		ComPtr<ID3D12Device> g_device;
 		ComPtr<ID3D12Fence> g_fence;
 		std::uint64_t g_fenceValue = 0;
@@ -205,6 +276,11 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 					return true;
 				}
 			}
+			for (const Slot& s : g_gbSlots) {
+				if (s.list.Get() == a_list) {
+					return true;
+				}
+			}
 			return false;
 		}
 
@@ -223,6 +299,72 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			return g_origReset(a_list, a_allocator, a_pso);
 		}
 
+		// The name the engine gave a texture (SetName stores it wide, the older way narrow), if it gave one.
+		const GUID kDebugNameA = { 0x429b8c22, 0x9188, 0x4b0c, { 0x87, 0x42, 0xac, 0xb0, 0xbf, 0x85, 0xc2, 0x00 } };
+		const GUID kDebugNameW = { 0x4cca5fd8, 0x921f, 0x42c8, { 0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41 } };
+
+		void ResourceName(ID3D12Resource* a_res, char (&a_out)[72])
+		{
+			a_out[0] = 0;
+			wchar_t wide[72] = {};
+			UINT size = sizeof(wide) - sizeof(wchar_t);
+			if (SUCCEEDED(a_res->GetPrivateData(kDebugNameW, &size, wide)) && size >= sizeof(wchar_t)) {
+				const std::size_t n = std::min<std::size_t>(size / sizeof(wchar_t), 71);
+				std::size_t k = 0;
+				for (; k < n && wide[k] != 0; ++k) {
+					a_out[k] = wide[k] < 128 ? static_cast<char>(wide[k]) : '?';
+				}
+				a_out[k] = 0;
+				return;
+			}
+			char narrow[72] = {};
+			size = sizeof(narrow) - 1;
+			if (SUCCEEDED(a_res->GetPrivateData(kDebugNameA, &size, narrow))) {
+				std::size_t k = 0;
+				for (; k < 71 && narrow[k] != 0; ++k) {
+					a_out[k] = narrow[k];
+				}
+				a_out[k] = 0;
+			}
+		}
+
+		const char* FormatName(DXGI_FORMAT a_format)
+		{
+			switch (a_format) {
+			case DXGI_FORMAT_R32G32B32A32_FLOAT: return "R32G32B32A32_FLOAT";
+			case DXGI_FORMAT_R16G16B16A16_TYPELESS: return "R16G16B16A16_TYPELESS";
+			case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+			case DXGI_FORMAT_R16G16B16A16_UNORM: return "R16G16B16A16_UNORM";
+			case DXGI_FORMAT_R32G32_FLOAT: return "R32G32_FLOAT";
+			case DXGI_FORMAT_R32G8X24_TYPELESS: return "R32G8X24_TYPELESS";
+			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return "D32_FLOAT_S8X24_UINT";
+			case DXGI_FORMAT_R10G10B10A2_TYPELESS: return "R10G10B10A2_TYPELESS";
+			case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+			case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
+			case DXGI_FORMAT_R8G8B8A8_TYPELESS: return "R8G8B8A8_TYPELESS";
+			case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+			case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+			case DXGI_FORMAT_R16G16_TYPELESS: return "R16G16_TYPELESS";
+			case DXGI_FORMAT_R16G16_FLOAT: return "R16G16_FLOAT";
+			case DXGI_FORMAT_R16G16_UNORM: return "R16G16_UNORM";
+			case DXGI_FORMAT_R32_TYPELESS: return "R32_TYPELESS";
+			case DXGI_FORMAT_D32_FLOAT: return "D32_FLOAT";
+			case DXGI_FORMAT_R32_FLOAT: return "R32_FLOAT";
+			case DXGI_FORMAT_R24G8_TYPELESS: return "R24G8_TYPELESS";
+			case DXGI_FORMAT_D24_UNORM_S8_UINT: return "D24_UNORM_S8_UINT";
+			case DXGI_FORMAT_R8G8_UNORM: return "R8G8_UNORM";
+			case DXGI_FORMAT_R16_TYPELESS: return "R16_TYPELESS";
+			case DXGI_FORMAT_R16_FLOAT: return "R16_FLOAT";
+			case DXGI_FORMAT_D16_UNORM: return "D16_UNORM";
+			case DXGI_FORMAT_R16_UNORM: return "R16_UNORM";
+			case DXGI_FORMAT_R8_TYPELESS: return "R8_TYPELESS";
+			case DXGI_FORMAT_R8_UNORM: return "R8_UNORM";
+			case DXGI_FORMAT_R8_UINT: return "R8_UINT";
+			case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+			default: return nullptr;
+			}
+		}
+
 		void NoteBarriers(List* a_list, UINT a_count, const D3D12_RESOURCE_BARRIER* a_barriers)
 		{
 			std::lock_guard lock(g_mutex);
@@ -233,6 +375,33 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 					continue;
 				}
 				ID3D12Resource* res = b.Transition.pResource;
+				if (g_gbufRecord.load(std::memory_order_relaxed) && info.gbuf.size() < 300) {
+					const D3D12_RESOURCE_DESC rd = res->GetDesc();
+					const UINT sw = g_screenW.load(std::memory_order_relaxed), sh = g_screenH.load(std::memory_order_relaxed);
+					const bool canBeTarget = (rd.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+					const bool isDepth = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+					const bool big = sw != 0 && rd.Width >= sw / 4 && rd.Height >= sh / 4;
+					if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && canBeTarget && (big || isDepth)) {
+						GbufTouch t{};
+						t.res = res;
+						t.desc = rd;
+						ResourceName(res, t.name);
+						t.before = static_cast<std::uint32_t>(b.Transition.StateBefore);
+						t.after = static_cast<std::uint32_t>(b.Transition.StateAfter);
+						t.sub = b.Transition.Subresource;
+						info.gbuf.push_back(t);
+					}
+				}
+				if ((b.Transition.Subresource == 0 || b.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) && info.screen.size() < 48) {
+					const UINT sw = g_screenW.load(std::memory_order_relaxed), sh = g_screenH.load(std::memory_order_relaxed);
+					if (sw != 0) {
+						const D3D12_RESOURCE_DESC sd = res->GetDesc();
+						if (sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sd.Width == sw && sd.Height == sh && (sd.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0) {
+							info.screen.push_back({ res, static_cast<std::uint32_t>(b.Transition.StateBefore), static_cast<std::uint32_t>(b.Transition.StateAfter), sd.Format,
+								(sd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 });
+						}
+					}
+				}
 				bool known = false;
 				for (const First& f : info.firsts) {
 					if (f.resource == res) {
@@ -358,6 +527,17 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 				}
 				s.list->Close();
 			}
+			for (Slot& s : g_gbSlots) {
+				HRESULT hr = g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s.allocator));
+				if (FAILED(hr)) {
+					return fail("making a command allocator", hr);
+				}
+				hr = g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.allocator.Get(), nullptr, IID_PPV_ARGS(&s.list));
+				if (FAILED(hr)) {
+					return fail("making a command list", hr);
+				}
+				s.list->Close();
+			}
 			HRESULT hr = g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
 			if (FAILED(hr)) {
 				return fail("making a fence", hr);
@@ -446,13 +626,19 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			g_device->CreateRenderTargetView(a_tag.source, &rtvDesc, rtv);
 
 			const D3D12_RESOURCE_STATES before = static_cast<D3D12_RESOURCE_STATES>(a_tag.state);
+			if (g_mode.load() == 4) {
+				// How bright the city is, while the scene can still be read (the next barrier makes it a render target): scales the blocks' gain. Does nothing until /ccdebug adapt is used.
+				overlay::MeasureScene(slot.list.Get(), a_tag.source, static_cast<std::uint32_t>(a_tag.state));
+			}
 			D3D12_RESOURCE_BARRIER toTarget{};
 			toTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			toTarget.Transition.pResource = a_tag.source;
 			toTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			toTarget.Transition.StateBefore = before;
 			toTarget.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-			slot.list->ResourceBarrier(1, &toTarget);
+			if (before != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+				slot.list->ResourceBarrier(1, &toTarget);
+			}
 
 			const UINT w = g_screenW.load(), h = g_screenH.load();
 			const float brightness[4] = { 0.0f, 1.0f, 4.0f, 16.0f };
@@ -461,7 +647,23 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 
 			if (g_mode.load() == 4) {
 				// A fresh copy of the game's depth first: the end-of-frame capture is a frame old by the time the blocks are drawn (the main depth is written to after this point of the frame).
-				if (a_haveDepthState && depth::RecordSceneCapture(slot.list.Get(), a_depthState)) {
+				// With the blocks written into the G-buffer (the default) nothing is drawn into the scene, unless that did not happen this frame (the moment was not found, a layer is not in the format that
+				// is expected, the list's slot was busy): then they are drawn into the scene as before, so that they never just disappear.
+				bool viaGbuf = false;
+				if (overlay::GbufBlocksOn()) {
+					static std::uint64_t seen = 0;
+					const std::uint64_t n = overlay::GbufBlocksDrawn();
+					viaGbuf = n != seen;
+					seen = n;
+					if (!viaGbuf) {
+						static std::int64_t lastNoteMs = 0;
+						if (NowMs() - lastNoteMs > 10000) {
+							lastNoteMs = NowMs();
+							g_sdk->logger->Info(g_handle, "inscene: the blocks were not written into the G-buffer this frame: drawing them into the scene instead (fallback; /ccdebug gbufblocks 0 turns the G-buffer way off)");
+						}
+					}
+				}
+				if (!viaGbuf && a_haveDepthState && depth::RecordSceneCapture(slot.list.Get(), a_depthState)) {
 					static bool noted = false;
 					if (!noted) {
 						noted = true;
@@ -469,7 +671,11 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 					}
 				}
 				// The real thing: Minecraft's blocks, drawn by the overlay's own pipeline into the scene.
-				a_drew = overlay::DrawWorldIntoScene(slot.list.Get(), rtv, w, h);
+				if (viaGbuf) {
+					a_drew = true;  // the blocks are in the G-buffer (the engine lights them): nothing is drawn into the scene
+				} else {
+					a_drew = overlay::DrawWorldIntoScene(slot.list.Get(), rtv, w, h);
+				}
 				if (!a_drew) {
 					g_lastFailure.store(overlay::SceneBlockedReason());
 				}
@@ -491,12 +697,36 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			D3D12_RESOURCE_BARRIER back = toTarget;
 			back.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			back.Transition.StateAfter = before;
-			slot.list->ResourceBarrier(1, &back);
+			if (before != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+				slot.list->ResourceBarrier(1, &back);
+			}
 			if (FAILED(slot.list->Close())) {
 				return nullptr;
 			}
 			a_slotOut = &slot;
 			++g_slotIndex;
+			return slot.list.Get();
+		}
+
+		// The list that copies the G-buffer layers (and, if asked, single texels) just before the engine's lighting reads them.
+		ID3D12CommandList* RecordGbufList(const overlay::GbufSource* a_layers, std::uint32_t a_depthState, bool a_haveDepth, Slot*& a_slotOut, bool a_blocks)
+		{
+			if (!InitGpu()) {
+				return nullptr;
+			}
+			Slot& slot = g_gbSlots[g_gbSlotIndex % kGbSlots];
+			if (g_fence->GetCompletedValue() < slot.fenceValue) {
+				return nullptr;  // the GPU is still using this slot: skip rather than wait
+			}
+			if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator.Get(), nullptr))) {
+				return nullptr;
+			}
+			const bool recorded = a_blocks ? overlay::RecordGbufBlocks(slot.list.Get(), a_layers, a_depthState, a_haveDepth) : overlay::RecordGbufSnapshot(slot.list.Get(), a_layers, a_depthState, a_haveDepth);
+			if (FAILED(slot.list->Close()) || !recorded) {
+				return nullptr;
+			}
+			a_slotOut = &slot;
+			++g_gbSlotIndex;
 			return slot.list.Get();
 		}
 
@@ -512,6 +742,18 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			std::vector<overlay::FogVolume> atInsertion;  // the fog textures and their states when our list will run
 			std::uint32_t depthStateAtInsertion = 0;       // the state of the game's main depth texture when our list will run
 			bool haveDepthState = false;
+			bool usedFallbackForLog = false;
+			int gbIndex = -1;                     // the list in this batch before which the G-buffer is copied (-1: none)
+			overlay::GbufSource gbLayers[4] = {};
+			std::uint32_t gbDepthState = 0;
+			bool gbHaveDepth = false;
+			const bool gbWanted = overlay::GbufWanted();
+			const bool blocksOn = overlay::GbufBlocksOn();
+			int blkIndex = -1;                    // the list in this batch before which the blocks are written into the G-buffer (-1: none)
+			bool blkEarly = false;                // (it is the early anchor, not the fallback)
+			overlay::GbufSource blkLayers[4] = {};
+			std::uint32_t blkDepthState = 0;
+			bool blkHaveDepth = false;
 			{
 				std::lock_guard lock(g_mutex);
 				bool touching = false;
@@ -538,6 +780,157 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 						}
 					}
 				}
+				// A frame in which the game makes no copy of the scene (it only does when something in view needs refraction, glass or water) has nothing to anchor on. The timeline of such a frame
+				// showed the same frame as a normal one without the copy and the glass pass drawn from it, and one point they share: the list in which post-processing begins to read the finished scene,
+				// which moves it from 0xC0 (pixel and non-pixel shader resource) to 0x40 (non-pixel only). So, with the fallback on and nothing inserted yet this frame, our drawing goes in before that list.
+				// (Counting how many times the scene had been moved into the render target, the first guess, found nothing: the no-copy frame never moves it in again after its last compute pass.)
+				// The count is still kept, for the timeline.
+				// The G-buffer: found each frame as the list that moves two R10G10B10A2 and one R8G8B8A8 screen-sized textures from 0x40 into the render target together (the probe showed batch 7 list 0
+				// doing that, with a R16G16_FLOAT texture, the motion vectors, in the next list). The state of every screen-sized texture is followed through the lists in the order the GPU runs them, so the
+				// states of the layers are known at the list in which the engine makes the first of them readable for the lighting (render target to shader resource): the copy goes in just before it.
+				if (a_queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+					std::uint32_t depthRun = g_depthState;
+					bool haveDepthRun = g_haveDepthState;
+					int detectedAt = -1;
+					for (UINT i = 0; i < a_count; ++i) {
+						auto it = g_lists.find(static_cast<List*>(a_lists[i]));
+						if (it == g_lists.end()) {
+							continue;
+						}
+						const ListInfo& li = it->second;
+						bool opens = false;   // the list in which the engine makes layer 1 readable for the lighting: the G-buffer is complete, decals and all
+						bool early = false;   // the list in which it copies layer 2 for the decals: the geometry is in, nothing else has run
+						if (g_gb.valid) {
+							for (const ScreenTouch& t : li.screen) {
+								if (t.res == g_gb.res[0] && t.before == D3D12_RESOURCE_STATE_RENDER_TARGET && (t.after & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) != 0) {
+									opens = true;
+								}
+								if (t.res == g_gb.res[1] && t.before == D3D12_RESOURCE_STATE_RENDER_TARGET && (t.after & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0) {
+									early = true;
+								}
+							}
+						}
+						// The states the layers are in just before this list, if they are all known.
+						auto gatherLayers = [&](overlay::GbufSource (&a_out)[4]) {
+							for (int L = 0; L < 4; ++L) {
+								if (!g_gb.res[L]) {
+									continue;  // (the motion vectors may not have been found)
+								}
+								const auto st = g_screenState.find(g_gb.res[L]);
+								if (st == g_screenState.end()) {
+									return false;
+								}
+								a_out[L] = { g_gb.res[L], st->second };
+							}
+							return true;
+						};
+						// The blocks go in at the earlier of the two (the decals, ambient occlusion and reflections then see them), or at the later one if the earlier was not found.
+						if (blocksOn && g_gb.valid && blkIndex < 0 && !g_blkThisFrame && (early || opens)) {
+							overlay::GbufSource layers[4] = {};
+							if (gatherLayers(layers)) {
+								blkIndex = static_cast<int>(i);
+								blkEarly = early;
+								std::memcpy(blkLayers, layers, sizeof(layers));
+								blkDepthState = depthRun;
+								blkHaveDepth = haveDepthRun;
+							}
+						}
+						// The copy for the viewer and the reader goes in at the later one: the layers as the lighting will read them, the blocks included.
+						if (gbWanted && g_gb.valid && gbIndex < 0 && !g_gbSnapThisFrame && opens) {
+							overlay::GbufSource layers[4] = {};
+							if (gatherLayers(layers)) {
+								gbIndex = static_cast<int>(i);
+								std::memcpy(gbLayers, layers, sizeof(layers));
+								gbDepthState = depthRun;
+								gbHaveDepth = haveDepthRun;
+							}
+						}
+						{
+							ID3D12Resource* c10[2] = {};
+							int n10 = 0;
+							ID3D12Resource* c8 = nullptr;
+							ID3D12Resource* velocity = nullptr;
+							for (const ScreenTouch& t : li.screen) {
+								if (t.before != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE || t.after != D3D12_RESOURCE_STATE_RENDER_TARGET || !t.rt) {
+									continue;
+								}
+								if (t.format == DXGI_FORMAT_R10G10B10A2_UNORM && n10 < 2) {
+									c10[n10++] = t.res;
+								} else if (t.format == DXGI_FORMAT_R8G8B8A8_UNORM && !c8) {
+									c8 = t.res;
+								} else if (t.format == DXGI_FORMAT_R16G16_FLOAT && !velocity) {
+									velocity = t.res;
+								}
+							}
+							if (!g_gb.valid && n10 == 2 && c8) {
+								g_gb.res[0] = c10[0];
+								g_gb.res[1] = c10[1];
+								g_gb.res[2] = c8;
+								g_gb.res[3] = velocity;
+								g_gb.valid = true;
+								detectedAt = static_cast<int>(i);
+								static bool noted = false;
+								if (!noted) {
+									noted = true;
+									g_sdk->logger->InfoF(g_handle, "inscene: found the G-buffer: layer 1 %p and layer 2 %p (R10G10B10A2), layer 3 %p (R8G8B8A8) move into the render target together in list %d of a batch of %u lists", static_cast<void*>(c10[0]),
+										static_cast<void*>(c10[1]), static_cast<void*>(c8), static_cast<int>(i), a_count);
+								}
+							} else if (g_gb.valid && !g_gb.res[3] && velocity && detectedAt >= 0 && static_cast<int>(i) <= detectedAt + 2) {
+								g_gb.res[3] = velocity;
+							}
+						}
+						for (const ScreenTouch& t : li.screen) {
+							g_screenState[t.res] = t.after;
+						}
+						for (const std::uint32_t d : li.depthStates) {
+							depthRun = d;
+							haveDepthRun = true;
+						}
+					}
+				}
+				bool usedFallback = false;
+				std::vector<int> ordinals(a_count, -1);
+				if (a_queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+					int rtCount = g_rtSeen;
+					for (UINT i = 0; i < a_count; ++i) {
+						auto it = g_lists.find(static_cast<List*>(a_lists[i]));
+						if (it == g_lists.end()) {
+							continue;
+						}
+						int n = 0;
+						bool postStart = false;
+						for (const Touch& t : it->second.touches) {
+							if (t.kind != 'B') {
+								continue;
+							}
+							if (t.b == D3D12_RESOURCE_STATE_RENDER_TARGET) {
+								++n;
+							}
+							if (t.a == (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) && t.b == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+								postStart = true;
+							}
+						}
+						ordinals[i] = rtCount;
+						if (found < 0 && postStart && g_fallbackOn.load() && !g_insertedThisFrame.load() && g_knownSource.load()) {
+							found = static_cast<int>(i);
+							tag = Tag{};
+							tag.source = g_knownSource.load();
+							// The state the scene is in when this list begins: from its first barrier on the scene.
+							tag.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+							for (const First& f : it->second.firsts) {
+								if (f.resource == tag.source) {
+									tag.state = f.state;
+									break;
+								}
+							}
+							tag.haveState = true;
+							usedFallback = true;
+						}
+						rtCount += n;
+					}
+					g_rtSeen = rtCount;
+				}
+				usedFallbackForLog = usedFallback;
 				// Replay what these lists do to the fog textures, in the order the GPU runs them. The states as of just before the scene-copy list are kept: that is where our drawing goes.
 				{
 					auto replay = [&](UINT i) {
@@ -582,6 +975,67 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 						}
 					}
 				}
+				// The G-buffer probe, when one was asked for: the state changes of the candidate textures, in the order the GPU runs the lists.
+				if (g_gbufOpen && g_gbufEvents.size() < 6000 && a_queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+					++g_gbufBatch;
+					for (UINT i = 0; i < a_count; ++i) {
+						auto it = g_lists.find(static_cast<List*>(a_lists[i]));
+						if (it == g_lists.end()) {
+							continue;
+						}
+						for (const GbufTouch& t : it->second.gbuf) {
+							g_gbufEvents.push_back({ t, g_gbufBatch, i });
+						}
+					}
+				}
+				// The timeline of a whole frame, when one was asked for: what each list does to the scene texture, the depth and the fog textures, and where our drawing goes.
+				if (g_timelineOpen && g_timeline.size() < 400) {
+					++g_timelineBatch;
+					char head[64];
+					std::snprintf(head, sizeof(head), "batch %u (%u lists):", g_timelineBatch, a_count);
+					g_timeline.push_back(head);
+					for (UINT i = 0; i < a_count; ++i) {
+						auto it = g_lists.find(static_cast<List*>(a_lists[i]));
+						if (it == g_lists.end()) {
+							continue;
+						}
+						const ListInfo& li = it->second;
+						const bool marked = static_cast<int>(i) == found;
+						if (li.touches.empty() && li.depthStates.empty() && li.volumes.empty() && !li.tag.source && !marked) {
+							continue;
+						}
+						std::string line;
+						char piece[96];
+						std::snprintf(piece, sizeof(piece), "  list %u (scene moved to render target %d times before it): ", i, ordinals[i]);
+						line += piece;
+						for (const Touch& t : li.touches) {
+							if (t.kind == 'B') {
+								std::snprintf(piece, sizeof(piece), "scene 0x%X->0x%X; ", t.a, t.b);
+							} else {
+								std::snprintf(piece, sizeof(piece), "%s; ", t.kind == 'S' ? "copy out of scene" : "copy into scene");
+							}
+							line += piece;
+						}
+						for (const std::uint32_t d : li.depthStates) {
+							std::snprintf(piece, sizeof(piece), "depth ->0x%X; ", d);
+							line += piece;
+						}
+						for (const VolTouch& v : li.volumes) {
+							std::snprintf(piece, sizeof(piece), "fog ..%04X ->0x%X; ", static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(v.res) & 0xFFFF), v.after);
+							line += piece;
+						}
+						if (li.tag.source) {
+							line += "<-- COPIES THE SCENE; ";
+							g_timelineSawCopy = true;
+						}
+						if (marked) {
+							line += usedFallback ? "<-- OUR DRAWING GOES BEFORE THIS LIST (fallback); " : "<-- OUR DRAWING GOES BEFORE THIS LIST; ";
+							g_timelineInserted = true;
+							g_timelineUsedFallback = usedFallback;
+						}
+						g_timeline.push_back(line);
+					}
+				}
 				// Drawing has stopped: describe what the lists of this batch do with the scene texture, once, so that the log shows how the game records it now.
 				const std::int64_t nowMs = NowMs();
 				if (found < 0 && touching && g_dumpUntilMs.load() > nowMs && nowMs - g_lastDumpMs > 1000) {
@@ -607,11 +1061,98 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 					}
 				}
 			}
+			// The G-buffer copy, when one is wanted and this batch holds the list before which it goes: ours is recorded now and run in the right place by run().
+			ID3D12CommandList* snapList = nullptr;
+			Slot* snapSlot = nullptr;
+			if (gbIndex >= 0) {
+				snapList = RecordGbufList(gbLayers, gbDepthState, gbHaveDepth, snapSlot, false);
+				if (snapList) {
+					std::lock_guard lock(g_mutex);
+					g_gbSnapThisFrame = true;
+					static bool noted = false;
+					if (!noted) {
+						noted = true;
+						g_sdk->logger->InfoF(g_handle, "inscene: copying the G-buffer just before the lighting reads it (before list %d of a batch of %u lists; the layers are in states 0x%X, 0x%X, 0x%X, 0x%X then, the main depth in 0x%X)", gbIndex, a_count,
+							gbLayers[0].state, gbLayers[1].state, gbLayers[2].state, gbLayers[3].state, gbDepthState);
+					}
+				} else {
+					gbIndex = -1;
+					static std::int64_t lastNoteMs = 0;
+					if (NowMs() - lastNoteMs > 10000) {
+						lastNoteMs = NowMs();
+						g_sdk->logger->Info(g_handle, "inscene: the G-buffer copy was wanted but could not be made this frame (the GPU still using the list, or the overlay is not ready)");
+					}
+				}
+			}
+			bool snapDone = false;
+			// The list that writes the blocks into the G-buffer, before list blkIndex (it comes before the copy if both are before the same list).
+			ID3D12CommandList* blkList = nullptr;
+			Slot* blkSlot = nullptr;
+			bool blkDone = false;
+			if (blkIndex >= 0) {
+				blkList = RecordGbufList(blkLayers, blkDepthState, blkHaveDepth, blkSlot, true);
+				if (blkList) {
+					std::lock_guard lock(g_mutex);
+					g_blkThisFrame = true;
+					static bool noted = false;
+					if (!noted) {
+						noted = true;
+						g_sdk->logger->InfoF(g_handle, "inscene: writing the blocks into the G-buffer %s (before list %d of a batch of %u lists; the layers are in states 0x%X, 0x%X, 0x%X, 0x%X then, the main depth in 0x%X)",
+							blkEarly ? "between the engine's geometry and its decals" : "just before the lighting (the earlier moment was not found)", blkIndex, a_count, blkLayers[0].state, blkLayers[1].state, blkLayers[2].state, blkLayers[3].state,
+							blkDepthState);
+					}
+				} else {
+					blkIndex = -1;
+				}
+			}
+			auto run = [&](UINT a_from, UINT a_to) {  // hands lists a_from to a_to (not included) of this batch to the queue, with our lists before the lists they belong before if those are among them
+				struct Pending
+				{
+					int index;
+					ID3D12CommandList* list;
+					Slot* slot;
+					bool* done;
+				};
+				Pending pending[2];
+				int n = 0;
+				if (blkList && !blkDone && blkIndex >= static_cast<int>(a_from) && blkIndex < static_cast<int>(a_to)) {
+					pending[n++] = { blkIndex, blkList, blkSlot, &blkDone };
+				}
+				if (snapList && !snapDone && gbIndex >= static_cast<int>(a_from) && gbIndex < static_cast<int>(a_to)) {
+					pending[n++] = { gbIndex, snapList, snapSlot, &snapDone };
+				}
+				if (n == 2 && pending[1].index < pending[0].index) {
+					std::swap(pending[0], pending[1]);
+				}
+				UINT at = a_from;
+				for (int k = 0; k < n; ++k) {
+					const UINT index = static_cast<UINT>(pending[k].index);
+					if (index > at) {
+						g_origExecute(a_queue, index - at, a_lists + at);
+						at = index;
+					}
+					g_origExecute(a_queue, 1, &pending[k].list);
+					a_queue->Signal(g_fence.Get(), ++g_fenceValue);
+					pending[k].slot->fenceValue = g_fenceValue;
+					*pending[k].done = true;
+				}
+				if (a_to > at) {
+					g_origExecute(a_queue, a_to - at, a_lists + at);
+				}
+			};
 			if (found < 0 || a_queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
-				g_origExecute(a_queue, a_count, a_lists);
+				run(0, a_count);
 				return;
 			}
+			g_insertedThisFrame.store(true);
+			if (usedFallbackForLog) {
+				const std::uint64_t k = ++g_fallbackInserts;
+				if (k == 1 || k % 300 == 0) {
+					g_sdk->logger->InfoF(g_handle, "inscene: this frame has no copy of the scene: drew before the list in which post-processing starts reading the scene (fallback; %llu times so far)", static_cast<unsigned long long>(k));
+				}
+			}
 			if (!g_foundLogged) {
+				ArmTimeline("the first frame in which the scene copy was found");
 				g_foundLogged = true;
 				g_sdk->logger->InfoF(g_handle, "inscene: found the list that copies the scene: it copies %p into %p, and begins with the source in state 0x%X; our drawing goes in just before it",
 					static_cast<void*>(tag.source), static_cast<void*>(tag.destination), tag.state);
@@ -640,16 +1181,14 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			bool drew = false;
 			ID3D12CommandList* ours = RecordSquare(tag, slot, drew, depthStateAtInsertion, haveDepthState);
 			if (!ours) {
-				g_origExecute(a_queue, a_count, a_lists);
+				run(0, a_count);
 				return;
 			}
-			if (found > 0) {
-				g_origExecute(a_queue, static_cast<UINT>(found), a_lists);
-			}
+			run(0, static_cast<UINT>(found));
 			g_origExecute(a_queue, 1, &ours);
 			a_queue->Signal(g_fence.Get(), ++g_fenceValue);
 			slot->fenceValue = g_fenceValue;
-			g_origExecute(a_queue, a_count - static_cast<UINT>(found), a_lists + found);
+			run(static_cast<UINT>(found), a_count);
 			if (drew) {
 				g_lastDrawMs.store(NowMs());
 				g_matchesAtDraw = g_copyMatches.load();
@@ -743,6 +1282,132 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 		g_sdk->logger->InfoF(g_handle, "inscene: drawing into the game's scene: %s", a_mode == 0 ? "off" : a_mode == 1 ? "a dim square" : a_mode == 2 ? "a bright square" : a_mode == 3 ? "a very bright square" : "Minecraft's blocks");
 	}
 
+	namespace
+	{
+		// Writes the G-buffer probe's report (g_mutex held): one line per candidate texture in the order the GPU first touches it, then the groups moved into the render target by the same list.
+		void FlushGbufProbe()
+		{
+			struct Entry
+			{
+				GbufTouch first;
+				std::uint32_t batch = 0, list = 0;
+				std::string seq;
+				int count = 0;
+			};
+			struct Group
+			{
+				std::uint32_t batch, list;
+				std::vector<std::size_t> members;
+			};
+			std::vector<Entry> entries;
+			std::unordered_map<ID3D12Resource*, std::size_t> index;
+			std::vector<Group> groups;
+			for (const GbufEvent& e : g_gbufEvents) {
+				std::size_t k;
+				auto found = index.find(e.t.res);
+				if (found == index.end()) {
+					k = entries.size();
+					index[e.t.res] = k;
+					Entry en;
+					en.first = e.t;
+					en.batch = e.batch;
+					en.list = e.list;
+					entries.push_back(std::move(en));
+				} else {
+					k = found->second;
+				}
+				Entry& en = entries[k];
+				if (en.count < 16) {
+					char piece[48];
+					std::snprintf(piece, sizeof(piece), "b%u.l%u %X>%X  ", e.batch, e.list, e.t.before, e.t.after);
+					en.seq += piece;
+				}
+				++en.count;
+				if (e.t.after == D3D12_RESOURCE_STATE_RENDER_TARGET) {
+					Group* g = nullptr;
+					for (Group& candidate : groups) {
+						if (candidate.batch == e.batch && candidate.list == e.list) {
+							g = &candidate;
+							break;
+						}
+					}
+					if (!g) {
+						groups.push_back({ e.batch, e.list, {} });
+						g = &groups.back();
+					}
+					if (std::find(g->members.begin(), g->members.end(), k) == g->members.end()) {
+						g->members.push_back(k);
+					}
+				}
+			}
+			g_sdk->logger->InfoF(g_handle, "inscene: G-BUFFER PROBE: %u textures that could be render targets, compute outputs or depth buffers (at least a quarter of the screen each way, or any depth buffer) changed state in one frame (%u batches of lists, %u state changes)",
+				static_cast<unsigned>(entries.size()), g_gbufBatch, static_cast<unsigned>(g_gbufEvents.size()));
+			g_sdk->logger->Info(g_handle, "inscene: G-BUFFER PROBE: line = number, pointer, size, format, flags, [name], then 'batch.list from>to' for each change in the order the GPU runs them (states in hex: 0x4 render target, 0x8 compute output, 0x10 depth write, 0xC0 shader resource, 0xE0 depth read)");
+			for (std::size_t k = 0; k < entries.size() && k < 100; ++k) {
+				const Entry& en = entries[k];
+				const D3D12_RESOURCE_DESC& d = en.first.desc;
+				std::string flags;
+				if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+					flags += "RT ";
+				}
+				if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+					flags += "UAV ";
+				}
+				if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+					flags += "DEPTH ";
+				}
+				char fmtNumber[24];
+				const char* fmt = FormatName(d.Format);
+				if (!fmt) {
+					std::snprintf(fmtNumber, sizeof(fmtNumber), "format %d", static_cast<int>(d.Format));
+					fmt = fmtNumber;
+				}
+				char name[96] = "";
+				if (en.first.name[0]) {
+					std::snprintf(name, sizeof(name), " \"%s\"", en.first.name);
+				}
+				g_sdk->logger->InfoF(g_handle, "inscene:   #%u ..%04X %llux%u %s %smips=%u%s%s: %s%s", static_cast<unsigned>(k), static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(en.first.res) & 0xFFFF),
+					static_cast<unsigned long long>(d.Width), d.Height, fmt, flags.c_str(), static_cast<unsigned>(d.MipLevels), name, en.first.res == g_knownSource.load() ? " <-- THE SCENE (HDR colour)" : "", en.seq.c_str(),
+					en.count > 16 ? "..." : "");
+			}
+			if (entries.size() > 100) {
+				g_sdk->logger->InfoF(g_handle, "inscene:   (%u more not shown)", static_cast<unsigned>(entries.size() - 100));
+			}
+			for (const Group& g : groups) {
+				if (g.members.size() < 2) {
+					continue;
+				}
+				std::string line;
+				for (const std::size_t k : g.members) {
+					char piece[24];
+					std::snprintf(piece, sizeof(piece), "#%u ", static_cast<unsigned>(k));
+					line += piece;
+				}
+				g_sdk->logger->InfoF(g_handle, "inscene: G-BUFFER PROBE: batch %u list %u moves %u textures into the render target together: %s", g.batch, g.list, static_cast<unsigned>(g.members.size()), line.c_str());
+			}
+		}
+	}
+
+	void RequestGbufProbe()
+	{
+		g_gbufRecord.store(true);
+		g_gbufWait.store(4);
+		g_sdk->logger->Info(g_handle, "inscene: G-buffer probe: recording; the report for one frame comes in a moment (it only watches: nothing about how the game draws changes)");
+	}
+
+	void RequestTimeline()
+	{
+		g_timelineLabel.store("asked for with /ccdebug scenetimeline");
+		g_timelineWant.store(1);
+		g_sdk->logger->Info(g_handle, "inscene: the next frame's timeline (what happens to the scene texture, the depth and the fog textures, in order) will be written to the log");
+	}
+
+	void SetFallback(bool a_on)
+	{
+		g_fallbackOn.store(a_on);
+		g_sdk->logger->InfoF(g_handle, "inscene: fallback when the game does not copy the scene: %s", a_on ? "on (draws before the list in which post-processing starts reading the scene)" : "off");
+	}
+
 	void EnableByDefault()
 	{
 		if (g_userChoice || g_mode.load() != 0 || g_gaveUp) {
@@ -769,11 +1434,55 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 			}
 			g_hooked = true;
 		}
+		// A frame has ended: the counts start again, and a timeline that was being collected is written.
+		{
+			std::lock_guard lock(g_mutex);
+			g_rtSeen = 0;
+			g_insertedThisFrame.store(false);
+			g_screenState.clear();
+			g_gb = GbufFound{};
+			g_gbSnapThisFrame = false;
+			g_blkThisFrame = false;
+			if (g_timelineOpen) {
+				g_sdk->logger->InfoF(g_handle, "inscene: timeline of one frame (%s): %u batches of lists; the game %s the scene this frame; our drawing was %s", g_timelineLabel.load(), g_timelineBatch,
+					g_timelineSawCopy ? "COPIED" : "did NOT copy", g_timelineInserted ? (g_timelineUsedFallback ? "inserted by the fallback" : "inserted at the scene copy") : "not inserted");
+				for (const std::string& line : g_timeline) {
+					g_sdk->logger->InfoF(g_handle, "inscene:   %s", line.c_str());
+				}
+				g_timeline.clear();
+				g_timelineOpen = false;
+				g_timelineBatch = 0;
+				g_timelineWant.fetch_sub(1);
+			}
+			if (g_gbufWait.load() > 0) {
+				if (g_gbufWait.fetch_sub(1) == 1) {
+					g_gbufOpen = true;
+					g_gbufBatch = 0;
+					g_gbufEvents.clear();
+				}
+			} else if (g_gbufOpen) {
+				FlushGbufProbe();
+				g_gbufEvents.clear();
+				g_gbufOpen = false;
+				g_gbufRecord.store(false);
+			}
+			if (!g_timelineOpen && g_timelineWant.load() > 0 && g_hooked) {
+				g_timelineOpen = true;
+				g_timelineBatch = 0;
+				g_timelineSawCopy = false;
+				g_timelineUsedFallback = false;
+				g_timelineInserted = false;
+				g_timeline.clear();
+			}
+		}
 		// Say when drawing into the scene stops or starts again, and why: the effect disappearing is otherwise silent.
 		{
 			const bool drawing = NowMs() - g_lastDrawMs.load() < 1500 && g_lastDrawMs.load() != 0;
 			if (drawing && !g_wasDrawing) {
 				g_sdk->logger->Info(g_handle, g_everDrew ? "inscene: drawing into the game's scene again" : "inscene: drawing into the game's scene");
+				if (g_everDrew) {
+					ArmTimeline("a frame just after drawing started again");
+				}
 				g_everDrew = true;
 			} else if (!drawing && g_wasDrawing) {
 				const char* why = g_lastFailure.load();
@@ -783,6 +1492,7 @@ float4 PS(VSOut i) : SV_Target { return float4(colour.rgb, 1.0); }
 					(why && *why) ? why : "the list that copies the scene has not been handed to the queue (the game has stopped copying the scene, records it differently, or the hooks lost it)",
 					static_cast<unsigned long long>(matches), static_cast<unsigned long long>(noState));
 				g_dumpUntilMs.store(NowMs() + 20000);
+				ArmTimeline("a frame in which drawing has stopped");
 			}
 			g_wasDrawing = drawing;
 		}

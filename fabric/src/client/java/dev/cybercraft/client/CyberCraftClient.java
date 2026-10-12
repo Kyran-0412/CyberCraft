@@ -350,12 +350,12 @@ public final class CyberCraftClient implements ClientModInitializer {
 					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_DUMP, 0, "Writing the classes behind the collision boxes to CyberCraft.log.")));
 					return 1;
 				}))
-				// Looking for the game's volumetric fog (3D textures): /ccdebug fogview <0|1|2|3> [volume] shows a volume's colour (1) or transmittance (2) on the blocks instead of the blocks, applies the fog to the blocks (3), paints the blocks with bands of their own distance, repeating every metre, to check the depth (4), applies the fog to plain grey blocks (5), or shows each block's light level (6, white for 15; to check which blocks are light sources); 0 is off,
+				// Looking for the game's volumetric fog (3D textures): /ccdebug fogview <0|1|2|3> [volume] shows a volume's colour (1) or transmittance (2) on the blocks instead of the blocks, applies the fog to the blocks (3), paints the blocks with bands of their own distance, repeating every metre, to check the depth (4), applies the fog to plain grey blocks (5), shows each block's light level (6, white for 15; to check which blocks are light sources), or the gain multiplier from the city's brightness (7, grey for 1); 0 is off,
 				// /ccdebug fogrange <nearCm> <farM> sets the distances its first and last slice stand for, /ccdebug fogcurve <0|1> says whether the slices are spread evenly (0) or exponentially (1).
-				.then(ClientCommands.literal("fogview").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 6)).executes(c -> {
+				.then(ClientCommands.literal("fogview").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 7)).executes(c -> {
 					int mode = IntegerArgumentType.getInteger(c, "mode");
 					// Without a volume number: modes 1 and 2 look at volume 0, mode 3 (the fog applied to the blocks) picks the volume by behaviour.
-					int volume = mode >= 3 && mode != 4 && mode != 6 ? -1 : 0;
+					int volume = mode >= 3 && mode != 4 && mode < 6 ? -1 : 0;
 					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_FOG_VIEW, mode, volume) == 0) {
 						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
 					} else {
@@ -380,6 +380,110 @@ public final class CyberCraftClient implements ClientModInitializer {
 					}
 					return 1;
 				}))))
+				// /ccdebug gbufview <layer 0-4> [channel 0-4] [scale %]: read-only. Shows one of the engine's G-buffer layers over the whole screen as raw colour, as it was just before the lighting reads it
+				// (layer 0 turns it off; 1 and 2 are the two R10G10B10A2 layers, 3 the R8G8B8A8 one, 4 the R16G16_FLOAT one, probably motion; channel 0 shows all three colours, 1 to 4 r, g, b or a on its own).
+				// /ccdebug gbufread: logs the raw values of every layer, the depth and the stencil at five points of the screen (the centre and four 160 pixels away), once.
+				.then(ClientCommands.literal("gbufview").then(ClientCommands.argument("layer", IntegerArgumentType.integer(0, 4)).executes(c -> {
+					int layer = IntegerArgumentType.getInteger(c, "layer");
+					c.getSource().sendFeedback(Component.literal(sendDebugTwo(Proto.DEBUG_GBUF_VIEW, layer * 10, 100, layer == 0 ? "G-buffer viewer off." : "G-buffer viewer: layer " + layer + ".")));
+					return 1;
+				}).then(ClientCommands.argument("channel", IntegerArgumentType.integer(0, 4)).executes(c -> {
+					int layer = IntegerArgumentType.getInteger(c, "layer"), channel = IntegerArgumentType.getInteger(c, "channel");
+					c.getSource().sendFeedback(Component.literal(sendDebugTwo(Proto.DEBUG_GBUF_VIEW, layer * 10 + channel, 100, "G-buffer viewer: layer " + layer + ", channel " + channel + ".")));
+					return 1;
+				}).then(ClientCommands.argument("scale", IntegerArgumentType.integer(1, 100000)).executes(c -> {
+					int layer = IntegerArgumentType.getInteger(c, "layer"), channel = IntegerArgumentType.getInteger(c, "channel"), scale = IntegerArgumentType.getInteger(c, "scale");
+					c.getSource().sendFeedback(Component.literal(sendDebugTwo(Proto.DEBUG_GBUF_VIEW, layer * 10 + channel, scale, "G-buffer viewer: layer " + layer + ", channel " + channel + ", scale " + scale + "%.")));
+					return 1;
+				})))))
+				.then(ClientCommands.literal("gbufread").executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_GBUF_READ, 0, "The raw G-buffer values at five points of the screen go to the log in a moment (the viewer or a read needs the scene hook running).")));
+					return 1;
+				}).then(ClientCommands.argument("seconds", IntegerArgumentType.integer(0, 60)).executes(c -> {
+					int seconds = IntegerArgumentType.getInteger(c, "seconds");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_GBUF_READ, seconds, "The raw G-buffer values at five points of the screen go to the log in " + seconds + " seconds: now go where you want to read.")));
+					return 1;
+				})))
+				// /ccdebug gbufemit <percent>: light-emitting blocks (glowstone, lanterns, torches, lava...: the ones Minecraft gives a light level) write that level / 15 times percent / 100 as the emissive value
+				// (layer 3's alpha) of the engine's G-buffer, so the engine's own bloom, exposure and fog treat them as light sources. Default 100; 0 writes none.
+				.then(ClientCommands.literal("gbufemit").then(ClientCommands.argument("percent", IntegerArgumentType.integer(0, 400)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_GBUF_EMIT, percent, percent == 0 ? "No emissive value written for light-emitting blocks." : "Light-emitting blocks write their light level / 15 times " + percent + "% as emissive.")));
+					return 1;
+				})))
+				// /ccdebug gbufexact <0|1>: the exact depth for block faces that lie on a block boundary (default 1). The search that finds each block pixel when the camera moves is good to about a centimetre,
+				// which the engine's shadow lookup turns into dark diagonal lines on the faces the sun skims; 0 goes back to that depth, to compare.
+				// /ccdebug gbufvel <percent>: writes the motion vector a static block has (the camera's own motion, in the units the engine uses: previous minus current, -1 to 1, y down), times percent / 100.
+				// 0 (default) writes none. The engine's anti-aliasing and denoising use it to line up the previous frame.
+				.then(ClientCommands.literal("gbufexact").then(ClientCommands.argument("on", IntegerArgumentType.integer(0, 1)).executes(c -> {
+					int on = IntegerArgumentType.getInteger(c, "on");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_GBUF_EXACT, on, on == 1 ? "Exact depth for block faces on a block boundary." : "The search's depth for every block face.")));
+					return 1;
+				})))
+				.then(ClientCommands.literal("gbufvel").then(ClientCommands.argument("percent", IntegerArgumentType.integer(0, 400)).executes(c -> {
+					int percent = IntegerArgumentType.getInteger(c, "percent");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_GBUF_VEL, percent, percent == 0 ? "No motion vector written for the blocks." : "Motion vector written for the blocks at " + percent + "% of the camera's own motion.")));
+					return 1;
+				})))
+				// /ccdebug gbufblocks <0|1> [colour exponent %] [roughness %]: the experiment. Writes the blocks into the engine's G-buffer (colour, normal, material, depth and stencil) instead of drawing them
+				// into the scene, so that the engine lights them: its sun, the shadows of the city, ambient occlusion, reflections, fog. While it is on the blocks are not drawn any other way. Set Minecraft to noon
+				// first (/time set noon): its own lighting is baked into the colours it sends. The exponent (default 100: Minecraft's colours as they are) is for if the engine keeps its albedo linear: try 220.
+				// The roughness (default 55) is what every block is written with (the street reads 50 to 60, a wall about 43).
+				.then(ClientCommands.literal("gbufblocks").then(ClientCommands.argument("on", IntegerArgumentType.integer(0, 1)).executes(c -> {
+					int on = IntegerArgumentType.getInteger(c, "on");
+					c.getSource().sendFeedback(Component.literal(sendDebugTwo(Proto.DEBUG_GBUF_BLOCKS, on + 10 * 55, 100, on == 1 ? "Blocks written into the engine's G-buffer (lit by the engine). /time set noon first." : "Blocks drawn the usual way again.")));
+					return 1;
+				}).then(ClientCommands.argument("gamma", IntegerArgumentType.integer(20, 400)).executes(c -> {
+					int on = IntegerArgumentType.getInteger(c, "on"), gamma = IntegerArgumentType.getInteger(c, "gamma");
+					c.getSource().sendFeedback(Component.literal(sendDebugTwo(Proto.DEBUG_GBUF_BLOCKS, on + 10 * 55, gamma, "Blocks in the G-buffer: " + (on == 1 ? "on" : "off") + ", colour exponent " + gamma + "%.")));
+					return 1;
+				}).then(ClientCommands.argument("roughness", IntegerArgumentType.integer(1, 100)).executes(c -> {
+					int on = IntegerArgumentType.getInteger(c, "on"), gamma = IntegerArgumentType.getInteger(c, "gamma"), rough = IntegerArgumentType.getInteger(c, "roughness");
+					c.getSource().sendFeedback(Component.literal(sendDebugTwo(Proto.DEBUG_GBUF_BLOCKS, on + 10 * rough, gamma, "Blocks in the G-buffer: " + (on == 1 ? "on" : "off") + ", colour exponent " + gamma + "%, roughness " + rough + "%.")));
+					return 1;
+				})))))
+				// /ccdebug gbufprobe: read-only. Writes to the log, for one frame, every texture that could be a render target, compute output or depth buffer (format, size, the engine's name for it if
+				// it gave one, and its state changes in the order the GPU runs them) and which are moved into the render target together: how the engine lays out its G-buffer.
+				.then(ClientCommands.literal("gbufprobe").executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_GBUF_PROBE, 0, "Recording the G-buffer probe: the report for one frame goes to the log in a moment (it only watches).")));
+					return 1;
+				}))
+				// /ccdebug scenetimeline: writes to the log, for the next frame, what happens to the scene texture, the depth and the fog textures, list by list. (It also does so by itself the first time
+				// the scene copy is found, when drawing stops and when it starts again.) /ccdebug scenefallback <0|1>: opt-in: when the game makes no copy of the scene (it only does when something in view
+				// needs refraction) draw at the same point of the frame where the copy would have been.
+				.then(ClientCommands.literal("scenetimeline").executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_TIMELINE, 0, "The next frame's timeline of the scene texture goes to the log.")));
+					return 1;
+				}))
+				.then(ClientCommands.literal("scenefallback").then(ClientCommands.argument("on", IntegerArgumentType.integer(0, 1)).executes(c -> {
+					int on = IntegerArgumentType.getInteger(c, "on");
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_SCENE_FALLBACK, on, on == 1 ? "Fallback on: with no scene copy in a frame, the blocks are drawn at the copy's usual place." : "Fallback off.")));
+					return 1;
+				})))
+				// /ccdebug adapt <strength> <power>: the blocks' gain follows how bright the city is (measured from the game's scene and smoothed over about a second and a half):
+				// multiplier = (brightness now / reference) ^ power, between 0.25 and 4, blended in by the strength (0 off, 100 full). A negative power gives a lower gain when the city is brighter,
+				// which is what is needed if Minecraft's own lighting changes more steeply between day and night than the city's. /ccdebug adaptref takes the brightness now as the reference.
+				.then(ClientCommands.literal("adapt").then(ClientCommands.argument("strength", IntegerArgumentType.integer(0, 100)).executes(c -> {
+					int strength = IntegerArgumentType.getInteger(c, "strength");
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_ADAPT, strength, 0) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: the gain follows the city's brightness at " + strength + "% (power 0: no change; give a power next to /ccdebug adapt <strength> <power>)."));
+					}
+					return 1;
+				}).then(ClientCommands.argument("power", IntegerArgumentType.integer(-150, 150)).executes(c -> {
+					int strength = IntegerArgumentType.getInteger(c, "strength"), power = IntegerArgumentType.getInteger(c, "power");
+					if (!CyberLink.active() || CyberLink.sendDebug(Proto.DEBUG_ADAPT, strength, power) == 0) {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: Cyberpunk isn't linked."));
+					} else {
+						c.getSource().sendFeedback(Component.literal("CyberCraft: the gain follows the city's brightness at " + strength + "%, to the power " + power / 100.0 + "."));
+					}
+					return 1;
+				}))))
+				.then(ClientCommands.literal("adaptref").executes(c -> {
+					c.getSource().sendFeedback(Component.literal(sendDebug(Proto.DEBUG_ADAPT_REF, 0, "The city's brightness now is the one the gain is right for.")));
+					return 1;
+				}))
 				// /ccdebug glowstart <percent>: how bright a pixel has to be (percent of full brightness, after undoing Minecraft's face shading) to count as light-emitting and get the glow boost. Default 70;
 				// raise it (about 90) so that sunlit pale blocks (sand, birch, quartz) don't glow at noon while glowstone and lanterns still do.
 				.then(ClientCommands.literal("glowstart").then(ClientCommands.argument("percent", IntegerArgumentType.integer(30, 99)).executes(c -> {
@@ -561,6 +665,16 @@ public final class CyberCraftClient implements ClientModInitializer {
 		pendingSeq = seq;
 		CyberCraft.LOG.info("CyberCraft: asked Cyberpunk to teleport V by east={} north={} up={} (command {})", east, north, up, seq);
 		return String.format("CyberCraft: asked Cyberpunk to move V by east %.1f, north %.1f, up %.1f m. Check the log for the result.", east, north, up);
+	}
+
+	private static String sendDebugTwo(int action, double first, double second, String message) {
+		if (!CyberLink.active()) {
+			return "CyberCraft: Cyberpunk isn't linked. Start the game with the plugin installed.";
+		}
+		if (CyberLink.sendDebug(action, first, second) == 0) {
+			return "CyberCraft: couldn't send the command.";
+		}
+		return "CyberCraft: " + message;
 	}
 
 	private static String sendDebug(int action, double arg, String message) {
